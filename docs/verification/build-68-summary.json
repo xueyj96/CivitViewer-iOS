@@ -1,0 +1,101 @@
+{
+  "version": "0.3.0",
+  "build": 68,
+  "at_utc": "2026-11-02T21:17:14.642519+00:00",
+  "stage": "INSTALLED68_INDEPENDENT_VERSION_METADATA_AND_SILENT_NATIVE_LAUNCH_VERIFIED",
+  "base_commit": "1337685c1883c00ffa2c35fa698942f06ca1cc26",
+  "base_build": 67,
+  "source_sha256": "0a43f9b63ad607d56a118051df958ecec80bc1dc43eab3da88c5d940306a09f0",
+  "installed": true,
+  "published": false,
+  "source_committed": false,
+  "source_pushed": false,
+  "behavior": [
+    "Media gesture observers attach to their nearest owning controller view instead of UIWindow",
+    "Opening an author or author work cannot trigger the background timeline type switch or other covered media gestures",
+    "Inactive page gestures disable and cancel; leaving the window detaches observers",
+    "Returning to the parent preserves its filter and restores its own existing media gestures"
+  ],
+  "local_validation": {
+    "silent_simulator_cases_passed": 10,
+    "failed": 0,
+    "skipped": 0,
+    "single_same_binary_run": true,
+    "production_inputs": 98,
+    "swift_sources_in_release": 70,
+    "read_only_review_open_material_findings": 0,
+    "release_arm64": true,
+    "QA_harness_excluded_from_release": true,
+    "test_names": [
+      "testGestures68CoveredEnabledPageCannotReceiveAuthorsEdgeSwipe",
+      "testGestures68AuthorGridDoesNotChangeStreamBehindIt",
+      "testGestures68AuthorWorkDoesNotChangeStreamBehindIt",
+      "testGestures68AuthorGridDoesNotChangeGridViewerBehindIt",
+      "testGestures68AuthorWorkDoesNotChangeGridViewerBehindIt",
+      "testGestures68AuthorVideoDoesNotChangeStreamBehindIt",
+      "testGestures68AuthorVideoDoesNotChangeGridViewerBehindIt",
+      "testCentralHoldGesturePrioritiesAndFullscreenExit",
+      "testToolbar49VideoCancelAndNativeBack",
+      "testNative67ReverseDragRevealsPreviousWithoutSkippingWork"
+    ]
+  },
+  "prior_failures_retained": [
+    "Default simulator build selected unsupported x86_64 engine; arm64-only build succeeded without source changes",
+    "First real-entry baseline: 1 passed/1 failed. Edge input targeted clickable gallery card and opened a work; corrected to author header margin",
+    "Controlled baseline with original gesture code: real-entry case passed; covered enabled lower controller received one author edge touch (expected zero)"
+  ],
+  "baseline_scope": "Controlled baseline preserves original gesture implementation, with a simulator-only touch-delivery harness; not an exact old production-binary or physical-phone reproduction",
+  "package": {
+    "bundle_identifier": "com.xueyj.civitviewer",
+    "version": "0.3.0",
+    "build": "68",
+    "minimum_ios": "17.0",
+    "platforms": [
+      "iPhoneOS"
+    ],
+    "ipa_filename": "CivitViewer-0.3.0-build68-sideload.ipa",
+    "ipa_bytes": 6313582,
+    "ipa_sha256": "7f449651489a3f8f9586b06c8ece2f2a05f3d9f57ca9d46d0249ec1433eae5b0",
+    "packaged_regular_files": 11,
+    "macho_binaries_checked": 2,
+    "personal_provisioning_profiles": 0,
+    "personal_certificate_signatures": 0,
+    "personal_signing_entitlements": 0,
+    "local_checksum_signatures": "ad-hoc, must be replaced by recipient signing",
+    "deep_strict_codesign_passed": true,
+    "ipa_crc_and_file_hashes_passed": true,
+    "main_executable_has_no_coverage_sections": true,
+    "original_input_app_unchanged": true,
+    "recipient_resigning_required": true,
+    "device_install_after_recipient_resigning": "NOT_TESTED"
+  },
+  "limits": [
+    "Neutral local muted simulator fixtures",
+    "Physical-phone normal-use gesture replay not yet performed",
+    "Recipient re-sign and installation not tested"
+  ],
+  "public_release_at_local_validation": 67,
+  "delivery_readback": {
+    "at_utc": "2026-11-02T21:18:59.981522+00:00",
+    "same_original_phone_version": "0.3.0(68)",
+    "data_preservation": {
+      "six_complete_metadata_scopes_unchanged": true,
+      "regular_files": 713,
+      "preset_metadata_unchanged": true,
+      "preset_regular_files": 1,
+      "method": "Fresh before/after paths, sizes and mtime; contents not read, copied or hashed; before app launch",
+      "category_counts": {
+        "offline": 139,
+        "history": 1,
+        "diagnostics": 4,
+        "cache": 566,
+        "preferences": 1,
+        "tagLibrary": 2
+      }
+    },
+    "separate_silent_launch_verified": true,
+    "independent_exact_process_alive": true,
+    "physical_normal_use_UI_replay": "NOT_TESTED",
+    "public_release_at_this_readback": 67
+  }
+}

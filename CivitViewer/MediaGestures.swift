@@ -3,8 +3,9 @@ import UIKit
 
 enum MediaPanPhase { case began, changed, ended, cancelled }
 
-/// Observe touches from the window without putting a hit-testing view over
-/// SwiftUI buttons. Reject vertical pans before recognition so paging still owns them.
+/// Observe only the owning page's touches without putting a hit-testing view
+/// over SwiftUI buttons. Navigation may retain enabled pages behind another one.
+/// Reject vertical pans before recognition so paging still owns them.
 struct MediaGestureLayer: UIViewRepresentable {
     let active: Bool
     let isVideo: Bool
@@ -58,8 +59,11 @@ struct MediaGestureLayer: UIViewRepresentable {
         private var holding = false
         init(_ configuration: MediaGestureLayer) { self.configuration = configuration; super.init() }
         func attach() {
-            guard let window = probe?.window, host !== window else { return }
-            detach(); host = window
+            guard let view = probe, view.window != nil, let owner = owningPageView(from: view) else {
+                detach(); return
+            }
+            if host === owner { updateEnabledState(); return }
+            detach(); host = owner
             pan.delegate = self; pan.maximumNumberOfTouches = 1
             hold.delegate = self; hold.minimumPressDuration = 0.35; hold.allowableMovement = 12
             centerHold.delegate = self; centerHold.minimumPressDuration = 0.45; centerHold.allowableMovement = 8
@@ -68,7 +72,24 @@ struct MediaGestureLayer: UIViewRepresentable {
             doubleTap.delegate = self; doubleTap.numberOfTapsRequired = 2; doubleTap.cancelsTouchesInView = false
             tap.require(toFail: pan); tap.require(toFail: hold); tap.require(toFail: centerHold)
             doubleTap.require(toFail: pan); doubleTap.require(toFail: hold); doubleTap.require(toFail: centerHold); tap.require(toFail: doubleTap)
-            window.addGestureRecognizer(pan); window.addGestureRecognizer(hold); window.addGestureRecognizer(centerHold); window.addGestureRecognizer(tap); window.addGestureRecognizer(doubleTap)
+            owner.addGestureRecognizer(pan); owner.addGestureRecognizer(hold); owner.addGestureRecognizer(centerHold); owner.addGestureRecognizer(tap); owner.addGestureRecognizer(doubleTap)
+            updateEnabledState()
+        }
+        private func owningPageView(from view: UIView) -> UIView? {
+            var responder: UIResponder? = view
+            while let current = responder {
+                if let controller = current as? UIViewController {
+                    guard let owner = controller.viewIfLoaded, view.isDescendant(of: owner) else { return nil }
+                    return owner
+                }
+                responder = current.next
+            }
+            return nil
+        }
+        private func updateEnabledState() {
+            let recognizers: [UIGestureRecognizer] = [pan, hold, centerHold, tap, doubleTap]
+            for recognizer in recognizers { recognizer.isEnabled = configuration.active }
+            if !configuration.active { panTouchOrigin = nil }
         }
         func detach() {
             host?.removeGestureRecognizer(pan); host?.removeGestureRecognizer(hold); host?.removeGestureRecognizer(centerHold); host?.removeGestureRecognizer(tap); host?.removeGestureRecognizer(doubleTap); host = nil
@@ -205,3 +226,71 @@ struct MediaGestureLayer: UIViewRepresentable {
         #endif
     }
 }
+
+#if DEBUG && targetEnvironment(simulator)
+/// Retain an enabled media page below another controller, as navigation can do
+/// before its cached SwiftUI content receives a new visibility value.
+@MainActor private final class MediaGestureScopeQAState: ObservableObject {
+    @Published var covered = true
+    @Published var switches = 0
+}
+
+struct MediaGestureScopeQAView: View {
+    @StateObject private var state = MediaGestureScopeQAState()
+    var body: some View { MediaGestureScopeQAContainer(state: state) }
+}
+
+private struct MediaGestureScopeQAContainer: UIViewControllerRepresentable {
+    @ObservedObject var state: MediaGestureScopeQAState
+    func makeUIViewController(context: Context) -> MediaGestureScopeQAController {
+        MediaGestureScopeQAController(state: state)
+    }
+    func updateUIViewController(_ controller: MediaGestureScopeQAController, context: Context) {
+        controller.cover.isHidden = !state.covered
+    }
+}
+
+@MainActor private final class MediaGestureScopeQAController: UIViewController {
+    let cover: UIView
+    private let content: UIHostingController<AnyView>
+    private let author: UIHostingController<AnyView>
+    init(state: MediaGestureScopeQAState) {
+        let mediaController = UIHostingController(rootView: AnyView(MediaGestureScopeQAPage(state: state, author: false)))
+        let authorController = UIHostingController(rootView: AnyView(MediaGestureScopeQAPage(state: state, author: true)))
+        content = mediaController; author = authorController; cover = authorController.view
+        super.init(nibName: nil, bundle: nil)
+    }
+    @MainActor required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        for child in [content, author] {
+            addChild(child); view.addSubview(child.view); child.didMove(toParent: self)
+        }
+    }
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        content.view.frame = view.bounds; author.view.frame = view.bounds
+    }
+}
+
+private struct MediaGestureScopeQAPage: View {
+    @ObservedObject var state: MediaGestureScopeQAState
+    let author: Bool
+    var body: some View {
+        VStack(spacing: 20) {
+            Text(author ? "作者页面" : "当前播放页").font(.title2)
+            Text("backgroundSwitches=\(state.switches)")
+                .accessibilityIdentifier(author ? "gesture68.cover.state" : "gesture68.page.state")
+            if author { Button("返回播放页") { state.covered = false } }
+            Spacer()
+        }
+        .padding(.top, 20).frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(author ? Color.blue.opacity(0.85) : Color.black).foregroundStyle(.white)
+        .background {
+            if !author {
+                MediaGestureLayer(active: true, isVideo: false, onKindSwipe: { _ in state.switches += 1 })
+            }
+        }
+    }
+}
+#endif

@@ -2274,6 +2274,110 @@ final class ResumePromptUITests: XCTestCase {
         }
     }
 
+    func testGestures68CoveredEnabledPageCannotReceiveAuthorsEdgeSwipe() {
+        app = XCUIApplication(); app.launchArguments = ["--qa-gesture-scope68", "--qa-collection-paging", "-muted", "YES", "-autoplay", "NO"]
+        XCUIDevice.shared.orientation = .portrait; app.launch()
+        let cover = app.staticTexts["gesture68.cover.state"]
+        XCTAssertTrue(cover.waitForExistence(timeout: 8)); XCTAssertEqual(cover.label, "backgroundSwitches=0")
+        let window = app.windows.firstMatch
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0.985, dy: 0.45))
+            .press(forDuration: 0.05, thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.55, dy: 0.45)))
+        attachScreenshot(named: "gestures68-covered-owner-must-ignore-authors-touch")
+        XCTAssertEqual(cover.label, "backgroundSwitches=0", "An enabled retained page cannot observe touches in another controller's author page")
+        app.buttons["返回播放页"].tap()
+        let page = app.staticTexts["gesture68.page.state"]
+        XCTAssertTrue(page.waitForExistence(timeout: 5))
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0.985, dy: 0.45))
+            .press(forDuration: 0.05, thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.55, dy: 0.45)))
+        waitUntil("The same recognizer still handles its own page after returning") { page.label == "backgroundSwitches=1" }
+    }
+
+    func testGestures68AuthorGridDoesNotChangeStreamBehindIt() {
+        auditAuthorGestureScope68(fromGrid: false, openWork: false)
+    }
+
+    func testGestures68AuthorWorkDoesNotChangeStreamBehindIt() {
+        auditAuthorGestureScope68(fromGrid: false, openWork: true)
+    }
+
+    func testGestures68AuthorGridDoesNotChangeGridViewerBehindIt() {
+        auditAuthorGestureScope68(fromGrid: true, openWork: false)
+    }
+
+    func testGestures68AuthorWorkDoesNotChangeGridViewerBehindIt() {
+        auditAuthorGestureScope68(fromGrid: true, openWork: true)
+    }
+
+    func testGestures68AuthorVideoDoesNotChangeStreamBehindIt() {
+        auditAuthorGestureScope68(fromGrid: false, openWork: true, video: true)
+    }
+
+    func testGestures68AuthorVideoDoesNotChangeGridViewerBehindIt() {
+        auditAuthorGestureScope68(fromGrid: true, openWork: true, video: true)
+    }
+
+    private func auditAuthorGestureScope68(fromGrid: Bool, openWork: Bool, video: Bool = false) {
+        visualLaunch(width: 0, large: false, landscape: false, extra: ["-autoplay", "YES", "-muted", "YES"])
+        let picker = app.segmentedControls["timeline.media-kind"]
+        if video { picker.buttons["视频"].tap() }
+        let initialKind = video ? "视频" : "全部", nextKind = video ? "全部" : "视频"
+        let initialRaw = video ? "video" : "all", itemID = video ? 28_037_102 : 28_037_100
+        XCTAssertTrue(picker.buttons[initialKind].isSelected)
+        if fromGrid {
+            app.buttons["timeline.presentation"].tap()
+            let cell = visualButton("media.grid.cell.\(itemID)")
+            XCTAssertTrue(cell.waitForExistence(timeout: 8)); cell.tap()
+        }
+        if video { waitPlayingFixture() }
+        let author = visualButton("media.author.\(itemID)")
+        XCTAssertTrue(author.waitForExistence(timeout: 8)); author.tap()
+        XCTAssertTrue(app.navigationBars["作者作品"].waitForExistence(timeout: 8))
+        if openWork {
+            let cell = visualButton("media.grid.cell.\(itemID)")
+            XCTAssertTrue(cell.waitForExistence(timeout: 8)); cell.tap()
+            XCTAssertTrue(visualButton("media.author.\(itemID)").waitForExistence(timeout: 8))
+            if video { waitPlayingFixture() }
+        }
+        let route = "\(fromGrid ? "grid-viewer" : "stream")-author-\(video ? "video" : (openWork ? "image" : "grid"))"
+        let window = app.windows.firstMatch
+        let edgeY = openWork ? 0.45 : 0.23
+        let startX = video ? 0.015 : 0.985, endX = video ? 0.45 : 0.55
+        window.coordinate(withNormalizedOffset: CGVector(dx: startX, dy: edgeY))
+            .press(forDuration: 0.05, thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: endX, dy: edgeY)))
+        attachScreenshot(named: "gestures68-after-child-edge-\(route)")
+        if openWork { closeVisibleWork68() }
+        let back = visualButton("navigation.back")
+        XCTAssertTrue(back.waitForExistence(timeout: 5))
+        waitUntil("Return must target the actually visible author page") { back.isHittable }
+        back.tap()
+        if fromGrid { closeVisibleWork68() }
+        XCTAssertTrue(picker.waitForExistence(timeout: 5))
+        XCTAssertTrue(picker.buttons[initialKind].isSelected,
+                      "\(route): an edge swipe in a child page must not change the retained timeline's media filter")
+        XCTAssertTrue(app.staticTexts["qa.controls.filter"].valueDescription.hasPrefix("kind=\(initialRaw);"))
+        if fromGrid {
+            let cell = visualButton("media.grid.cell.\(itemID)")
+            XCTAssertTrue(cell.waitForExistence(timeout: 8)); cell.tap()
+        }
+        window.coordinate(withNormalizedOffset: CGVector(dx: startX, dy: 0.45))
+            .press(forDuration: 0.05, thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: endX, dy: 0.45)))
+        if !video {
+            waitUntil("Returning to the actual timeline restores its own edge type switch") { self.watchFocus() == 28_037_102 }
+            waitPlayingFixture()
+        }
+        attachScreenshot(named: "gestures68-parent-edge-restored-\(route)")
+        if fromGrid { closeVisibleWork68() }
+        waitUntil("The original timeline still applies its own edge filter change") { picker.buttons[nextKind].isSelected }
+    }
+
+    private func closeVisibleWork68() {
+        guard let close = app.buttons.matching(NSPredicate(format: "label == %@", "关闭作品"))
+            .allElementsBoundByIndex.first(where: \.isHittable) else {
+            XCTFail("Expected the current full-screen viewer's visible close action"); return
+        }
+        close.tap()
+    }
+
     func testLayout67SameAuthorAndFollowPositionsAcrossRealEntries() {
         visualLaunch(width: 0, large: false, landscape: false, extra: ["-autoplay", "YES", "-muted", "YES"])
         app.segmentedControls["timeline.media-kind"].buttons["视频"].tap()

@@ -16,7 +16,8 @@ struct CivitViewerApp: App {
             if AppReadback.tagMediaRequested { TagMetadataReadbackView().environmentObject(session) }
             else {
             #if targetEnvironment(simulator)
-            if ProcessInfo.processInfo.arguments.contains("--qa-grid-retry55") { GridRetryQAView() }
+            if ProcessInfo.processInfo.arguments.contains("--qa-gesture-scope68") { MediaGestureScopeQAView() }
+            else if ProcessInfo.processInfo.arguments.contains("--qa-grid-retry55") { GridRetryQAView() }
             else if ProcessInfo.processInfo.arguments.contains("--qa-preparation48") { VideoPreparationOverlayQAView() }
             else if CollectionPagingQA.enabled { CollectionPagingQAView().environmentObject(session).environmentObject(session.oauth) }
             else if ResumePromptQA.enabled { ResumePromptQAView().environmentObject(session).environmentObject(session.oauth) }
