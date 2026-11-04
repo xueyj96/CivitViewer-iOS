@@ -133,6 +133,25 @@ private struct AnimatedBitmapView: UIViewRepresentable {
     }
 }
 
+struct CoverPlaceholder: View {
+    let symbol: String
+    let title: String
+    var detail: String? = nil
+    var body: some View {
+        VStack(spacing: 7) {
+            Image(systemName: symbol).font(.title2).foregroundStyle(.secondary)
+            Text(title).font(.caption).foregroundStyle(.secondary)
+                .lineLimit(2).multilineTextAlignment(.center)
+            if let detail {
+                Text(detail).font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.secondary.opacity(0.07))
+        .accessibilityElement(children: .combine)
+    }
+}
+
 struct CachedPoster: View {
     let source: URL
     let declared: URL?
@@ -144,6 +163,7 @@ struct CachedPoster: View {
     var onFailure: ((Bool) -> Void)? = nil
     var showsFailure = true
     var emptyPlaceholder: String? = nil
+    var placeholderTitle: String? = nil
     var imageBlur: CGFloat = 0
     @State private var image: UIImage?
     @State private var failed = false
@@ -156,15 +176,14 @@ struct CachedPoster: View {
                     Image(uiImage: image).resizable().aspectRatio(contentMode: fit ? .fit : .fill)
                         .frame(width: geometry.size.width, height: geometry.size.height).clipped()
                         .blur(radius: imageBlur)
-                } else if let emptyPlaceholder {
-                    Text(emptyPlaceholder).font(.subheadline).foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else if failed {
-                    if showsFailure {
-                        Image(systemName: "play.rectangle").font(.title).foregroundStyle(.secondary)
-                            .accessibilityLabel("视频封面暂不可用，打开作品播放")
-                    }
-                } else { ProgressView() }
+                } else {
+                    CoverPlaceholder(symbol: "play.rectangle",
+                        title: placeholderTitle ?? "视频预览",
+                        detail: emptyPlaceholder)
+                    .accessibilityLabel([placeholderTitle, emptyPlaceholder].compactMap { $0 }.joined(separator: "，").isEmpty
+                        ? "视频预览"
+                        : [placeholderTitle, emptyPlaceholder].compactMap { $0 }.joined(separator: "，"))
+                }
             }.frame(width: geometry.size.width, height: geometry.size.height).clipped()
         }
         .task(id: Key(source: source, declared: declared, active: active, local: allowLocalExtraction, retry: retryToken, workID: diagnosticWorkID, cacheRevision: cacheRevision)) {
@@ -173,6 +192,10 @@ struct CachedPoster: View {
             var stage = PosterDiagnosticStage.cachedPoster
             notePoster(.posterStarted, error: nil, stage: stage)
             do {
+                #if DEBUG && targetEnvironment(simulator)
+                if ProcessInfo.processInfo.arguments.contains("--qa-cover69-wait") { try await Task.sleep(for: .seconds(6)) }
+                if ProcessInfo.processInfo.arguments.contains("--qa-cover69-cancel") { throw CancellationError() }
+                #endif
                 // The focused native player supplies its current frame. A still
                 // preview must not start a second original-video download.
                 let value = try await MediaCache.shared.loadPoster(source: source, declared: declared, allowExtraction: false,
@@ -180,7 +203,12 @@ struct CachedPoster: View {
                 try Task.checkCancellation(); image = value
                 notePoster(.posterLoaded, error: nil, stage: stage)
             } catch is CancellationError {
-                notePoster(.posterCancelled, error: nil, stage: stage)
+                if Task.isCancelled {
+                    notePoster(.posterCancelled, error: nil, stage: stage)
+                    return
+                }
+                failed = true; onFailure?(true)
+                notePoster(.posterFailed, error: CancellationError(), stage: stage)
             } catch {
                 if Task.isCancelled { notePoster(.posterCancelled, error: nil, stage: stage); return }
                 failed = true; onFailure?(true)

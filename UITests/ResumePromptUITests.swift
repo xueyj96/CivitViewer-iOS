@@ -1289,7 +1289,8 @@ final class ResumePromptUITests: XCTestCase {
         let preview = app.descendants(matching: .any)["details.preview"]
         let poster = preview.descendants(matching: .any)["poster.qa.146087479"]
         XCTAssertTrue(poster.waitForValueToContain("state=failed", timeout: 12))
-        XCTAssertTrue(preview.staticTexts["暂无可用封面"].exists)
+        let unavailable = preview.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS %@", "暂无可用封面")).firstMatch
+        XCTAssertTrue(unavailable.exists)
         XCTAssertEqual(preview.activityIndicators.count, 0)
         XCTAssertFalse(app.buttons["details.poster.retry"].exists)
         attachScreenshot(named: "poster67-neutral-before-frame")
@@ -1297,7 +1298,7 @@ final class ResumePromptUITests: XCTestCase {
         producer.tap()
         XCTAssertTrue(producer.waitForValueToContain("written", timeout: 3), "The real cache writer must commit a valid frame first")
         XCTAssertTrue(poster.waitForValueToContain("state=ready", timeout: 5), "The existing failed detail must refresh without tapping retry or reopening")
-        XCTAssertFalse(preview.staticTexts["暂无可用封面"].exists)
+        XCTAssertFalse(unavailable.exists)
         XCTAssertFalse(app.buttons["details.poster.retry"].exists)
         XCTAssertFalse(app.descendants(matching: .any)["media.qa.player"].exists, "Cache invalidation does not create a second player")
         attachPlayback43("poster51-late-cache-write")
@@ -2272,6 +2273,107 @@ final class ResumePromptUITests: XCTestCase {
             attachScreenshot(named: "style48-\(appearance)-author-time-menu")
             app.buttons["不限时间"].tap()
         }
+    }
+
+    private func favorite69Submit(extra: [String] = [], remove: Bool = false, nested: Bool = false) {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-favorite-save69-delay", "-muted", "YES", "-autoplay", "NO"] + extra)
+        if nested {
+            visualButton("media.author.28037100").tap()
+            XCTAssertTrue(app.navigationBars["作者作品"].waitForExistence(timeout: 5))
+            let cell = visualButton("media.grid.cell.28037100")
+            XCTAssertTrue(cell.waitForExistence(timeout: 5)); cell.tap()
+            XCTAssertTrue(app.buttons["关闭作品"].waitForExistence(timeout: 5))
+        }
+        visualButton("favorite-28037100").tap()
+        XCTAssertTrue(app.navigationBars["收藏图片"].waitForExistence(timeout: 5))
+        let folder = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "分页测试收藏")).firstMatch
+        XCTAssertTrue(folder.waitForExistence(timeout: 5))
+        if remove { folder.tap() }
+        let save = app.buttons["保存"]
+        XCTAssertTrue(save.isEnabled); save.tap()
+        XCTAssertTrue(app.navigationBars["收藏图片"].waitForNonExistence(timeout: 2), "Saving must dismiss without waiting for the controlled six-second server operation")
+        let state = app.staticTexts["favorite69.qa.state"]
+        XCTAssertTrue(state.waitForExistence(timeout: 2))
+        XCTAssertTrue(state.valueDescription.contains("pending=28037100"))
+        XCTAssertFalse(app.staticTexts["正在保存并核对…"].exists)
+        attachScreenshot(named: "favorite69-background-save")
+    }
+
+    func testFavorite69SaveContinuesAfterPickerDismissalAndPagingAway() {
+        favorite69Submit()
+        heightDeck().swipeUp()
+        XCTAssertTrue(visualButton("favorite-28037101").waitForExistence(timeout: 4), "The user can continue browsing while the save is pending")
+        let state = app.staticTexts["favorite69.qa.state"]
+        waitUntil("A session-owned save completes after its picker and original page stop being visible", timeout: 10) {
+            state.valueDescription.contains("pending=-1;saved=true;message=false")
+        }
+        XCTAssertFalse(app.alerts.firstMatch.exists)
+    }
+
+    func testFavorite69FailureRemainsVisibleAfterPickerDismissal() {
+        favorite69Submit(extra: ["--qa-favorite-save69-failure"])
+        let alert = app.alerts["Civit Viewer"]
+        XCTAssertTrue(alert.waitForExistence(timeout: 10))
+        XCTAssertTrue(alert.staticTexts["收藏结果尚未确认，请刷新收藏状态后再操作。"].exists)
+        XCTAssertTrue(app.staticTexts["favorite69.qa.state"].valueDescription.contains("pending=-1;saved=false;message=true"))
+        attachScreenshot(named: "favorite69-failed-save-stays-actionable")
+        alert.buttons["好"].tap()
+    }
+
+    func testFavorite69AccountInvalidationDiscardsLateSaveAndError() {
+        favorite69Submit(extra: ["--qa-favorite-save69-account-change"])
+        let state = app.staticTexts["favorite69.qa.state"]
+        waitUntil("Invalidating the account context clears saving and rejects a late completion", timeout: 10) {
+            state.valueDescription.contains("pending=-1;saved=false;message=false")
+        }
+        XCTAssertFalse(app.alerts.firstMatch.exists)
+    }
+
+    func testFavorite69FailureIsPresentedOverAuthorWorkViewer() {
+        favorite69Submit(extra: ["--qa-favorite-save69-failure"], nested: true)
+        let alert = app.alerts["Civit Viewer"]
+        XCTAssertTrue(alert.waitForExistence(timeout: 10), "A save failure must remain visible above an author work's full-screen presentation")
+        XCTAssertTrue(alert.staticTexts["收藏结果尚未确认，请刷新收藏状态后再操作。"].exists)
+        attachScreenshot(named: "favorite69-failure-above-author-work")
+        alert.buttons["好"].tap()
+    }
+
+    func testFavorite69RemovalAlsoCompletesOutsidePicker() {
+        favorite69Submit(extra: ["--qa-favorite-save69-start-saved"], remove: true)
+        let state = app.staticTexts["favorite69.qa.state"]
+        XCTAssertTrue(state.valueDescription.contains("saved=true"), "The previous confirmed state stays visible until the removal finishes")
+        waitUntil("Removal completes through the same session-owned save", timeout: 10) {
+            state.valueDescription.contains("pending=-1;saved=false;message=false")
+        }
+        XCTAssertEqual(visualButton("favorite-28037100").label, "收藏")
+    }
+
+    func testCover69WaitingAndFailedPreviewsKeepWorkIdentifiers() {
+        app = XCUIApplication(); app.launchArguments = ["--qa-grid-retry55", "--qa-cover69-wait", "-muted", "YES"]; app.launch()
+        for name in ["图片 · #55001", "视频 · #55002"] {
+            XCTAssertTrue(app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS %@", name)).firstMatch.waitForExistence(timeout: 3))
+        }
+        XCTAssertEqual(app.progressIndicators.count, 0, "A cover wait must show a stable placeholder, not only a spinner")
+        attachScreenshot(named: "cover69-waiting-image-and-video-placeholders")
+        XCTAssertTrue(app.buttons["media.grid.retry.55001"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.buttons["media.grid.retry.55002"].exists)
+        XCTAssertEqual(app.progressIndicators.count, 0)
+        attachScreenshot(named: "cover69-failed-image-and-video-identifiers")
+    }
+
+    func testCover69UnderlyingCancellationFinishesActivePreview() {
+        app = XCUIApplication(); app.launchArguments = ["--qa-grid-retry55", "--qa-cover69-cancel", "-muted", "YES"]; app.launch()
+        let retry = app.buttons["media.grid.retry.55002"]
+        XCTAssertTrue(retry.waitForExistence(timeout: 8), "A live consumer receiving underlying cancellation must enter its existing failure state")
+        let attempts = app.staticTexts["grid.preview.attempts.55002"]
+        XCTAssertTrue(attempts.waitForExistence(timeout: 3)); XCTAssertTrue(attempts.valueDescription.contains("attempts=1"))
+        XCTAssertEqual(app.progressIndicators.count, 0)
+        XCTAssertTrue(retry.isHittable); retry.tap()
+        XCTAssertTrue(attempts.waitForValueToContain("attempts=2", timeout: 8), "Retry must start a second real preview task, rather than only leave the old error visible")
+        XCTAssertTrue(retry.waitForExistence(timeout: 8))
+        XCTAssertEqual(app.staticTexts["grid.retry.qa.opens"].label, "opened=0")
+        attachScreenshot(named: "cover69-underlying-cancellation-has-retry")
     }
 
     func testGestures68CoveredEnabledPageCannotReceiveAuthorsEdgeSwipe() {

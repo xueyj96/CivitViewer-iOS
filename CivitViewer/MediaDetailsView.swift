@@ -170,21 +170,24 @@ struct MediaDetailsView: View {
             if item.isVideo, let source = item.mediaURL {
                 CachedPoster(source: source, declared: item.posterURL, active: false, fit: true,
                     retryToken: posterRetry, allowLocalExtraction: true, diagnosticWorkID: item.id,
-                    showsFailure: false, emptyPlaceholder: "暂无可用封面", imageBlur: blurPreview ? 24 : 0)
+                    showsFailure: false, emptyPlaceholder: "暂无可用封面",
+                    placeholderTitle: "视频 · #\(item.id)\(item.username.map { " · \($0)" } ?? "")",
+                    imageBlur: blurPreview ? 24 : 0)
             } else if !item.isVideo, let imageURL = item.mediaURL {
                 CachedImage(url: imageURL, fit: true, allowsRetry: false, retryToken: posterRetry,
-                            showsFailure: false, onFailureMessage: { imageFailure = $0 })
-                    .blur(radius: blurPreview ? 24 : 0)
+                            showsFailure: false, onFailureMessage: { imageFailure = $0 },
+                            placeholderTitle: "图片 · #\(item.id)\(item.username.map { " · \($0)" } ?? "")", imageBlur: blurPreview ? 24 : 0)
+                    .opacity(imageFailure == nil ? 1 : 0)
             } else {
                 if item.isVideo {
                     Text("暂无可用封面").font(.subheadline).foregroundStyle(.secondary)
                 } else {
-                    Image(systemName: "photo")
-                        .font(.system(size: 30, weight: .regular)).foregroundStyle(.secondary)
+                    CoverPlaceholder(symbol: "photo",
+                        title: "图片 · #\(item.id)\(item.username.map { " · \($0)" } ?? "")")
                 }
             }
             if let imageFailure {
-                MediaLoadFailureContent(message: imageFailure, retryIdentifier: "details.image.retry",
+                MediaLoadFailureContent(message: imageFailure, workTitle: "图片 · #\(item.id)", retryIdentifier: "details.image.retry",
                                         retry: { posterRetry += 1 })
             }
         }

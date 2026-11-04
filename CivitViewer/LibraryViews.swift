@@ -478,35 +478,62 @@ private struct MediaGridCell: View {
     let open: () -> Void
     @State private var failure: String?
     @State private var retry = 0
+    @Environment(\.dynamicTypeSize) private var textSize
+    #if DEBUG && targetEnvironment(simulator)
+    @State private var previewAttempts = 0
+    #endif
+    private var cardHeight: CGFloat { textSize.isAccessibilitySize ? 300 : 230 }
+    private var coverTitle: String { "\(item.isVideo ? "视频" : "图片") · #\(item.id)\(item.username.map { " · \($0)" } ?? "")" }
     var body: some View {
         ZStack(alignment: .topTrailing) {
             Button(action: open) {
                 Group {
                     if item.isVideo, let source = item.mediaURL {
                         CachedPoster(source: source, declared: item.posterURL, retryToken: retry,
-                                     onFailure: { failure = $0 ? "封面暂时无法加载" : nil }, showsFailure: false).blur(radius: blurred ? 20 : 0)
+                                     onFailure: { failed in
+                                         #if DEBUG && targetEnvironment(simulator)
+                                         if !failed { previewAttempts += 1 }
+                                         #endif
+                                         failure = failed ? "封面暂时无法加载" : nil
+                                     }, showsFailure: false,
+                                     placeholderTitle: "视频 · #\(item.id)\(item.username.map { " · \($0)" } ?? "")", imageBlur: blurred ? 20 : 0)
                     } else if let url = item.mediaURL {
                         CachedImage(url: url, allowsRetry: false, retryToken: retry, showsFailure: false,
-                                    onFailureMessage: { failure = $0 }).blur(radius: blurred ? 20 : 0)
+                                    onFailureMessage: { message in
+                                        #if DEBUG && targetEnvironment(simulator)
+                                        if message == nil { previewAttempts += 1 }
+                                        #endif
+                                        failure = message
+                                    },
+                                    placeholderTitle: "图片 · #\(item.id)\(item.username.map { " · \($0)" } ?? "")", imageBlur: blurred ? 20 : 0)
                     } else {
                         ZStack {
                             Color.secondary.opacity(0.1)
-                            Label(item.isVideo ? "暂无封面" : "暂无图片", systemImage: "photo").font(.caption).foregroundStyle(.secondary)
+                            CoverPlaceholder(symbol: item.isVideo ? "play.rectangle" : "photo",
+                                title: "\(item.isVideo ? "视频" : "图片") · #\(item.id)\(item.username.map { " · \($0)" } ?? "")")
                         }
                     }
-                }.frame(height: 230).contentShape(Rectangle())
+                }.opacity(failure == nil ? 1 : 0).frame(height: cardHeight).contentShape(Rectangle())
             }.buttonStyle(.plain).accessibilityLabel("\(item.isVideo ? "视频" : "图片") \(item.id)")
                 .accessibilityIdentifier("media.grid.cell.\(item.id)")
             if item.isVideo {
                 Image(systemName: "play.fill").font(.caption).foregroundStyle(.white).padding(8).background(.black.opacity(0.4), in: Circle()).padding(8).allowsHitTesting(false)
             }
             if let failure {
-                MediaLoadFailureContent(message: failure, symbol: item.isVideo ? "play.rectangle" : "photo",
+                MediaLoadFailureContent(message: failure, workTitle: coverTitle, symbol: item.isVideo ? "play.rectangle" : "photo",
                                         retryLabel: item.isVideo ? "重试封面" : "重试图片",
                                         retryIdentifier: "media.grid.retry.\(item.id)", retry: { retry += 1 })
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-        }.frame(height: 230).clipShape(RoundedRectangle(cornerRadius: 9))
+        }.frame(height: cardHeight).clipShape(RoundedRectangle(cornerRadius: 9))
+        #if DEBUG && targetEnvironment(simulator)
+        .overlay(alignment: .bottomLeading) {
+            if ProcessInfo.processInfo.arguments.contains("--qa-grid-retry55") {
+                Text("attempts=\(previewAttempts)").font(.system(size: 1)).frame(width: 1, height: 1).opacity(0.01).allowsHitTesting(false)
+                    .accessibilityIdentifier("grid.preview.attempts.\(item.id)").accessibilityValue("attempts=\(previewAttempts)")
+            }
+        }
+        #endif
     }
 }
 

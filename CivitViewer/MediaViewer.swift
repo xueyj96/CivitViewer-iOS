@@ -870,6 +870,7 @@ struct MediaPageView: View {
 /// so a retry cannot accidentally navigate into the failed work.
 struct MediaLoadFailureContent: View {
     let message: String
+    var workTitle: String? = nil
     var symbol = "photo"
     var retryLabel = "重试图片"
     var retryIdentifier = ""
@@ -877,6 +878,7 @@ struct MediaLoadFailureContent: View {
     var body: some View {
         VStack(spacing: 8) {
             Image(systemName: symbol).font(.title3).foregroundStyle(.secondary)
+            if let workTitle { Text(workTitle).font(.caption.weight(.medium)).lineLimit(1).foregroundStyle(.secondary) }
             Text(message).font(.caption).multilineTextAlignment(.center).lineLimit(3)
                 .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             if let retry {
@@ -897,6 +899,9 @@ struct CachedImage: View {
     var onFailure: ((Bool) -> Void)? = nil
     var showsFailure = true
     var onFailureMessage: ((String?) -> Void)? = nil
+    var placeholderTitle: String? = nil
+    var placeholderSymbol = "photo"
+    var imageBlur: CGFloat = 0
     @State private var image: UIImage?
     @State private var failure: String?
     @State private var retry = 0
@@ -908,6 +913,9 @@ struct CachedImage: View {
                 if let image {
                     Image(uiImage: image).resizable().aspectRatio(contentMode: fit ? .fit : .fill)
                         .frame(width: geometry.size.width, height: geometry.size.height).clipped()
+                        .blur(radius: imageBlur)
+                } else if let placeholderTitle {
+                    CoverPlaceholder(symbol: placeholderSymbol, title: placeholderTitle)
                 } else if let failure {
                     if showsFailure {
                         MediaLoadFailureContent(message: failure, retry: allowsRetry ? { retry += 1 } : nil)
@@ -919,6 +927,9 @@ struct CachedImage: View {
             guard !Task.isCancelled else { return }
             onReady?(false); onFailure?(false); onFailureMessage?(nil); image = nil; failure = nil
             do {
+                #if DEBUG && targetEnvironment(simulator)
+                if placeholderTitle != nil && ProcessInfo.processInfo.arguments.contains("--qa-cover69-wait") { try await Task.sleep(for: .seconds(6)) }
+                #endif
                 let value = try await MediaCache.shared.loadImage(url)
                 guard !Task.isCancelled else { return }
                 image = value; onReady?(true)

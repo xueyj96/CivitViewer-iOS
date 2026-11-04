@@ -487,6 +487,18 @@ struct CollectionPagingQAView: View {
         // The QA transport control covers only the existing 104pt timeline
         // header, outside the native media viewport. It never resizes the deck.
         .overlay(alignment: .topTrailing) { if AutoContinuationQA.enabled { AutoContinuationQAReadback() } }
+        .overlay(alignment: .topTrailing) {
+            if ProcessInfo.processInfo.arguments.contains("--qa-favorite-save69-delay") {
+                let value = "pending=\(session.savingFavoriteID ?? -1);saved=\(!(session.savedMemberships[28_037_100] ?? []).isEmpty);message=\(session.message != nil)"
+                Text(value).font(.system(size: 1)).frame(width: 1, height: 1).opacity(0.01).allowsHitTesting(false)
+                    .accessibilityIdentifier("favorite69.qa.state").accessibilityValue(value)
+            }
+        }
+        .alert("Civit Viewer", isPresented: Binding(get: {
+            ProcessInfo.processInfo.arguments.contains("--qa-favorite-save69-delay") && session.message != nil
+        }, set: { if !$0 { session.message = nil } })) {
+            Button("好") { session.message = nil }
+        } message: { Text(session.message ?? "") }
         .overlay(alignment: .topLeading) { if CollectionPagingQA.playbackDiagnosticMode != nil { PlaybackDiagnostics43Readback() } }
         .overlay(alignment: .bottomTrailing) {
             if ready && ProcessInfo.processInfo.arguments.contains("--qa-poster-late51") {

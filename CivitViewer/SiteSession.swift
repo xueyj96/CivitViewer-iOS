@@ -20,6 +20,8 @@ final class SiteSession: NSObject, ObservableObject, WKNavigationDelegate, WKUID
     @Published private(set) var collectionsKnown = false
     @Published private(set) var savedMemberships: [Int: Set<Int>] = [:]
     @Published private(set) var pendingFavorites = Set<Int>()
+    @Published private(set) var savingFavoriteID: Int?
+    private var favoriteSaveToken: UUID?
     @Published private(set) var collectionRevision = 0
     @Published private(set) var savedMembershipUpdate: SavedMembershipUpdate?
     private let collectionRead = CollectionRead<[SavedCollection]>()
@@ -99,6 +101,9 @@ final class SiteSession: NSObject, ObservableObject, WKNavigationDelegate, WKUID
         collections = [CollectionPagingQA.collection]; collectionsKnown = true
         if VisualControlsQA.enabled {
             following = []; followsKnown = true; savedMemberships = [:]
+            if ProcessInfo.processInfo.arguments.contains("--qa-favorite-save69-start-saved") {
+                savedMemberships[28_037_100] = [CollectionPagingQA.collection.id]
+            }
             if VisualControlsQA.state == "busy" { pendingUsers = [VisualControlsQA.creatorID] }
             if VisualControlsQA.state == "unknown" { unknownUsers = [VisualControlsQA.creatorID] }
         }
@@ -636,6 +641,7 @@ final class SiteSession: NSObject, ObservableObject, WKNavigationDelegate, WKUID
     }
 
     private func clearCollectionState() {
+        favoriteSaveToken = nil; savingFavoriteID = nil
         collectionRead.invalidate()
         for read in membershipReads.values { read.invalidate() }
         collections = []; collectionsKnown = false; savedMemberships = [:]
@@ -701,9 +707,46 @@ final class SiteSession: NSObject, ObservableObject, WKNavigationDelegate, WKUID
         return Set(rows.map(\.collectionId))
     }
 
-    func saveCollectionSelection(imageID: Int, original: Set<Int>, selected: Set<Int>) async throws {
+    /// The session owns this one in-flight save, so dismissing the picker or
+    /// paging away does not cancel it or leave its failure in a discarded view.
+    func submitCollectionSelection(imageID: Int, original: Set<Int>, selected: Set<Int>) throws {
+        guard let actorID = account?.id, hasCollectionAccess else { throw ClientError.collectionAuthorization }
+        guard savingFavoriteID == nil, pendingFavorites.isEmpty, !creatingCollection else { throw ClientError.collectionBusy }
+        let generation = authGeneration, token = UUID()
+        favoriteSaveToken = token; savingFavoriteID = imageID
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.favoriteSaveToken == token { self.favoriteSaveToken = nil; self.savingFavoriteID = nil }
+            }
+            guard self.acceptsFavoriteSave(token, actorID: actorID, generation: generation) else { return }
+            do {
+                try await self.saveCollectionSelection(imageID: imageID, original: original, selected: selected, token: token)
+                guard self.acceptsFavoriteSave(token, actorID: actorID, generation: generation) else { return }
+                self.rememberCollectionSelection(selected)
+            } catch {
+                guard self.acceptsFavoriteSave(token, actorID: actorID, generation: generation) else { return }
+                self.message = error.localizedDescription
+            }
+        }
+    }
+
+    private func acceptsFavoriteSave(_ token: UUID, actorID: Int, generation: Int) -> Bool {
+        favoriteSaveToken == token && generation == authGeneration && account?.id == actorID && hasCollectionAccess && !showLogin
+    }
+
+    private func saveCollectionSelection(imageID: Int, original: Set<Int>, selected: Set<Int>, token: UUID) async throws {
         #if DEBUG && targetEnvironment(simulator)
         if VisualControlsQA.enabled {
+            if ProcessInfo.processInfo.arguments.contains("--qa-favorite-save69-delay") {
+                try await Task.sleep(for: .seconds(6))
+            }
+            if ProcessInfo.processInfo.arguments.contains("--qa-favorite-save69-account-change") {
+                clearCollectionState()
+                throw ClientError.accountChanged
+            }
+            guard favoriteSaveToken == token else { throw ClientError.accountChanged }
+            if ProcessInfo.processInfo.arguments.contains("--qa-favorite-save69-failure") { throw ClientError.collectionWriteUnknown }
             guard account?.id == CollectionPagingQA.ownerID,
                   CollectionPagingQA.items.contains(where: { $0.id == imageID }),
                   original == (savedMemberships[imageID] ?? []),
@@ -718,12 +761,12 @@ final class SiteSession: NSObject, ObservableObject, WKNavigationDelegate, WKUID
         pendingFavorites.insert(imageID); defer { pendingFavorites.remove(imageID) }
         invalidateMembershipRead(imageID)
         let identity: Account? = try await request(path: "/api/auth/session", sessionIdentityOnly: true)
-        guard identity?.id == actorID, generation == authGeneration, !showLogin else { throw ClientError.accountChanged }
+        guard identity?.id == actorID, acceptsFavoriteSave(token, actorID: actorID, generation: generation) else { throw ClientError.accountChanged }
         try await refreshCollections()
         let current = try await refreshSavedMembership(imageID, force: true)
         let change = CollectionSelectionChange(original: original, selected: selected, editable: Set(collections.map(\.id)), current: current)
         guard !change.isEmpty else { return }
-        guard generation == authGeneration, account?.id == actorID, !showLogin else { throw ClientError.accountChanged }
+        guard acceptsFavoriteSave(token, actorID: actorID, generation: generation) else { throw ClientError.accountChanged }
         do {
             let _: CollectionWriteResult = try await rpc("collection.saveItem", input: [
                 "imageId": imageID, "type": "Image",
@@ -733,13 +776,16 @@ final class SiteSession: NSObject, ObservableObject, WKNavigationDelegate, WKUID
         } catch {
             // The server may have committed before a timeout. Read, never replay.
         }
+        guard acceptsFavoriteSave(token, actorID: actorID, generation: generation) else { throw ClientError.accountChanged }
         collectionRevision += 1
         invalidateMembershipRead(imageID)
         do {
             let after = try await refreshSavedMembership(imageID, force: true)
+            guard acceptsFavoriteSave(token, actorID: actorID, generation: generation) else { throw ClientError.accountChanged }
             guard change.isConfirmed(by: after) else { throw ClientError.collectionWriteUnknown }
             savedMembershipUpdate = .init(accountID: actorID, imageID: imageID, collectionIDs: after)
         } catch {
+            guard acceptsFavoriteSave(token, actorID: actorID, generation: generation) else { throw ClientError.accountChanged }
             savedMemberships[imageID] = nil
             membershipReadAt[imageID] = nil
             throw ClientError.collectionWriteUnknown

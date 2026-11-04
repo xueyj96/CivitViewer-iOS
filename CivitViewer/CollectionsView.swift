@@ -10,11 +10,18 @@ struct FavoriteButton: View {
     @State private var chromeOverlay = UUID()
     @ObservedObject private var chrome = ViewingChromeController.shared
     private var saved: Bool { !(session.savedMemberships[item.id] ?? []).isEmpty }
+    private var saving: Bool { session.savingFavoriteID == item.id }
     var body: some View {
         Button { showPicker = true } label: {
-            MediaIconActionLabel(title: saved ? "已收藏" : "收藏", symbol: saved ? "bookmark.fill" : "bookmark", qaKey: "control.\(item.id).favorite")
+            ZStack(alignment: .bottomTrailing) {
+                MediaIconActionLabel(title: saved ? "已收藏" : "收藏", symbol: saved ? "bookmark.fill" : "bookmark", qaKey: "control.\(item.id).favorite")
+                if saving {
+                    ProgressView().controlSize(.mini).frame(width: 14, height: 14)
+                        .accessibilityIdentifier("favorite-saving-\(item.id)")
+                }
+            }
         }
-        .buttonStyle(.plain).accessibilityLabel(saved ? "已收藏" : "收藏")
+        .buttonStyle(.plain).disabled(saving).accessibilityLabel(saving ? "正在保存收藏" : (saved ? "已收藏" : "收藏"))
         .accessibilityIdentifier("favorite-\(item.id)")
         .sheet(isPresented: $showPicker, onDismiss: { chrome.resume(after: chromeOverlay) }) { FavoriteEditor(item: item) }
         .onChange(of: showPicker) { _, shown in
@@ -108,9 +115,9 @@ private struct FavoriteEditor: View {
     @State private var selected = Set<Int>()
     @State private var loading = false
     @State private var loaded = false
-    @State private var saving = false
     @State private var error: String?
     @State private var showCreate = false
+    private var saving: Bool { session.savingFavoriteID != nil || !session.pendingFavorites.isEmpty }
     var body: some View {
         NavigationStack {
             Group {
@@ -131,7 +138,15 @@ private struct FavoriteEditor: View {
                             }
                         } footer: { Text("新收藏默认勾选上次保存的收藏夹。取消勾选会从对应收藏夹移除；公开收藏夹中的作品可被他人看到。") }
                         Button { showCreate = true } label: { Label("新建私密收藏夹", systemImage: "folder.badge.plus") }.disabled(saving || loading)
-                        if loading || saving { ProgressView(saving ? "正在保存并核对…" : "正在读取收藏状态…") }
+                        if loading || saving {
+                            HStack(spacing: 8) {
+                                Spacer(minLength: 0)
+                                ProgressView().controlSize(.small)
+                                Text(saving ? "上一笔收藏保存中" : "正在读取收藏状态")
+                                    .font(.footnote).foregroundStyle(.secondary)
+                                Spacer(minLength: 0)
+                            }.frame(maxWidth: .infinity).accessibilityIdentifier("favorite-editor-status")
+                        }
                         if let error {
                             Text(error).font(.caption).foregroundStyle(.secondary)
                             Button("重新读取收藏状态") { Task { await load() } }.disabled(saving || loading)
@@ -141,12 +156,11 @@ private struct FavoriteEditor: View {
             }
             .navigationTitle(item.isVideo ? "收藏视频" : "收藏图片").navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                AppToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() }.disabled(saving) }
-                AppToolbarItem(placement: .confirmationAction) { Button("保存") { Task { await save() } }.disabled(!loaded || loading || saving || selected == original) }
+                AppToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
+                AppToolbarItem(placement: .confirmationAction) { Button("保存") { save() }.disabled(!loaded || loading || saving || selected == original) }
             }
             .task(id: "\(session.account?.id ?? -1):\(session.hasCollectionAccess)") { if session.hasCollectionAccess { await load() } }
             .sheet(isPresented: $showCreate) { CreateCollectionView { collection in selected.insert(collection.id) } }
-            .interactiveDismissDisabled(saving)
         }.ordinaryAppearance().environment(\.defaultMinListRowHeight, 52)
     }
     private func load() async {
@@ -158,10 +172,9 @@ private struct FavoriteEditor: View {
             original = ids; selected = ids.isEmpty ? session.defaultCollectionIDs : ids; loaded = true
         } catch { self.error = error.localizedDescription }
     }
-    private func save() async {
-        guard loaded && !saving else { return }; saving = true; error = nil
-        defer { saving = false }
-        do { try await session.saveCollectionSelection(imageID: item.id, original: original, selected: selected); session.rememberCollectionSelection(selected); dismiss() }
+    private func save() {
+        guard loaded && !saving else { return }; error = nil
+        do { try session.submitCollectionSelection(imageID: item.id, original: original, selected: selected); dismiss() }
         catch { self.error = error.localizedDescription; loaded = false }
     }
 }
