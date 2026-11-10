@@ -3,17 +3,19 @@
 Sparse fixtures test 6.3 GB of logical file sizes without downloading or
 allocating 6.3 GB. This tests eviction order/budget, not video throughput.
 """
+import argparse
 import datetime
 import json
 import os
 from pathlib import Path
 import plistlib
 import subprocess
-import sys
 import time
 import uuid
 
-device = sys.argv[1]
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("device", help="UUID of the dedicated Civit Viewer QA simulator")
+device = parser.parse_args().device
 bundle = "com.xueyj.civitviewer"
 env = dict(os.environ, DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer")
 
@@ -23,12 +25,14 @@ def sim(*args, check=True):
 
 inventory = json.loads(sim("list", "devices", "available", "--json").stdout)
 matches = [d for group in inventory["devices"].values() for d in group if d["udid"] == device]
-assert len(matches) == 1 and matches[0]["name"] == "Civit Viewer QA", "Only use the dedicated QA simulator"
+if len(matches) != 1 or matches[0]["name"] != "Civit Viewer QA":
+    parser.error("Only the dedicated Civit Viewer QA simulator is allowed")
 sim("terminate", device, bundle, check=False)
 container = Path(sim("get_app_container", device, bundle, "data").stdout.strip())
 preferences = container / "Library/Preferences" / (bundle + ".plist")
 limit = plistlib.loads(preferences.read_bytes()).get("cacheLimitGB", 5) if preferences.exists() else 5
-assert limit == 5, "The QA simulator must be using the normal 5 GB default"
+if limit != 5:
+    parser.error("The QA simulator must be using the normal 5 GB default")
 directory = container / "Library/Caches/CivitMedia"
 directory.mkdir(parents=True, exist_ok=True)
 prefix = "qa-lru-" + uuid.uuid4().hex

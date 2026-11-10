@@ -26,7 +26,7 @@ enum TagDirectoryQuality {
 enum TagDirectoryMode: String, CaseIterable, Identifiable {
     case common, catalog
     var id: Self { self }
-    var title: String { self == .common ? "站内常用" : "标签目录" }
+    var title: String { self == .common ? "常用" : "全部标签" }
 }
 struct TagDirectoryCursor {
     let page: Int
@@ -57,7 +57,7 @@ extension TagDirectorySource {
     }
 }
 @MainActor final class TagDirectoryStore: ObservableObject {
-    struct Key: Equatable { let mode: TagDirectoryMode; let keyword: String; let identity: String }
+    struct Key: Hashable { let mode: TagDirectoryMode; let keyword: String; let identity: String }
     @Published private(set) var tags: [SearchTag] = []
     @Published private(set) var key: Key?
     @Published private(set) var loading = false

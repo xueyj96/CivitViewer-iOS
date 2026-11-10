@@ -2,10 +2,22 @@ import Foundation
 import WebKit
 import Combine
 
-/// OAuth credentials stay in this app's Keychain. A non-persistent real-origin
-/// WebKit context is used only for anonymous site requests when needed.
+/// Owns the current account and qualifies site responses before updating browsing or account state.
 @MainActor
-final class SiteSession: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate, PublicationSource, MediaSearchSource, TagDirectorySource, FollowingListSource, TagCandidateSource, TagLibrarySource, TimelineReading {
+final class SiteSession: NSObject, ObservableObject, PublicationSource, MediaSearchSource, TagDirectorySource, FollowingListSource, TagCandidateSource, TagLibrarySource, TimelineReading {
+    struct AccountSessionID: Hashable {
+        let accountID: Int
+        fileprivate let generation: Int
+    }
+
+    var accountSessionID: AccountSessionID? {
+        account.map { AccountSessionID(accountID: $0.id, generation: authGeneration) }
+    }
+
+    var collectionSessionID: AccountSessionID? {
+        hasCollectionAccess ? accountSessionID : nil
+    }
+
     static let origin = "https://civitai.red"
     @Published private(set) var account: Account?
     @Published private(set) var following = Set<Int>()
@@ -19,22 +31,28 @@ final class SiteSession: NSObject, ObservableObject, WKNavigationDelegate, WKUID
     @Published private(set) var collections: [SavedCollection] = []
     @Published private(set) var collectionsKnown = false
     @Published private(set) var savedMemberships: [Int: Set<Int>] = [:]
-    @Published private(set) var pendingFavorites = Set<Int>()
     @Published private(set) var savingFavoriteID: Int?
+    @Published private var optimisticBookmark: (imageID: Int, saved: Bool)?
     private var favoriteSaveToken: UUID?
     @Published private(set) var collectionRevision = 0
     @Published private(set) var savedMembershipUpdate: SavedMembershipUpdate?
     private let collectionRead = CollectionRead<[SavedCollection]>()
-    private var creatingCollection = false
     private var membershipReadAt: [Int: Date] = [:]
     private var membershipReads: [Int: CollectionRead<Set<Int>>] = [:]
-    let oauth = OAuthLogin()
-    let webView: WKWebView
-    private var loadingDocument = false
+    let oauth: OAuthLogin
+    private let webContext: SiteWebContext
+    private let requestClient: SiteRequestClient
+    var webView: WKWebView { webContext.webView }
     private var authGeneration = 0
     #if DEBUG
     private(set) var tagRPCReads = 0
     private(set) var tagCandidateReads = 0
+    #endif
+    #if DEBUG && targetEnvironment(simulator)
+    private var simulatedBatchFailure = false
+    private var simulatedTagPageFailure = false
+    private static let simulatesTagDirectoryPagination = CollectionPagingQA.enabled &&
+        ProcessInfo.processInfo.arguments.contains("--qa-tag-directory-pagination")
     #endif
     var feedIdentity: String { "\(authGeneration):\(account?.id ?? -1):\(account?.browsingLevel ?? -1)" }
     var tagEvidenceIdentity: String {
@@ -52,14 +70,12 @@ final class SiteSession: NSObject, ObservableObject, WKNavigationDelegate, WKUID
     var tagLookupIdentity: String { tagLibraryIdentity + "|" + feedIdentity }
 
     override init() {
-        let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .nonPersistent()
-        configuration.allowsInlineMediaPlayback = true
-        webView = WKWebView(frame: .zero, configuration: configuration)
+        let oauth = OAuthLogin()
+        let webContext = SiteWebContext(origin: Self.origin)
+        self.oauth = oauth
+        self.webContext = webContext
+        requestClient = SiteRequestClient(origin: Self.origin, oauth: oauth, web: webContext, cooldown: .shared)
         super.init()
-        webView.navigationDelegate = self
-        webView.uiDelegate = self
-        webView.allowsBackForwardNavigationGestures = true
         oauth.onAuthenticated = { [weak self] in
             self?.authGeneration += 1
             self?.clearCollectionState()
@@ -98,7 +114,8 @@ final class SiteSession: NSObject, ObservableObject, WKNavigationDelegate, WKUID
             }
             if special { TagObservationStore.shared.recordEmpty(tagID: 42_002, scope: tagEvidenceIdentity, policy: policy) }
         }
-        collections = [CollectionPagingQA.collection]; collectionsKnown = true
+        collectionsKnown = CollectionListCacheQA.fixture == nil
+        collections = collectionsKnown ? CollectionPagingQA.collections : []
         if VisualControlsQA.enabled {
             following = []; followsKnown = true; savedMemberships = [:]
             if ProcessInfo.processInfo.arguments.contains("--qa-favorite-save69-start-saved") {
@@ -106,6 +123,14 @@ final class SiteSession: NSObject, ObservableObject, WKNavigationDelegate, WKUID
             }
             if VisualControlsQA.state == "busy" { pendingUsers = [VisualControlsQA.creatorID] }
             if VisualControlsQA.state == "unknown" { unknownUsers = [VisualControlsQA.creatorID] }
+        }
+        if ProcessInfo.processInfo.arguments.contains("--qa-collection-batch-manage") {
+            for item in CollectionPagingQA.items {
+                savedMemberships[item.id] = [CollectionPagingQA.collection.id]
+            }
+            if let second = collections.dropFirst().first {
+                savedMemberships[28_037_100, default: []].insert(second.id)
+            }
         }
         if ViewportAuditQA.enabled { following = [CollectionPagingQA.ownerID]; followsKnown = true }
     }
@@ -136,7 +161,7 @@ final class SiteSession: NSObject, ObservableObject, WKNavigationDelegate, WKUID
         let generation = authGeneration
         guard oauth.hasCredentials else { account = nil; following = []; followsKnown = false; clearCollectionState(); return }
         do {
-            let value: Account? = try await request(path: "/api/auth/session", sessionIdentityOnly: true)
+            let value: Account? = try await request(path: "/api/auth/session", response: .identity)
             guard generation == authGeneration, oauth.hasCredentials else { return }
             if account?.id != value?.id { following = []; followsKnown = false; unknownUsers = []; clearCollectionState() }
             account = value
@@ -207,7 +232,7 @@ final class SiteSession: NSObject, ObservableObject, WKNavigationDelegate, WKUID
         defer { pendingUsers.remove(creator.id) }
         // This is a toggle API: always read before deciding to issue ONE mutation.
         do {
-            let identity: Account? = try await request(path: "/api/auth/session", sessionIdentityOnly: true)
+            let identity: Account? = try await request(path: "/api/auth/session", response: .identity)
             guard identity?.id == actorID else {
                 account = identity; following = []; followsKnown = false
                 throw ClientError.accountChanged
@@ -268,20 +293,8 @@ final class SiteSession: NSObject, ObservableObject, WKNavigationDelegate, WKUID
         if !filter.onlyPG, let level = account?.browsingLevel {
             components.queryItems?.append(.init(name: "browsingLevel", value: String(level)))
         }
-        if oauth.hasCredentials {
-            return try await request(path: components.url!.path + "?" + (components.percentEncodedQuery ?? ""))
-        }
-        let (data, response) = try await SiteRequestCooldown.shared.performRead {
-            try await URLSession.shared.data(from: components.url!)
-        }
-        guard let response = response as? HTTPURLResponse else { throw ClientError.invalidResponse }
-        if response.statusCode == 403 {
-            // Some site edges reject non-browser clients. Use the real embedded
-            // website session; do not spoof browser headers or bypass challenges.
-            return try await request(path: components.url!.path + "?" + (components.percentEncodedQuery ?? ""))
-        }
-        try SiteRequestCooldown.shared.validateResponse(status: response.statusCode, retryAfter: response.value(forHTTPHeaderField: "Retry-After"))
-        return try JSONDecoder().decode(MediaPage.self, from: data)
+        let path = components.url!.path + "?" + (components.percentEncodedQuery ?? "")
+        return try await request(path: path, preferPublicREST: true)
     }
 
     private func followingPage(filter: FeedFilter, cursor: String?, includeTags: Bool) async throws -> MediaPage {
@@ -303,14 +316,8 @@ final class SiteSession: NSObject, ObservableObject, WKNavigationDelegate, WKUID
         guard !scoped.isEmpty else { return MediaPage(items: [], metadata: .init(nextCursor: page.nextCursor)) }
         // One batched hydration gives us the site's real media URLs and safe video
         // thumbnails. It is not one request per creator or per media item.
-        var components = URLComponents(string: "/api/v1/images")!
-        components.queryItems = [
-            .init(name: "ids", value: scoped.map { String($0.id) }.joined(separator: ",")),
-            .init(name: "limit", value: String(scoped.count)),
-            .init(name: "browsingLevel", value: String(filter.onlyPG ? 1 : (account?.browsingLevel ?? 1)))
-        ]
-        if includeTags { components.queryItems?.append(.init(name: "withTags", value: "true")) }
-        let media: MediaPage = try await request(path: components.string!)
+        let media = try await hydrateMedia(ids: scoped.map(\.id), browsingLevel: filter.onlyPG ? 1 : (account?.browsingLevel ?? 1),
+                                           includeTags: includeTags)
         guard identity == feedIdentity else { throw ClientError.accountChanged }
         let byID = Dictionary(media.items.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let ordered = scoped.compactMap { row -> MediaItem? in
@@ -380,8 +387,9 @@ final class SiteSession: NSObject, ObservableObject, WKNavigationDelegate, WKUID
                     LeaderboardEntry(position: index, user: Creator(id: base + index, username: "Pattern Creator \(index)"))
                 }
             }
+            let firstRank = ProcessInfo.processInfo.arguments.contains("--qa-leaderboard-three-digits") ? 108 : 1
             return (0..<8).map { index in
-                LeaderboardEntry(position: index + 1, user: Creator(id: CollectionPagingQA.ownerID + index, username: "Pattern Creator \(index + 1)"))
+                LeaderboardEntry(position: firstRank + index, user: Creator(id: CollectionPagingQA.ownerID + index, username: "Pattern Creator \(index + 1)"))
             }
         }
         #endif
@@ -391,6 +399,7 @@ final class SiteSession: NSObject, ObservableObject, WKNavigationDelegate, WKUID
     func latestPublication(creator: Creator) async throws -> PublicationResult {
         #if DEBUG && targetEnvironment(simulator)
         if CollectionPagingQA.enabled && ProcessInfo.processInfo.arguments.contains("--qa-author-activity58") {
+            try await Task.sleep(for: .milliseconds(300))
             return .published(Date().addingTimeInterval(creator.id.isMultiple(of: 4) ? -3_600 : -259_200))
         }
         #endif
@@ -416,6 +425,10 @@ final class SiteSession: NSObject, ObservableObject, WKNavigationDelegate, WKUID
 
     func mediaItems(ids: [Int], includeTags: Bool = true) async throws -> [MediaItem] {
         #if DEBUG && targetEnvironment(simulator)
+        if CollectionPagingQA.detailsTagsEnabled {
+            if ProcessInfo.processInfo.arguments.contains("--qa-details-tags-failure") { throw ClientError.invalidResponse }
+            return CollectionPagingQA.items.filter { ids.contains($0.id) }
+        }
         if ViewportAuditQA.enabled { return ViewportAuditQA.mediaItems(ids: ids) }
         if ResumePromptQA.enabled {
             if ResumePromptQA.scenario == "restore-failure" {
@@ -425,13 +438,23 @@ final class SiteSession: NSObject, ObservableObject, WKNavigationDelegate, WKUID
         }
         #endif
         guard !ids.isEmpty, ids.count <= 30 else { return [] }
-        var components = URLComponents(string: "/api/v1/images")!
-        components.queryItems = [.init(name: "ids", value: ids.map(String.init).joined(separator: ",")), .init(name: "limit", value: String(ids.count)),
-                                 .init(name: "browsingLevel", value: String(account?.browsingLevel ?? 1))]
-        if includeTags { components.queryItems?.append(.init(name: "withTags", value: "true")) }
-        let page: MediaPage = try await request(path: components.string!)
+        let page = try await hydrateMedia(ids: ids, browsingLevel: account?.browsingLevel ?? 1, includeTags: includeTags)
         guard page.items.allSatisfy({ ids.contains($0.id) }) else { throw ClientError.invalidResponse }
         return page.items
+    }
+
+    private func hydrateMedia(ids: [Int], browsingLevel: Int, includeTags: Bool) async throws -> MediaPage {
+        var components = URLComponents()
+        components.path = "/api/v1/images"
+        var query = [
+            URLQueryItem(name: "ids", value: ids.map(String.init).joined(separator: ",")),
+            URLQueryItem(name: "limit", value: String(ids.count)),
+            URLQueryItem(name: "browsingLevel", value: String(browsingLevel))
+        ]
+        if includeTags { query.append(.init(name: "withTags", value: "true")) }
+        components.queryItems = query
+        guard let path = components.string else { throw ClientError.invalidResponse }
+        return try await request(path: path)
     }
 
     func searchAuthors(keyword: String) async throws -> [Creator] {
@@ -459,6 +482,7 @@ final class SiteSession: NSObject, ObservableObject, WKNavigationDelegate, WKUID
     }
     func directoryPage(mode: TagDirectoryMode, keyword: String, cursor: TagDirectoryCursor?) async throws -> TagDirectoryPage {
         #if DEBUG && targetEnvironment(simulator)
+        if Self.simulatesTagDirectoryPagination { return .init(items: [], next: nil) }
         if CollectionPagingQA.enabled && (ProcessInfo.processInfo.arguments.contains("--qa-style48") || ProcessInfo.processInfo.arguments.contains("--qa-tag-availability55")) {
             let normalized = TagPolicy.normalize(keyword)
             let tags = CollectionPagingQA.neutralDetailsTags.compactMap { value -> SearchTag? in
@@ -474,6 +498,26 @@ final class SiteSession: NSObject, ObservableObject, WKNavigationDelegate, WKUID
     }
     func onlineTagPage(mode: TagDirectoryMode, keyword: String, page: Int) async throws -> [SearchTag]? {
         #if DEBUG && targetEnvironment(simulator)
+        if Self.simulatesTagDirectoryPagination {
+            guard mode == .catalog, keyword.isEmpty else { return [] }
+            if page == 2 && !simulatedTagPageFailure {
+                simulatedTagPageFailure = true
+                throw URLError(.timedOut)
+            }
+            let rows: Range<Int>
+            switch page {
+            case 1: rows = 1..<21
+            case 2: rows = 21..<41
+            case 3: rows = 41..<44
+            default: return []
+            }
+            return rows.map { index in
+                let name = index == 43
+                    ? "paging fixture 43 with an unusually long tag name for narrow layouts"
+                    : String(format: "paging fixture %02d", index)
+                return SearchTag(id: 43_000 + index, name: name)
+            }
+        }
         if CollectionPagingQA.enabled && (ProcessInfo.processInfo.arguments.contains("--qa-style48") || ProcessInfo.processInfo.arguments.contains("--qa-tag-availability55")) {
             if mode == .common && keyword.isEmpty {
                 return CollectionPagingQA.neutralDetailsTags.compactMap { value in
@@ -497,6 +541,9 @@ final class SiteSession: NSObject, ObservableObject, WKNavigationDelegate, WKUID
         return result
     }
     func rememberTags(_ tags: [SearchTag], common: Bool, identity: String) async throws {
+        #if DEBUG && targetEnvironment(simulator)
+        if Self.simulatesTagDirectoryPagination { return }
+        #endif
         guard identity == tagLookupIdentity, !Task.isCancelled else { throw ClientError.accountChanged }
         try await LocalTagLibrary.shared.rememberDiscovered(ownerID: tagLibraryOwnerID, tags: tags, common: common)
         guard identity == tagLookupIdentity else { throw ClientError.accountChanged }
@@ -619,29 +666,40 @@ final class SiteSession: NSObject, ObservableObject, WKNavigationDelegate, WKUID
         }
     }
 
-    func saveBrowsingPreferences(level: Int, blur: Bool?) async -> Bool {
-        guard let actorID = account?.id, (0...31).contains(level) else { message = ClientError.signedOut.localizedDescription; return false }
+    private func readVerifiedAccount(for expectedSession: AccountSessionID) async throws -> Account {
+        guard accountSessionID == expectedSession, oauth.hasCredentials else { throw ClientError.accountChanged }
+        let verified: Account? = try await request(path: "/api/auth/session", response: .identity)
+        guard let verified, verified.id == expectedSession.accountID,
+              accountSessionID == expectedSession, oauth.hasCredentials else { throw ClientError.accountChanged }
+        return verified
+    }
+
+    func saveBrowsingPreferences(level: Int, blur: Bool?, for expectedSession: AccountSessionID) async {
+        guard accountSessionID == expectedSession, (0...31).contains(level) else { return }
         var input: [String: Any] = ["browsingLevel": level]
         if let blur { input["blurNsfw"] = blur }
         do {
-            let identity: Account? = try await request(path: "/api/auth/session", sessionIdentityOnly: true)
-            guard identity?.id == actorID else { throw ClientError.accountChanged }
+            _ = try await readVerifiedAccount(for: expectedSession)
+            try Task.checkCancellation()
             do { let _: Bool? = try await rpc("user.updateBrowsingMode", input: input, mutation: true) }
             catch {
                 // Do not repeat an ambiguous write. Continue with a server readback.
             }
-            let updated: Account? = try await request(path: "/api/auth/session", sessionIdentityOnly: true)
-            guard updated?.id == actorID, account?.id == actorID, oauth.hasCredentials else { throw ClientError.accountChanged }
+            let updated = try await readVerifiedAccount(for: expectedSession)
             account = updated
-            guard updated?.browsingLevel == level, blur == nil || updated?.blurNsfw == blur else {
-                message = "服务器尚未确认这组偏好，保留当前读回值。"; return false
+            if updated.browsingLevel == level, blur == nil || updated.blurNsfw == blur {
+                message = "账号偏好已读回确认。"
+            } else {
+                message = "服务器尚未确认这组偏好，保留当前读回值。"
             }
-            message = "账号偏好已读回确认。"; return true
-        } catch { message = error.localizedDescription; return false }
+        } catch {
+            if !Task.isCancelled, accountSessionID == expectedSession { message = error.localizedDescription }
+        }
     }
 
     private func clearCollectionState() {
         favoriteSaveToken = nil; savingFavoriteID = nil
+        optimisticBookmark = nil
         collectionRead.invalidate()
         for read in membershipReads.values { read.invalidate() }
         collections = []; collectionsKnown = false; savedMemberships = [:]
@@ -651,7 +709,15 @@ final class SiteSession: NSObject, ObservableObject, WKNavigationDelegate, WKUID
 
     func refreshCollections() async throws {
         #if DEBUG && targetEnvironment(simulator)
-        if CollectionPagingQA.enabled { return }
+        if CollectionPagingQA.enabled {
+            if CollectionListCacheQA.fixture != nil, !collectionsKnown {
+                _ = try await collectionRead.task(load: {
+                    try await Task.sleep(for: .milliseconds(1_400))
+                    return CollectionPagingQA.collections
+                }, commit: { folders in self.collections = folders; self.collectionsKnown = true }).value
+            }
+            return
+        }
         #endif
         guard let actorID = account?.id else { throw ClientError.signedOut }
         guard hasCollectionAccess else { throw ClientError.collectionAuthorization }
@@ -672,8 +738,7 @@ final class SiteSession: NSObject, ObservableObject, WKNavigationDelegate, WKUID
         #if DEBUG && targetEnvironment(simulator)
         if VisualControlsQA.enabled { return savedMemberships[imageID] ?? [] }
         if CollectionPagingQA.enabled {
-            savedMemberships[imageID] = []; membershipReadAt[imageID] = Date()
-            return []
+            return savedMemberships[imageID] ?? []
         }
         #endif
         guard let actorID = account?.id, hasCollectionAccess else { throw ClientError.collectionAuthorization }
@@ -707,66 +772,209 @@ final class SiteSession: NSObject, ObservableObject, WKNavigationDelegate, WKUID
         return Set(rows.map(\.collectionId))
     }
 
+    private enum FavoriteSaveIntent {
+        case toggle(wasSaved: Bool)
+        case folders(original: Set<Int>, selected: Set<Int>)
+    }
+
+    func isBookmarked(_ imageID: Int) -> Bool {
+        if let optimisticBookmark, optimisticBookmark.imageID == imageID {
+            return optimisticBookmark.saved
+        }
+        return savedMemberships[imageID]?.isEmpty == false
+    }
+
+    func toggleFavorite(imageID: Int, wasSaved: Bool, for expectedSession: AccountSessionID) throws {
+        try submitFavoriteSave(imageID: imageID, intent: .toggle(wasSaved: wasSaved), for: expectedSession)
+    }
+
     /// The session owns this one in-flight save, so dismissing the picker or
     /// paging away does not cancel it or leave its failure in a discarded view.
-    func submitCollectionSelection(imageID: Int, original: Set<Int>, selected: Set<Int>) throws {
-        guard let actorID = account?.id, hasCollectionAccess else { throw ClientError.collectionAuthorization }
-        guard savingFavoriteID == nil, pendingFavorites.isEmpty, !creatingCollection else { throw ClientError.collectionBusy }
-        let generation = authGeneration, token = UUID()
+    func submitCollectionSelection(imageID: Int, original: Set<Int>, selected: Set<Int>, for expectedSession: AccountSessionID) throws {
+        try submitFavoriteSave(imageID: imageID, intent: .folders(original: original, selected: selected), for: expectedSession)
+    }
+
+    private func submitFavoriteSave(imageID: Int, intent: FavoriteSaveIntent, for expectedSession: AccountSessionID) throws {
+        try requireCollectionSession(expectedSession)
+        guard savingFavoriteID == nil else { throw ClientError.collectionBusy }
+        let token = UUID()
         favoriteSaveToken = token; savingFavoriteID = imageID
+        // Only the button projects the pending intent. Folder reads and
+        // offline downloads continue to consume confirmed memberships.
+        if case .toggle(let wasSaved) = intent {
+            optimisticBookmark = (imageID, !wasSaved)
+        }
         Task { @MainActor [weak self] in
             guard let self else { return }
             defer {
-                if self.favoriteSaveToken == token { self.favoriteSaveToken = nil; self.savingFavoriteID = nil }
+                if self.favoriteSaveToken == token {
+                    self.optimisticBookmark = nil
+                    self.favoriteSaveToken = nil; self.savingFavoriteID = nil
+                }
             }
-            guard self.acceptsFavoriteSave(token, actorID: actorID, generation: generation) else { return }
+            guard self.acceptsFavoriteSave(token, for: expectedSession) else { return }
             do {
-                try await self.saveCollectionSelection(imageID: imageID, original: original, selected: selected, token: token)
-                guard self.acceptsFavoriteSave(token, actorID: actorID, generation: generation) else { return }
-                self.rememberCollectionSelection(selected)
+                try await self.saveCollectionSelection(imageID: imageID, intent: intent, token: token, for: expectedSession)
             } catch {
-                guard self.acceptsFavoriteSave(token, actorID: actorID, generation: generation) else { return }
+                guard self.acceptsFavoriteSave(token, for: expectedSession) else { return }
                 self.message = error.localizedDescription
             }
         }
     }
 
-    private func acceptsFavoriteSave(_ token: UUID, actorID: Int, generation: Int) -> Bool {
-        favoriteSaveToken == token && generation == authGeneration && account?.id == actorID && hasCollectionAccess && !showLogin
+    private func requireCollectionSession(_ expectedSession: AccountSessionID) throws {
+        guard accountSessionID == expectedSession else { throw ClientError.accountChanged }
+        guard collectionSessionID == expectedSession else { throw ClientError.collectionAuthorization }
     }
 
-    private func saveCollectionSelection(imageID: Int, original: Set<Int>, selected: Set<Int>, token: UUID) async throws {
+    private func acceptsFavoriteSave(_ token: UUID, for expectedSession: AccountSessionID) -> Bool {
+        favoriteSaveToken == token && collectionSessionID == expectedSession && !showLogin
+    }
+
+    /// Confirm each work separately so a partial save can be resumed safely.
+    func updateFavorites(_ ids: Set<Int>, folders: Set<Int>, removing: Bool,
+                         for expectedSession: AccountSessionID) async throws -> (confirmed: Set<Int>, error: String?) {
+        try requireCollectionSession(expectedSession)
+        let actorID = expectedSession.accountID
+        let works = ids.sorted()
+        guard let first = works.first, first > 0, !folders.isEmpty else { throw ClientError.invalidResponse }
+        guard savingFavoriteID == nil else { throw ClientError.collectionBusy }
+
+        let token = UUID()
+        favoriteSaveToken = token; savingFavoriteID = first
+        var attemptedWrite = false
+        defer {
+            if favoriteSaveToken == token {
+                if attemptedWrite && acceptsFavoriteSave(token, for: expectedSession) { collectionRevision += 1 }
+                favoriteSaveToken = nil; savingFavoriteID = nil
+            }
+        }
+
+        try await verifyFavoriteAccount(token, for: expectedSession)
+        try await refreshCollections()
+        guard acceptsFavoriteSave(token, for: expectedSession) else { throw ClientError.accountChanged }
+        let editable = Set(collections.map(\.id))
+        guard folders.isSubset(of: editable) else { throw ClientError.invalidResponse }
+
+        var confirmed = Set<Int>()
+        var failure: String?
+        for id in works {
+            try Task.checkCancellation()
+            guard acceptsFavoriteSave(token, for: expectedSession) else { throw ClientError.accountChanged }
+            savingFavoriteID = id
+            invalidateMembershipRead(id)
+            do {
+                let current = try await refreshSavedMembership(id, force: true)
+                let change = CollectionSelectionChange(original: removing ? folders : [],
+                                                       selected: removing ? [] : folders, editable: editable, current: current)
+                if !change.isEmpty {
+                    if !attemptedWrite { await CollectionListCache.shared.invalidateRows(owner: actorID) }
+                    attemptedWrite = true
+                    _ = try await confirmCollectionChange(change, imageID: id, token: token, for: expectedSession)
+                }
+                try Task.checkCancellation()
+                guard acceptsFavoriteSave(token, for: expectedSession) else { throw ClientError.accountChanged }
+                confirmed.insert(id)
+            } catch {
+                try Task.checkCancellation()
+                guard acceptsFavoriteSave(token, for: expectedSession) else { throw ClientError.accountChanged }
+                if case ClientError.http(429) = error { failure = error.localizedDescription; break }
+                if failure == nil { failure = error.localizedDescription }
+            }
+        }
+        guard acceptsFavoriteSave(token, for: expectedSession) else { throw ClientError.accountChanged }
+        if !removing && !confirmed.isEmpty { rememberCollectionSelection(folders) }
+        return (confirmed, failure)
+    }
+
+    private func verifyFavoriteAccount(_ token: UUID, for expectedSession: AccountSessionID) async throws {
+        #if DEBUG && targetEnvironment(simulator)
+        if !CollectionPagingQA.enabled { _ = try await readVerifiedAccount(for: expectedSession) }
+        #else
+        _ = try await readVerifiedAccount(for: expectedSession)
+        #endif
+        guard acceptsFavoriteSave(token, for: expectedSession) else { throw ClientError.accountChanged }
+    }
+
+    private func favoriteSelection(for intent: FavoriteSaveIntent, current: Set<Int>) throws -> (original: Set<Int>, selected: Set<Int>) {
+        switch intent {
+        case .folders(let original, let selected):
+            return (original, selected)
+        case .toggle(let wasSaved):
+            if wasSaved { return (current, []) }
+            if !current.isEmpty { return (current, current) }
+            let privateFolders = collections.filter { $0.read == "Private" }
+            let preferred = defaultCollectionIDs
+            guard let folder = privateFolders.first(where: { preferred.contains($0.id) }) ?? privateFolders.first else {
+                throw ClientError.noPrivateFavoriteFolder
+            }
+            return (current, [folder.id])
+        }
+    }
+
+    private func saveCollectionSelection(imageID: Int, intent: FavoriteSaveIntent, token: UUID,
+                                         for expectedSession: AccountSessionID) async throws {
         #if DEBUG && targetEnvironment(simulator)
         if VisualControlsQA.enabled {
             if ProcessInfo.processInfo.arguments.contains("--qa-favorite-save69-delay") {
                 try await Task.sleep(for: .seconds(6))
             }
             if ProcessInfo.processInfo.arguments.contains("--qa-favorite-save69-account-change") {
+                authGeneration += 1
                 clearCollectionState()
                 throw ClientError.accountChanged
             }
-            guard favoriteSaveToken == token else { throw ClientError.accountChanged }
+            guard acceptsFavoriteSave(token, for: expectedSession) else { throw ClientError.accountChanged }
             if ProcessInfo.processInfo.arguments.contains("--qa-favorite-save69-failure") { throw ClientError.collectionWriteUnknown }
+            let current = savedMemberships[imageID] ?? []
+            let (original, selected) = try favoriteSelection(for: intent, current: current)
             guard account?.id == CollectionPagingQA.ownerID,
                   CollectionPagingQA.items.contains(where: { $0.id == imageID }),
-                  original == (savedMemberships[imageID] ?? []),
+                  original == current,
                   selected.isSubset(of: [CollectionPagingQA.collection.id]) else { throw ClientError.invalidResponse }
             savedMemberships[imageID] = selected; collectionRevision += 1
+            if case .folders = intent { rememberCollectionSelection(selected) }
             return // Controlled in-memory interaction; never issue a site write.
         }
         #endif
-        guard let actorID = account?.id, hasCollectionAccess else { throw ClientError.collectionAuthorization }
-        guard pendingFavorites.isEmpty, !creatingCollection else { throw ClientError.collectionBusy }
-        let generation = authGeneration
-        pendingFavorites.insert(imageID); defer { pendingFavorites.remove(imageID) }
+        try requireCollectionSession(expectedSession)
+        let actorID = expectedSession.accountID
         invalidateMembershipRead(imageID)
-        let identity: Account? = try await request(path: "/api/auth/session", sessionIdentityOnly: true)
-        guard identity?.id == actorID, acceptsFavoriteSave(token, actorID: actorID, generation: generation) else { throw ClientError.accountChanged }
+        try await verifyFavoriteAccount(token, for: expectedSession)
         try await refreshCollections()
         let current = try await refreshSavedMembership(imageID, force: true)
+        guard acceptsFavoriteSave(token, for: expectedSession) else { throw ClientError.accountChanged }
+        let (original, selected) = try favoriteSelection(for: intent, current: current)
         let change = CollectionSelectionChange(original: original, selected: selected, editable: Set(collections.map(\.id)), current: current)
-        guard !change.isEmpty else { return }
-        guard acceptsFavoriteSave(token, actorID: actorID, generation: generation) else { throw ClientError.accountChanged }
+        if !change.isEmpty {
+            await CollectionListCache.shared.invalidateRows(owner: actorID)
+            defer { if acceptsFavoriteSave(token, for: expectedSession) { collectionRevision += 1 } }
+            let after = try await confirmCollectionChange(change, imageID: imageID, token: token, for: expectedSession)
+            savedMembershipUpdate = .init(accountID: actorID, imageID: imageID, collectionIDs: after)
+        }
+        if case .folders = intent, acceptsFavoriteSave(token, for: expectedSession) {
+            rememberCollectionSelection(selected)
+        }
+    }
+
+    private func confirmCollectionChange(_ change: CollectionSelectionChange, imageID: Int, token: UUID,
+                                         for expectedSession: AccountSessionID) async throws -> Set<Int> {
+        try Task.checkCancellation()
+        guard acceptsFavoriteSave(token, for: expectedSession) else { throw ClientError.accountChanged }
+        #if DEBUG && targetEnvironment(simulator)
+        if CollectionPagingQA.enabled {
+            guard CollectionPagingQA.items.contains(where: { $0.id == imageID }) else { throw ClientError.invalidResponse }
+            if !simulatedBatchFailure, imageID == 28_037_101,
+               ProcessInfo.processInfo.arguments.contains("--qa-batch-favorite-partial") {
+                simulatedBatchFailure = true
+                throw ClientError.collectionWriteUnknown
+            }
+            let result = (savedMemberships[imageID] ?? []).union(change.additions).subtracting(change.removals)
+            savedMemberships[imageID] = result
+            return result
+        }
+        #endif
+        var rateLimited = false
         do {
             let _: CollectionWriteResult = try await rpc("collection.saveItem", input: [
                 "imageId": imageID, "type": "Image",
@@ -775,56 +983,41 @@ final class SiteSession: NSObject, ObservableObject, WKNavigationDelegate, WKUID
             ], mutation: true)
         } catch {
             // The server may have committed before a timeout. Read, never replay.
+            if case ClientError.http(429) = error { rateLimited = true }
         }
-        guard acceptsFavoriteSave(token, actorID: actorID, generation: generation) else { throw ClientError.accountChanged }
-        collectionRevision += 1
+        guard acceptsFavoriteSave(token, for: expectedSession) else { throw ClientError.accountChanged }
         invalidateMembershipRead(imageID)
         do {
             let after = try await refreshSavedMembership(imageID, force: true)
-            guard acceptsFavoriteSave(token, actorID: actorID, generation: generation) else { throw ClientError.accountChanged }
+            guard acceptsFavoriteSave(token, for: expectedSession) else { throw ClientError.accountChanged }
             guard change.isConfirmed(by: after) else { throw ClientError.collectionWriteUnknown }
-            savedMembershipUpdate = .init(accountID: actorID, imageID: imageID, collectionIDs: after)
+            return after
         } catch {
-            guard acceptsFavoriteSave(token, actorID: actorID, generation: generation) else { throw ClientError.accountChanged }
-            savedMemberships[imageID] = nil
+            guard acceptsFavoriteSave(token, for: expectedSession) else { throw ClientError.accountChanged }
+            // Keep the last observed membership for rollback, but force
+            // the next read to recheck an uncertain server outcome.
             membershipReadAt[imageID] = nil
-            throw ClientError.collectionWriteUnknown
+            if case ClientError.http(429) = error { rateLimited = true }
+            throw rateLimited ? ClientError.http(429) : ClientError.collectionWriteUnknown
         }
-    }
-
-    func createPrivateCollection(name: String) async throws -> SavedCollection {
-        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty, name.utf16.count <= 30, let actorID = account?.id, hasCollectionAccess else { throw ClientError.invalidResponse }
-        guard !creatingCollection, pendingFavorites.isEmpty else { throw ClientError.collectionBusy }
-        creatingCollection = true; defer { creatingCollection = false }
-        let generation = authGeneration
-        let identity: Account? = try await request(path: "/api/auth/session", sessionIdentityOnly: true)
-        guard identity?.id == actorID, generation == authGeneration, !showLogin else { throw ClientError.accountChanged }
-        try await refreshCollections()
-        guard generation == authGeneration, account?.id == actorID, !showLogin else { throw ClientError.accountChanged }
-        // Reuse an exact existing private folder rather than create duplicates on retry.
-        if let existing = collections.first(where: { $0.name == name && $0.read == "Private" }) { return existing }
-        let before = Set(collections.map(\.id))
-        do {
-            let _: SavedCollection = try await rpc("collection.upsert", input: ["name": name, "type": "Image", "read": "Private", "write": "Private"], mutation: true)
-        } catch { /* Read back once; never repeat an uncertain create. */ }
-        guard generation == authGeneration, account?.id == actorID else { throw ClientError.accountChanged }
-        try await refreshCollections()
-        let created = collections.filter { !before.contains($0.id) && $0.name == name && $0.read == "Private" }
-        guard created.count == 1, let value = created.first else { throw ClientError.collectionWriteUnknown }
-        collectionRevision += 1
-        return value
     }
 
     func collectionPage(id: Int, filter: FeedFilter, cursor: String?, allAccessibleLevels: Bool = false, includeTags: Bool = false) async throws -> MediaPage {
         #if DEBUG && targetEnvironment(simulator)
         if CollectionPagingQA.enabled {
-            guard id == CollectionPagingQA.collection.id else { throw ClientError.invalidResponse }
-            return MediaPage(items: cursor == nil ? CollectionPagingQA.items.filter { filter.effectiveKind == .all || $0.isVideo == (filter.effectiveKind == .video) } : [], metadata: .init(nextCursor: nil))
+            if !collectionsKnown { try await refreshCollections() }
+            guard collections.contains(where: { $0.id == id }) else { throw ClientError.invalidResponse }
+            if CollectionListCacheQA.fixture != nil, cursor == nil { try await Task.sleep(for: .seconds(5)) }
+            let source = if ProcessInfo.processInfo.arguments.contains("--qa-collection-batch-manage") {
+                CollectionPagingQA.items.filter { savedMemberships[$0.id]?.contains(id) == true }
+            } else if CollectionListCacheQA.updatesList { Array(CollectionPagingQA.otherCollectionItems.prefix(1)) }
+                else { id == CollectionPagingQA.collection.id ? CollectionPagingQA.items : CollectionPagingQA.otherCollectionItems }
+            return MediaPage(items: cursor == nil ? source.filter { filter.effectiveKind == .all || $0.isVideo == (filter.effectiveKind == .video) } : [], metadata: .init(nextCursor: nil))
         }
         #endif
         guard let actorID = account?.id, hasCollectionAccess else { throw ClientError.collectionAuthorization }
         let generation = authGeneration
+        let startingRevision = collectionRevision
         if !collectionsKnown { try await refreshCollections() }
         guard collections.contains(where: { $0.id == id }) else { throw ClientError.invalidResponse }
         let level = allAccessibleLevels ? 31 : (filter.onlyPG ? 1 : (account?.browsingLevel ?? 1))
@@ -833,16 +1026,13 @@ final class SiteSession: NSObject, ObservableObject, WKNavigationDelegate, WKUID
         let index: CollectionIndexPage = try await rpc("collection.getAllCollectionItems", input: input)
         guard generation == authGeneration, account?.id == actorID else { throw ClientError.accountChanged }
         guard !index.mediaIDs.isEmpty else { return MediaPage(items: [], metadata: .init(nextCursor: index.nextCursor, sourceIDs: index.mediaIDs)) }
-        var components = URLComponents(string: "/api/v1/images")!
-        components.queryItems = [.init(name: "ids", value: index.mediaIDs.map(String.init).joined(separator: ",")),
-                                 .init(name: "limit", value: String(index.mediaIDs.count)),
-                                 .init(name: "browsingLevel", value: String(level))]
-        if includeTags { components.queryItems?.append(.init(name: "withTags", value: "true")) }
-        let media: MediaPage = try await request(path: components.string!)
+        let media = try await hydrateMedia(ids: index.mediaIDs, browsingLevel: level, includeTags: includeTags)
         guard generation == authGeneration, account?.id == actorID else { throw ClientError.accountChanged }
         let byID = Dictionary(media.items.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let ordered = index.mediaIDs.compactMap { byID[$0] }
-        for item in ordered { savedMemberships[item.id, default: []].insert(id) }
+        if startingRevision == collectionRevision, savingFavoriteID == nil {
+            for item in ordered { savedMemberships[item.id, default: []].insert(id) }
+        }
         return MediaPage(items: ordered, metadata: .init(nextCursor: index.nextCursor, sourceIDs: index.mediaIDs))
     }
 
@@ -856,134 +1046,43 @@ final class SiteSession: NSObject, ObservableObject, WKNavigationDelegate, WKUID
         if procedure.hasPrefix("tag.") && !mutation { tagRPCReads += 1 }
         #endif
         let allowed = ["user.getFollowingUsers", "user.getList", "user.toggleFollow", "user.updateBrowsingMode", "leaderboard.getLeaderboard", "leaderboard.getLeadboardLegends", "image.getInfinite",
-                       "collection.getAllUser", "collection.getUserCollectionItemsByItem", "collection.getAllCollectionItems", "collection.saveItem", "collection.upsert", "post.getInfinite", "tag.getAll", "tag.getFeedTagBar", "tag.getTagWithModelCount", "tag.getById", "user.getAll", "userProfile.get"]
+                       "collection.getAllUser", "collection.getUserCollectionItemsByItem", "collection.getAllCollectionItems", "collection.saveItem", "post.getInfinite", "tag.getAll", "tag.getFeedTagBar", "tag.getTagWithModelCount", "tag.getById", "user.getAll", "userProfile.get"]
         guard allowed.contains(procedure) else { throw ClientError.invalidResponse }
         let envelope: [String: Any] = ["json": input.map { $0 as Any } ?? NSNull()]
         let data = try JSONSerialization.data(withJSONObject: envelope, options: [.sortedKeys])
         let body = String(decoding: data, as: UTF8.self)
         var components = URLComponents(string: "/api/trpc/" + procedure)!
         if !mutation { components.queryItems = [.init(name: "input", value: body)] }
-        return try await request(path: components.string!, method: mutation ? "POST" : "GET", body: mutation ? body : "", rpc: true)
+        return try await request(path: components.string!, postBody: mutation ? body : nil, response: .rpc)
     }
 
-    private func ensureOrigin() async throws {
-        guard !showLogin else { throw ClientError.loadingSite }
-        if webView.url?.host == "civitai.red" && !webView.isLoading { return }
-        if !loadingDocument {
-            loadingDocument = true
-            webView.load(URLRequest(url: URL(string: Self.origin + "/api/auth/session")!))
-        }
-        for _ in 0..<80 {
-            try Task.checkCancellation()
-            if webView.url?.host == "civitai.red" && !webView.isLoading { return }
-            try await Task.sleep(for: .milliseconds(250))
-        }
-        throw ClientError.siteUnavailable
-    }
-
-    private func request<T: Decodable>(path: String, method: String = "GET", body: String = "", rpc: Bool = false, sessionIdentityOnly: Bool = false) async throws -> T {
+    private func request<T: Decodable>(path: String, postBody: String? = nil, response: SiteRequestClient.Response = .rest,
+                                       preferPublicREST: Bool = false) async throws -> T {
         #if DEBUG && targetEnvironment(simulator)
         if CollectionPagingQA.enabled { throw ClientError.format("本地测试不使用站点接口") }
         #endif
         let requestGeneration = authGeneration
-        func checkCurrentSession() throws {
+        return try await requestClient.request(path: path, postBody: postBody, response: response,
+                                               preferPublicREST: preferPublicREST, loginPresented: { self.showLogin }) {
             try Task.checkCancellation()
-            guard requestGeneration == authGeneration else { throw CancellationError() }
+            guard requestGeneration == self.authGeneration else { throw CancellationError() }
         }
-        try checkCurrentSession()
-        guard path.hasPrefix("/api/"), !path.hasPrefix("//") else { throw ClientError.invalidResponse }
-        let limitedRead = method == "GET" && !sessionIdentityOnly && !path.hasPrefix("/api/auth/")
-        if limitedRead { try SiteRequestCooldown.shared.check() }
-        if oauth.hasCredentials {
-            var request = URLRequest(url: URL(string: Self.origin + path)!)
-            request.httpMethod = method; request.cachePolicy = .reloadIgnoringLocalCacheData
-            if method == "POST" {
-                request.httpBody = body.data(using: .utf8)
-                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            }
-            let data: Data, response: HTTPURLResponse
-            do { (data, response) = try await oauth.authorizedData(for: request) }
-            catch { try checkCurrentSession(); throw error }
-            try checkCurrentSession()
-            try SiteRequestCooldown.shared.validateResponse(status: response.statusCode,
-                retryAfter: response.value(forHTTPHeaderField: "Retry-After"), markSuccess: false)
-            let value = try JSONSerialization.jsonObject(with: data)
-            var payload: Any = value
-            if rpc {
-                guard let root = value as? [String: Any] else { throw ClientError.invalidResponse }
-                try SiteRequestCooldown.shared.validateResponse(status: 200,
-                    retryAfter: response.value(forHTTPHeaderField: "Retry-After"), rpcError: root["error"], markSuccess: false)
-                guard let result = root["result"] as? [String: Any], let data = result["data"] else { throw ClientError.invalidResponse }
-                payload = (data as? [String: Any])?["json"] ?? data
-            }
-            if limitedRead { SiteRequestCooldown.shared.recordSuccess() }
-            if sessionIdentityOnly {
-                let user = (value as? [String: Any])?["user"] as? [String: Any]
-                payload = user.map { ["id": $0["id"] ?? NSNull(), "username": $0["username"] ?? NSNull(),
-                                      "browsingLevel": $0["browsingLevel"] ?? NSNull(), "blurNsfw": $0["blurNsfw"] ?? NSNull()] } ?? NSNull()
-            }
-            return try decode(T.self, data: JSONSerialization.data(withJSONObject: payload, options: [.fragmentsAllowed]))
-        }
-        do { try await ensureOrigin() } catch { try checkCurrentSession(); throw error }
-        try checkCurrentSession()
-        let script = """
-        if (location.origin !== origin) throw new Error('origin');
-        const abort = new AbortController();
-        const timer = setTimeout(() => abort.abort(), 25000);
-        try {
-          const options = {method, credentials:'include', cache:'no-store', signal:abort.signal};
-          if (method === 'POST') { options.headers={'Content-Type':'application/json'}; options.body=body; }
-          const r = await fetch(path, options);
-          if (!r.ok) return JSON.stringify({ok:false,status:r.status,retryAfter:r.status===429?r.headers.get('Retry-After'):null});
-          const value = await r.json();
-          if (rpc && value.error) return JSON.stringify({ok:false,status:value.error.json?.data?.httpStatus || 400,retryAfter:r.headers.get('Retry-After')});
-          let payload = rpc ? value.result?.data : value;
-          if (rpc && payload && Object.prototype.hasOwnProperty.call(payload,'json')) payload = payload.json;
-          if (identity) payload = payload?.user ? {id:payload.user.id,username:payload.user.username,browsingLevel:payload.user.browsingLevel ?? null,blurNsfw:payload.user.blurNsfw ?? null} : null;
-          return JSON.stringify({ok:true,payload});
-        } finally { clearTimeout(timer); }
-        """
-        let result: Any
-        do { result = try await webView.callAsyncJavaScript(script, arguments: ["origin": Self.origin, "path": path, "method": method, "body": body, "rpc": rpc, "identity": sessionIdentityOnly], in: nil, contentWorld: .page) }
-        catch { try checkCurrentSession(); throw error }
-        try checkCurrentSession()
-        guard let text = result as? String, let data = text.data(using: .utf8),
-              let envelope = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw ClientError.invalidResponse }
-        guard envelope["ok"] as? Bool == true else {
-            let status = envelope["status"] as? Int ?? 500
-            try SiteRequestCooldown.shared.validateResponse(status: status, retryAfter: envelope["retryAfter"] as? String, markSuccess: false)
-            throw ClientError.invalidResponse
-        }
-        if limitedRead { SiteRequestCooldown.shared.recordSuccess() }
-        let payload = envelope["payload"] ?? NSNull()
-        let payloadData = try JSONSerialization.data(withJSONObject: payload, options: [.fragmentsAllowed])
-        return try decode(T.self, data: payloadData)
-    }
-
-    private func decode<T: Decodable>(_ type: T.Type, data: Data) throws -> T {
-        do { return try JSONDecoder().decode(type, from: data) }
-        catch DecodingError.typeMismatch(_, let c) { throw ClientError.format(c.codingPath.map(\.stringValue).joined(separator: ".")) }
-        catch DecodingError.valueNotFound(_, let c) { throw ClientError.format(c.codingPath.map(\.stringValue).joined(separator: ".")) }
-        catch DecodingError.keyNotFound(let key, let c) { throw ClientError.format((c.codingPath.map(\.stringValue) + [key.stringValue]).joined(separator: ".")) }
     }
 
     func clearLocalLogin() async {
         authGeneration += 1
         oauth.clear()
-        let types = WKWebsiteDataStore.allWebsiteDataTypes()
-        await webView.configuration.websiteDataStore.removeData(ofTypes: types, modifiedSince: .distantPast)
+        await webContext.clearWebsiteData()
         account = nil; following = []; followsKnown = false; unknownUsers = []
         clearCollectionState()
         MediaCache.shared.clear()
-        webView.load(URLRequest(url: URL(string: Self.origin + "/api/auth/session")!))
+        await CollectionListCache.shared.clear()
+        webContext.reloadSession()
     }
 
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { loadingDocument = false }
-    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { loadingDocument = false }
-    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-        if navigationAction.targetFrame == nil { webView.load(navigationAction.request) }; return nil
-    }
     private struct FollowResult: Decodable { let following: Bool }
     private struct UserPage: Decodable { let items: [Creator] }
 
 }
+
+extension OAuthLogin: SiteAuthorizedTransport {}

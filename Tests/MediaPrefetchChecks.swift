@@ -324,6 +324,32 @@ import Combine
         }
         defaults.set(cacheLimitArgument, forKey: "cacheLimitGB")
         let videoReservation = Int64(512 * 1024 * 1024)
+        try await resetStats()
+        let bufferingCache = MediaCache(directoryURL: root.appendingPathComponent("buffering-window"), monitorNetwork: false,
+            diagnostics: nil, availableBytesProvider: { 10_000_000_000 })
+        let buffering = MediaPreloader(cache: bufferingCache, network: Just(true).eraseToAnyPublisher())
+        let waitingWork = item(5_700, "playing-current", video: true)
+        let futureWorks = (1...3).map { item(5_700 + $0, "concurrency61-buffering-\($0)", video: true) }
+        let playingOwner = UUID()
+        bufferingCache.setForegroundVideoDemand(url: waitingWork.mediaURL!, owner: playingOwner, waiting: true)
+        buffering.update([waitingWork] + futureWorks, after: 0, count: 3, context: "buffering-window", wifiOnly: false)
+        let nearestStarted = await waitForRequest("/concurrency61-buffering-1")
+        let secondStarted = await waitForRequest("/concurrency61-buffering-2")
+        precondition(nearestStarted && secondStarted && buffering.snapshot.active == 2, "Two future videos must preload during buffering")
+        let pausedRequests = try await stats()["requests"] as? [String: Int] ?? [:]
+        precondition(pausedRequests["/concurrency61-buffering-3"] == nil, "The third waits for a slot or foreground recovery")
+        bufferingCache.setForegroundVideoDemand(url: waitingWork.mediaURL!, owner: playingOwner, waiting: false)
+        let thirdStarted = await waitForRequest("/concurrency61-buffering-3")
+        precondition(thirdStarted && buffering.snapshot.active == 3, "The remaining video joins after playback recovers")
+        _ = try await URLSession.shared.data(from: base.appendingPathComponent("release-concurrency"))
+        let windowReady = await waitUntil { buffering.snapshot.ready == 3 }
+        let bufferingRequests = try await stats()["requests"] as? [String: Int] ?? [:]
+        precondition(windowReady && (1...3).allSatisfy { bufferingRequests["/concurrency61-buffering-\($0)"] == 1 },
+                     "All three videos reach cache with one request each")
+        buffering.stop()
+        bufferingCache.removeForegroundVideoDemand(owner: playingOwner)
+        concurrencyMeasurements.append(["scenario": "buffering-future-video-window", "duringWait": 2, "afterRecovery": 3, "ready": windowReady])
+
         for setting in MediaPrefetchConcurrency.steps {
             try await resetStats()
             let measuredCache = MediaCache(directoryURL: root.appendingPathComponent("concurrency-\(setting)"), monitorNetwork: false,

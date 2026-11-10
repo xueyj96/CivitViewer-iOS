@@ -1,16 +1,21 @@
 import SwiftUI
 
 struct MediaDetailsView: View {
+    enum ExitAction { case author(CreatorRoute), signIn, tab(MediaTabExit) }
     let item: MediaItem
+    private let onClose: ((ExitAction?) -> Void)?
     @EnvironmentObject private var session: SiteSession
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.dynamicTypeSize) private var typeSize
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.ordinaryColorScheme) private var ordinaryScheme
+    @State private var contentRevealed = false
+    @State private var bottomTone = PageToneTransition(source: .black)
+    @Environment(\.mediaTabs) private var tabs
     @ObservedObject private var blocklist = TagBlocklist.shared
     @ObservedObject private var authorBlocklist = AuthorBlocklist.shared
-    @State private var tags: [String]?
-    @State private var tagIDs: [String: Int]
+    @State private var resolvedTags: (request: TagRequest, names: [String], ids: [String: Int])?
     @State private var selected = Set<String>()
-    @State private var tagsExpanded = false
-    @State private var loading = false
     @State private var preparingSearch = false
     @State private var searchTask: Task<Void, Never>?
     @State private var searchDraft: MediaSearchCriteria?
@@ -22,10 +27,32 @@ struct MediaDetailsView: View {
     @State private var displayedItemID: Int
     @State private var imageFailure: String?
     @State private var posterRetry = 0
+    @State private var authorRetry = 0
+    @State private var resolvedDuration: (workID: Int, identity: String, seconds: Double)?
+    @State private var resolvedAuthor: (request: AuthorRequest, creator: Creator)?
+    @State private var failedAuthorRequest: AuthorRequest?
+    private struct TagRequest: Equatable {
+        let workID: Int
+        let identity: String
+    }
+    private var tagRequest: TagRequest {
+        .init(workID: item.id, identity: session.feedIdentity)
+    }
+    private struct AuthorRequest: Equatable {
+        let workID: Int
+        let identity: String
+        let retry: Int
+    }
+    private var authorRequest: AuthorRequest {
+        .init(workID: item.id, identity: session.feedIdentity, retry: authorRetry)
+    }
+    private var author: Creator? {
+        item.attributedCreator ?? (resolvedAuthor?.request == authorRequest ? resolvedAuthor?.creator : nil)
+    }
     private var blurPreview: Bool { (session.account?.blurNsfw ?? true) && ((item.browsingLevel ?? 1) & 28 != 0) }
-    init(item: MediaItem) {
-        self.item = item; _tags = State(initialValue: item.tagNames?.sorted())
-        _tagIDs = State(initialValue: Self.ids(item.tags))
+    init(item: MediaItem, onClose: ((ExitAction?) -> Void)? = nil) {
+        self.item = item
+        self.onClose = onClose
         _displayedItemID = State(initialValue: item.id)
     }
     private static func ids(_ tags: [MediaTag]?) -> [String: Int] {
@@ -34,149 +61,292 @@ struct MediaDetailsView: View {
             return (TagPolicy.normalize(name), id)
         }, uniquingKeysWith: { first, _ in first })
     }
-    private var eligibleTags: [String] { (tags ?? []).filter { TagDirectoryQuality.includes($0) } }
-    private var visibleTags: [String] {
-        let all = eligibleTags
-        guard !tagsExpanded, all.count > 12 else { return all }
-        let first = Array(all.prefix(12))
-        return all.filter { first.contains($0) || selected.contains($0) }
+    private var eligibleTags: [String] {
+        guard let resolvedTags, resolvedTags.request == tagRequest else { return [] }
+        return resolvedTags.names
     }
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    HStack(alignment: .center, spacing: 12) {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text((item.isVideo ? "视频" : "图片") + " · #" + String(item.id))
-                                .font(.headline).accessibilityIdentifier("details.summary")
-                            if let author = item.username {
-                                Text("@" + author).font(.subheadline).foregroundStyle(.secondary)
-                            }
-                            HStack(spacing: 8) {
-                                if item.offlineMediaURL != nil {
-                                    Label("本地副本", systemImage: "internaldrive")
-                                }
-                                if blockedAuthorForItem != nil {
-                                    Text("作者已在本机屏蔽")
-                                }
-                            }
-                            .font(.caption).foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: FloatingPageChrome.spacing) {
+                    VStack(alignment: .leading, spacing: FloatingPageChrome.spacing) {
+                        let headerLayout = typeSize.isAccessibilitySize
+                            ? AnyLayout(VStackLayout(alignment: .leading, spacing: FloatingPageChrome.spacing))
+                            : AnyLayout(HStackLayout(alignment: .center, spacing: FloatingPageChrome.cardInset))
+                        headerLayout {
+                            preview
+                            identity
                         }
-                        Spacer(minLength: 0)
-                        Menu {
-                            if let blocked = blockedAuthorForItem {
-                                Button("取消本机屏蔽", role: .destructive) {
-                                    authorBlocklist.remove(id: blocked.id); authorBlockError = nil
-                                }
-                            } else if item.username != nil {
-                                Button(authorBlockWorking ? "正在核验…" : "屏蔽此作者", systemImage: "person.crop.circle.badge.xmark") {
-                                    guard !authorBlockWorking else { return }
-                                    let expectedID = displayedItemID, identity = session.feedIdentity
-                                    let requestID = UUID()
-                                    authorBlockTask?.cancel()
-                                    authorBlockRequestID = requestID
-                                    authorBlockTask = Task { await blockCurrentAuthor(itemID: expectedID, identity: identity, requestID: requestID) }
-                                }.disabled(authorBlockWorking)
-                            } else {
-                                Button("无法屏蔽：作者身份不可核验") {}.disabled(true)
-                            }
-                        } label: {
-                            Image(systemName: "ellipsis")
-                                .font(.system(size: 15, weight: .semibold))
+                        Divider()
+                        metadataGroup
+                        if let imageFailure {
+                            MediaLoadFailureContent(message: imageFailure, retryIdentifier: "details.image.retry",
+                                                    retry: { posterRetry += 1 })
+                                .frame(maxWidth: .infinity)
                         }
-                        .buttonStyle(AppActionButtonStyle(tone: .neutral))
-                        .accessibilityLabel(blockedAuthorForItem == nil ? "更多作者操作" : "更多作者操作，作者已屏蔽")
-                        .accessibilityIdentifier("details.more")
+                        if let authorBlockError {
+                            Text(authorBlockError).font(.caption).foregroundStyle(.red)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
+                    .padding(FloatingPageChrome.cardInset)
+                    .background(cardSurface)
+                    .accessibilityElement(children: .contain)
+                    .accessibilityIdentifier("details.work-card")
 
-                    preview
-
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack(spacing: 8) {
-                            Text("站点标签").font(.headline)
-                            Text("已选 \(selected.count) / 8").font(.caption).foregroundStyle(.secondary)
-                                .accessibilityIdentifier("details.selection.count")
-                            Spacer(minLength: 0)
-                            Button {
-                                guard !loading, !preparingSearch else { return }
-                                Task { await refresh() }
-                            } label: {
-                                Group {
-                                    if loading { ProgressView().controlSize(.small) }
-                                    else { Image(systemName: "arrow.clockwise") }
-                                }
-                            }
-                            .buttonStyle(AppActionButtonStyle(tone: .neutral))
-                            .disabled(loading || preparingSearch)
-                            .accessibilityLabel("重新读取标签")
-                            .accessibilityIdentifier("details.refresh")
-                        }
-                        if let tags {
-                            if eligibleTags.isEmpty {
-                                Text(tags.isEmpty ? "站点返回的标签列表为空" : "没有可展示的标签")
-                                    .font(.subheadline).foregroundStyle(.secondary)
-                            } else {
-                                TagPillLayout(spacing: 6) {
-                                    ForEach(visibleTags, id: \.self) { tag in tagButton(tag) }
-                                }
-                                .accessibilityElement(children: .contain)
-                                .accessibilityIdentifier("details.tags")
-                                if eligibleTags.count > 12 {
-                                    Button(tagsExpanded ? "收起标签" : "显示全部标签（\(eligibleTags.count)）") {
-                                        tagsExpanded.toggle()
-                                    }
-                                    .buttonStyle(AppActionButtonStyle(tone: .neutral))
-                                    .accessibilityIdentifier("details.tags.expand")
-                                }
-                            }
-                        } else if !loading {
-                            Text("标签尚未取得").font(.subheadline).foregroundStyle(.secondary)
-                        }
-                        Text("点选标签组合搜索；长按可屏蔽或单独搜索。")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                    if loading { ProgressView("正在读取作品标签…").font(.caption) }
+                    if !eligibleTags.isEmpty { tagsCard }
                     if let error { Text(error).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
-                    if let authorBlockError { Text(authorBlockError).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true) }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, AppTheme.spacing)
-                .padding(.top, 8)
+                .padding(.horizontal, FloatingPageChrome.pageInset)
                 .padding(.bottom, 16)
-            }.background(Color(uiColor: .systemBackground)).disabled(preparingSearch)
-                .safeAreaInset(edge: .bottom) {
+            }
+                .opacity(contentRevealed || reduceMotion || onClose == nil ? 1 : 0.68)
+                .task {
+                    guard onClose != nil, !reduceMotion else { return }
+                    withAnimation(.easeOut(duration: 0.16)) { contentRevealed = true }
+                }
+                .overlay {
+                    if onClose != nil, ordinaryScheme == .light { PageToneBlend(source: .black) }
+                }
+                .disabled(preparingSearch)
+                .safeAreaInset(edge: .bottom, spacing: 0) {
                     if !selected.isEmpty { searchBar }
                 }
-                .navigationTitle("作品详情").navigationBarTitleDisplayMode(.inline)
-                .toolbar { AppToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() }.buttonStyle(AppActionButtonStyle()) } }
-                .navigationDestination(item: $searchDraft) { SearchView(initialCriteria: $0) }
-                .task { if tags == nil { await refresh() } }
-        }.ordinaryAppearance()
+                .avoidOverlaidTabBar()
+                .floatingTitleBar("作品详情", leading: {
+                    Button { closeDetails() } label: { FloatingPageIcon(symbol: "chevron.left") }
+                        .buttonStyle(FloatingPageButtonStyle(iconOnly: true))
+                        .accessibilityLabel("返回作品")
+                        .accessibilityIdentifier("details.back")
+                }) {
+                    authorActions.disabled(preparingSearch)
+                }
+                .navigationDestination(item: $searchDraft) { SearchView(initialCriteria: $0, showsBack: true) }
+                .task(id: tagRequest) { [tagRequest] in await refreshTags(for: tagRequest) }
+                .task(id: authorRequest) { await loadAuthor(authorRequest) }
+                .task(id: "\(session.feedIdentity):\(item.id)") { await loadDuration() }
+        }
+        .environment(\.overlaidTabBarHeight, tabBarHeight)
+        .environment(\.exitMediaCoverToTab, onClose.map { _ in { exit in closeDetails(.tab(exit)) } })
+        .overlay(alignment: .bottom) {
+            if let tabs, onClose != nil {
+                tabs.render(false, "details.tabs", nil, ordinaryScheme == .light ? bottomTone : nil, requestTab)
+            }
+        }
+        .ordinaryPresentationAppearance()
             .onAppear { notePosterRoute() }
             .onChange(of: session.feedIdentity) { _, _ in
                 searchTask?.cancel(); authorBlockTask?.cancel(); authorBlockRequestID = nil; authorBlockWorking = false
-                tags = nil; tagIDs = [:]; selected = []; tagsExpanded = false
-                error = "账号内容范围已变更，请重新读取标签。"
+                selected = []; error = nil
             }
             .onChange(of: item.id) { _, newID in
                 displayedItemID = newID; authorBlockTask?.cancel(); authorBlockRequestID = nil; authorBlockWorking = false
+                searchTask?.cancel(); selected = []; error = nil
                 notePosterRoute()
             }
             .onDisappear { searchTask?.cancel(); authorBlockTask?.cancel() }
     }
-    @ViewBuilder private var preview: some View {
+
+    private var tabBarHeight: CGFloat { onClose == nil ? 0 : (tabs?.height ?? 0) }
+
+    private func closeDetails(_ action: ExitAction? = nil) {
+        if let onClose { onClose(action) }
+        else { dismiss() }
+    }
+
+    private func requestTab(_ id: Int) {
+        closeDetails(.tab(MediaTabExit(id: id, fromMedia: false)))
+    }
+
+    private var cardSurface: some View {
+        FloatingPageChrome.controlShape.fill(AppTheme.secondarySurface)
+    }
+
+    private var mediaKind: String { item.isVideo ? "视频" : "图片" }
+
+    private var workTitle: String? {
+        guard let title = item.postTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty else { return nil }
+        return title
+    }
+
+    private var identity: some View {
+        let authorLayout = typeSize.isAccessibilitySize
+            ? AnyLayout(VStackLayout(alignment: .leading, spacing: 0))
+            : AnyLayout(HStackLayout(spacing: FloatingPageChrome.spacing))
+
+        return VStack(alignment: .leading, spacing: 0) {
+            Text(workTitle ?? "\(mediaKind)作品")
+                .font(.title3.weight(.semibold))
+                .lineLimit(typeSize.isAccessibilitySize ? nil : 2)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityAddTraits(.isHeader)
+                .accessibilityIdentifier("details.summary")
+
+            authorLayout {
+                if item.username != nil { authorLink }
+                else { Text("作者未知").font(.subheadline).foregroundStyle(.secondary) }
+                authorFollowAction
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var metadataGroup: some View {
+        VStack(alignment: .leading, spacing: FloatingPageChrome.groupInset) {
+            if !workMetadata.isEmpty {
+                Text(workMetadata)
+                    .font(.footnote.weight(.medium).monospacedDigit())
+                    .foregroundStyle(.primary)
+                    .accessibilityIdentifier("details.metadata")
+            }
+            Text(publicationMetadata)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier("details.publication")
+        }
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var publicationMetadata: String {
+        var parts: [String] = []
+        if let rawDate = item.createdAt,
+           let date = (try? Date.ISO8601FormatStyle(includingFractionalSeconds: true).parse(rawDate))
+               ?? (try? Date.ISO8601FormatStyle().parse(rawDate)) {
+            parts.append(date.formatted(.dateTime.locale(Locale(identifier: "zh_Hans_CN")).year().month().day()))
+        }
+        parts.append("作品 #\(item.id)")
+        if let postID = item.postID, postID > 0 { parts.append("帖子 #\(postID)") }
+        return parts.joined(separator: " · ")
+    }
+
+    private func loadDuration() async {
+        guard item.isVideo, item.durationSeconds == nil, item.offlineMediaURL == nil,
+              let postID = item.postID, postID > 0 else { return }
+        let identity = session.feedIdentity
+        let workID = item.id
+        guard let records = try? await session.videoDurationMetadata(ids: [workID], postIDs: [postID], onlyPG: false),
+              let seconds = records.first(where: { $0.id == workID })?.metadata?.duration,
+              !Task.isCancelled, identity == session.feedIdentity else { return }
+        resolvedDuration = (workID, identity, seconds)
+    }
+
+    private var workMetadata: String {
+        var parts: [String] = workTitle == nil ? [] : [mediaKind]
+        let fetched = resolvedDuration.flatMap { $0.workID == item.id && $0.identity == session.feedIdentity ? $0.seconds : nil }
+        if item.isVideo, let duration = item.durationSeconds ?? fetched, duration.isFinite, duration > 0 {
+            parts.append(VideoProgressChrome.clock(duration))
+        }
+        if let width = item.width, let height = item.height, width > 0, height > 0 {
+            parts.append("\(width) × \(height)")
+        }
+        if item.offlineMediaURL != nil { parts.append("本地副本") }
+        if blockedAuthorForItem != nil { parts.append("作者已屏蔽") }
+        return parts.joined(separator: " · ")
+    }
+
+    @ViewBuilder private var authorFollowAction: some View {
+        if item.offlineMediaURL == nil {
+            if let author {
+                FollowButton(creator: author, onSignIn: onClose.map { _ in
+                    { closeDetails(.signIn) }
+                })
+                .fixedSize(horizontal: true, vertical: false)
+            } else if failedAuthorRequest == authorRequest {
+                Button { authorRetry += 1 } label: { FloatingPageIcon(symbol: "arrow.clockwise") }
+                    .buttonStyle(FloatingPageButtonStyle(iconOnly: true))
+                    .accessibilityLabel("重试读取作者")
+            } else if item.username != nil {
+                ProgressView().controlSize(.small).accessibilityLabel("读取作者")
+            }
+        }
+    }
+
+    private var authorActions: some View {
+        Menu {
+            if let blocked = blockedAuthorForItem {
+                Button("取消本机屏蔽", role: .destructive) {
+                    authorBlocklist.remove(id: blocked.id); authorBlockError = nil
+                }
+            } else if item.username != nil {
+                Button(authorBlockWorking ? "正在核验…" : "屏蔽此作者", systemImage: "person.crop.circle.badge.xmark") {
+                    guard !authorBlockWorking else { return }
+                    let expectedID = displayedItemID, identity = session.feedIdentity
+                    let requestID = UUID()
+                    authorBlockTask?.cancel()
+                    authorBlockRequestID = requestID
+                    authorBlockTask = Task { await blockCurrentAuthor(itemID: expectedID, identity: identity, requestID: requestID) }
+                }.disabled(authorBlockWorking)
+            } else {
+                Button("无法屏蔽：作者身份不可核验") {}.disabled(true)
+            }
+        } label: {
+            FloatingPageIcon(symbol: "ellipsis")
+        }
+        .buttonStyle(FloatingPageButtonStyle(iconOnly: true))
+        .accessibilityLabel(blockedAuthorForItem == nil ? "更多作者操作" : "更多作者操作，作者已屏蔽")
+        .accessibilityIdentifier("details.more")
+    }
+
+    private var tagsCard: some View {
+        TagPillLayout(spacing: FloatingPageChrome.groupInset, rowSpacing: 2) {
+            ForEach(eligibleTags, id: \.self) { tag in tagButton(tag) }
+        }
+        .padding(FloatingPageChrome.cardInset)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(cardSurface)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("details.tags")
+        .accessibilityValue("已选 \(selected.count) / 8")
+    }
+
+    @ViewBuilder private var authorLink: some View {
+        if let username = item.username {
+            if let author, onClose != nil {
+                Button {
+                    closeDetails(.author(CreatorRoute(creator: author, item: item)))
+                } label: {
+                    HStack(spacing: 4) {
+                        Text("@" + username).lineLimit(1)
+                        Image(systemName: "chevron.right").font(.caption2.weight(.semibold))
+                    }
+                    .frame(minHeight: 44, alignment: .leading).contentShape(Rectangle())
+                }
+                .font(.subheadline).foregroundStyle(.secondary).buttonStyle(.plain)
+                .accessibilityIdentifier("details.author")
+            } else {
+                Text("@" + username).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                    .frame(minHeight: 44, alignment: .leading)
+            }
+        }
+    }
+
+    private func loadAuthor(_ request: AuthorRequest) async {
+        guard item.offlineMediaURL == nil, item.attributedCreator == nil,
+              let username = item.username else { return }
+        do {
+            let creator = try await session.creator(username: username)
+            guard !Task.isCancelled, request == authorRequest else { return }
+            guard creator.id > 0 else { throw ClientError.invalidResponse }
+            resolvedAuthor = (request, creator)
+        } catch {
+            if !Task.isCancelled, request == authorRequest { failedAuthorRequest = request }
+        }
+    }
+
+    private var preview: some View {
         ZStack {
-            Color(uiColor: .secondarySystemBackground)
+            Color(uiColor: .tertiarySystemBackground)
             if item.isVideo, let source = item.mediaURL {
-                CachedPoster(source: source, declared: item.posterURL, active: false, fit: true,
+                CachedPoster(source: source, declared: item.posterURL, active: false, fit: false,
                     retryToken: posterRetry, allowLocalExtraction: true, diagnosticWorkID: item.id,
                     showsFailure: false, emptyPlaceholder: "暂无可用封面",
-                    placeholderTitle: "视频 · #\(item.id)\(item.username.map { " · \($0)" } ?? "")",
+                    placeholderTitle: nil,
                     imageBlur: blurPreview ? 24 : 0)
             } else if !item.isVideo, let imageURL = item.mediaURL {
-                CachedImage(url: imageURL, fit: true, allowsRetry: false, retryToken: posterRetry,
+                CachedImage(url: imageURL, fit: false, allowsRetry: false, retryToken: posterRetry,
                             showsFailure: false, onFailureMessage: { imageFailure = $0 },
-                            placeholderTitle: "图片 · #\(item.id)\(item.username.map { " · \($0)" } ?? "")", imageBlur: blurPreview ? 24 : 0)
+                            imageBlur: blurPreview ? 24 : 0)
                     .opacity(imageFailure == nil ? 1 : 0)
             } else {
                 if item.isVideo {
@@ -186,14 +356,10 @@ struct MediaDetailsView: View {
                         title: "图片 · #\(item.id)\(item.username.map { " · \($0)" } ?? "")")
                 }
             }
-            if let imageFailure {
-                MediaLoadFailureContent(message: imageFailure, workTitle: "图片 · #\(item.id)", retryIdentifier: "details.image.retry",
-                                        retry: { posterRetry += 1 })
-            }
+            if imageFailure != nil { Image(systemName: "photo").foregroundStyle(.secondary) }
         }
-        .frame(maxWidth: .infinity)
-        .frame(height: 190)
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .frame(width: 76, height: 76)
+        .clipShape(FloatingPageChrome.surfaceShape(nested: true))
         .accessibilityElement(children: .contain)
         .accessibilityLabel(item.isVideo ? "视频封面" : "作品预览")
         .accessibilityIdentifier("details.preview")
@@ -240,7 +406,7 @@ struct MediaDetailsView: View {
             guard authorBlocklist.add(creator) else {
                 authorBlockError = authorBlocklist.error ?? "无法将此作者加入本机屏蔽名单。"; return
             }
-            dismiss()
+            closeDetails()
         } catch is CancellationError {
             return
         } catch {
@@ -250,29 +416,32 @@ struct MediaDetailsView: View {
         }
     }
     private var searchBar: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: FloatingPageChrome.groupInset) {
             Button("清空") { if !preparingSearch { selected = [] } }
-                .buttonStyle(AppActionButtonStyle(tone: .neutral))
                 .disabled(preparingSearch)
             Button {
-                guard !preparingSearch, !loading else { return }
+                guard !preparingSearch else { return }
                 searchTask?.cancel()
                 searchTask = Task { await prepareSearch() }
             } label: {
-                HStack(spacing: 8) {
+                HStack(spacing: FloatingPageChrome.groupInset) {
                     if preparingSearch { ProgressView() }
                     Label("组合搜索 · \(selected.count)", systemImage: "magnifyingglass")
                         .font(.subheadline.weight(.semibold))
                 }
                 .frame(maxWidth: .infinity, minHeight: 44)
             }
-            .buttonStyle(AppActionButtonStyle(tone: .accent))
-            .disabled(selected.isEmpty || preparingSearch || loading)
+            .buttonStyle(FloatingPageButtonStyle(selected: true))
+            .disabled(selected.isEmpty || preparingSearch)
                 .accessibilityIdentifier("details.search")
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 4)
-        .background(Color(uiColor: .systemBackground).opacity(0.96))
+        .floatingPagePanelControls()
+        .padding(.horizontal, FloatingPageChrome.groupInset)
+        .background {
+            FloatingPageChrome.controlShape.fill(AppTheme.secondarySurface.opacity(0.9))
+                .frame(height: FloatingPageChrome.surfaceHeight)
+        }
+        .padding(.horizontal, FloatingPageChrome.pageInset)
     }
     private func tagButton(_ tag: String) -> some View {
         let chosen = selected.contains(tag)
@@ -283,12 +452,7 @@ struct MediaDetailsView: View {
             else if selected.count < 8 { selected.insert(tag); error = nil }
             else { error = "最多组合 8 个标签，可先取消已有选择。" }
         } label: {
-            HStack(spacing: 5) {
-                Text(tag).font(.subheadline).lineLimit(2).fixedSize(horizontal: false, vertical: true)
-                if blocked { Image(systemName: "tag.slash").font(.caption2) }
-            }.padding(.horizontal, 12).padding(.vertical, 9)
-                .foregroundStyle(chosen ? Color.blue : (blocked ? Color.secondary : Color.primary))
-                .background(chosen ? Color.blue.opacity(0.12) : Color(uiColor: .secondarySystemBackground), in: Capsule())
+            WorkTagLabel(title: tag, selected: chosen, blocked: blocked, compact: true)
         }.buttonStyle(.plain).accessibilityIdentifier("details.tag.\(tag)")
             .accessibilityLabel(tag).accessibilityValue(chosen ? "已选入组合搜索" : "未选择")
             .contextMenu {
@@ -298,42 +462,48 @@ struct MediaDetailsView: View {
                     else if !blocklist.add(tag) { error = "无法加入屏蔽列表：最多 100 个标签，每个最多 80 字。" }
                 }.disabled(preparingSearch)
                 Button("仅用此标签组合搜索", systemImage: "magnifyingglass") {
-                    guard !preparingSearch, !loading else { return }
+                    guard !preparingSearch else { return }
                     selected = [tag]; searchTask?.cancel(); searchTask = Task { await prepareSearch() }
-                }.disabled(preparingSearch || loading)
+                }.disabled(preparingSearch)
             }
     }
     private func prepareSearch() async {
         guard !Task.isCancelled, !preparingSearch, !selected.isEmpty else { return }
         preparingSearch = true; error = nil
         defer { preparingSearch = false }
-        let identity = session.feedIdentity, names = selected.sorted()
+        let request = tagRequest, names = selected.sorted()
+        let tagIDs = resolvedTags?.request == request ? resolvedTags?.ids ?? [:] : [:]
         do {
             var resolved: [SearchTag] = []
             for name in names {
                 try Task.checkCancellation()
                 if let id = tagIDs[name] { resolved.append(.init(id: id, name: name)) }
                 else if let tag = try await session.exactTag(name: name) { resolved.append(tag) }
-                else { throw ClientError.format("站点暂未确认标签编号，请重新读取标签后重试。") }
+                else { throw ClientError.format("站点暂未确认标签编号。") }
             }
-            guard identity == session.feedIdentity, !Task.isCancelled, selected == Set(names) else { return }
+            guard request == tagRequest, !Task.isCancelled, selected == Set(names) else { return }
             searchDraft = .init(tags: resolved)
-        } catch is CancellationError {} catch { if identity == session.feedIdentity { self.error = error.localizedDescription } }
+        } catch {
+            guard !Task.isCancelled, request == tagRequest else { return }
+            self.error = error.localizedDescription
+        }
     }
-    private func refresh() async {
-        guard !loading, !preparingSearch else { return }; loading = true; error = nil
-        defer { loading = false }
-        let identity = session.feedIdentity
-        do {
-            guard let value = try await session.mediaItem(id: item.id), let names = value.tagNames else { error = "站点未返回可确认的标签，作品可能暂不可访问；请稍后重试。"; return }
-            guard identity == session.feedIdentity, !Task.isCancelled else { return }
-            tags = names.sorted(); tagIDs = Self.ids(value.tags); selected.formIntersection(names)
-        } catch { if !Task.isCancelled { self.error = "标签读取失败：" + error.localizedDescription } }
+
+    private func refreshTags(for request: TagRequest) async {
+        let value: MediaItem?
+        if item.offlineMediaURL != nil { value = item }
+        else { value = try? await session.mediaItem(id: request.workID) }
+        guard !Task.isCancelled, request == tagRequest else { return }
+
+        let names = (value?.tagNames ?? []).filter { TagDirectoryQuality.includes($0) }.sorted()
+        resolvedTags = (request, names, Self.ids(value?.tags))
+        selected.formIntersection(names)
     }
 }
 
 struct TagPillLayout: Layout {
     var spacing: CGFloat = 8
+    var rowSpacing: CGFloat? = nil
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
         let width = proposal.width.flatMap { $0.isFinite ? $0 : nil } ?? 320
         return CGSize(width: width, height: arrangement(width: width, subviews: subviews).height)
@@ -350,7 +520,7 @@ struct TagPillLayout: Layout {
         for view in subviews {
             let ideal = view.sizeThatFits(.unspecified)
             let size = view.sizeThatFits(ProposedViewSize(width: min(width, ideal.width), height: nil))
-            if x > 0 && x + size.width > width { x = 0; y += rowHeight + spacing; rowHeight = 0 }
+            if x > 0 && x + size.width > width { x = 0; y += rowHeight + (rowSpacing ?? spacing); rowHeight = 0 }
             frames.append(CGRect(origin: CGPoint(x: x, y: y), size: size))
             x += size.width + spacing; rowHeight = max(rowHeight, size.height)
         }
@@ -360,6 +530,7 @@ struct TagPillLayout: Layout {
 
 struct CreatorBiographyView: View {
     let creator: Creator
+    var collapsedLines = 2
     var onCollapse: (() -> Void)? = nil
     @EnvironmentObject private var session: SiteSession
     @State private var value: CreatorBiography?
@@ -373,10 +544,14 @@ struct CreatorBiographyView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             if loading { ProgressView("读取简介…").font(.caption) }
-            else if let error { Text(error).font(.caption).foregroundStyle(.secondary); Button("重试简介") { Task { await load() } }.font(.caption) }
-            else if value == nil { Text("简介尚未取得").font(.caption).foregroundStyle(.secondary); Button("读取简介") { Task { await load() } }.font(.caption) }
+            else if error != nil || value == nil {
+                HStack(spacing: 8) {
+                    Text(error ?? "简介尚未取得").font(.caption).foregroundStyle(.secondary)
+                    StatusReloadButton(title: error == nil ? "读取简介" : "重试简介") { Task { await load() } }
+                }
+            }
             else if value?.blockedByThem == true { Text("作者简介当前不可见").font(.caption).foregroundStyle(.secondary) }
-            else { CreatorBiographyContent(text: text, onCollapse: onCollapse) }
+            else { CreatorBiographyContent(text: text, collapsedLines: collapsedLines, onCollapse: onCollapse) }
         }.frame(maxWidth: .infinity, alignment: .leading)
             .task(id: session.feedIdentity) { if loadedIdentity != session.feedIdentity { await load() } }
     }
@@ -396,11 +571,12 @@ struct CreatorBiographyView: View {
 }
 
 /// Full-width, native biography text shared by the loaded creator view and
-/// controlled layout previews. Overflow beyond two lines is detected from the
+/// controlled layout previews. Overflow beyond the collapsed preview is detected from the
 /// text's laid-out height at the currently proposed width, so font and width
 /// changes remeasure.
 struct CreatorBiographyContent: View {
     let text: String
+    var collapsedLines = 2
     var onCollapse: (() -> Void)? = nil
     @State private var expanded = false
     @State private var fullHeight: CGFloat = 0
@@ -409,21 +585,27 @@ struct CreatorBiographyContent: View {
     private var hasOverflow: Bool { fullHeight > collapsedHeight + 1 }
     private var attributedText: AttributedString { Self.linkedText(text) }
 
+    private var textFont: Font { collapsedLines == 1 ? .footnote : .subheadline }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
+        let layout = collapsedLines == 1
+            ? AnyLayout(HStackLayout(alignment: expanded ? .top : .center, spacing: 0))
+            : AnyLayout(VStackLayout(alignment: .leading, spacing: 2))
+        layout {
             if !text.isEmpty {
                 Text(attributedText)
-                    .font(.subheadline)
-                    .lineLimit(expanded ? nil : 2)
+                    .font(textFont)
+                    .foregroundStyle(collapsedLines == 1 ? Color.secondary : Color.primary)
+                    .lineLimit(expanded ? nil : collapsedLines)
                     .truncationMode(.tail)
                     .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(maxWidth: collapsedLines == 1 ? nil : .infinity, alignment: .leading)
                     .textSelection(.enabled)
                     .accessibilityIdentifier("creator.biography.body")
                     .overlay {
                         ZStack(alignment: .topLeading) {
                             Text(attributedText)
-                                .font(.subheadline)
+                                .font(textFont)
                                 .fixedSize(horizontal: false, vertical: true)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .hidden().accessibilityHidden(true)
@@ -433,7 +615,7 @@ struct CreatorBiographyContent: View {
                                     }
                                 }
                             Text(attributedText)
-                                .font(.subheadline).lineLimit(2)
+                                .font(textFont).lineLimit(collapsedLines)
                                 .fixedSize(horizontal: false, vertical: true)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .hidden().accessibilityHidden(true)
@@ -446,14 +628,27 @@ struct CreatorBiographyContent: View {
                     }
 
                 if hasOverflow {
-                    Button(expanded ? "收起" : "展开") {
+                    Button {
                         let wasExpanded = expanded
                         withAnimation(.easeInOut(duration: 0.18)) { expanded.toggle() }
                         if wasExpanded { onCollapse?() }
+                    } label: {
+                        if collapsedLines == 1 {
+                            Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                                .foregroundStyle(.secondary)
+                                .padding(.leading, 8)
+                                .frame(width: 44, alignment: .leading)
+                                .frame(height: 44)
+                                .contentShape(Rectangle())
+                        } else {
+                            Text(expanded ? "收起" : "展开")
+                        }
                     }
+                    .accessibilityLabel(expanded ? "收起简介" : "展开简介")
                     .font(.caption.weight(.medium))
                     .tint(.blue)
                     .frame(minWidth: 44, minHeight: 44, alignment: .leading)
+                    .frame(width: collapsedLines == 1 ? 44 : nil)
                     .contentShape(Rectangle())
                     .accessibilityIdentifier("creator.biography.toggle")
                     .accessibilityValue(expanded ? "已展开" : "已收起")

@@ -1,7 +1,11 @@
 import Foundation
 
-enum MediaKind: String, CaseIterable, Codable, Identifiable {
+enum MediaKind: String, Codable, Identifiable, Sendable {
+    // `all` remains only for unfiltered internal observations and decoding older settings.
+    // Browsing controls and newly encoded preferences expose only image/video.
     case image, all, video
+    static let browsingCases: [MediaKind] = [.image, .video]
+    var browsingSelection: MediaKind { self == .all ? .image : self }
     var id: Self { self }
     var title: String { chineseTitle }
     var chineseTitle: String { switch self { case .all: "全部"; case .image: "图片"; case .video: "视频" } }
@@ -21,8 +25,8 @@ enum FeedSort: String, CaseIterable, Identifiable {
     var title: String { switch self { case .reactions: "热度"; case .newest: "最新"; case .comments: "最多评论"; case .collected: "最多收藏" } }
 }
 
-struct FeedFilter: Codable, Equatable {
-    var kind: MediaKind = .all
+struct FeedFilter: Codable, Equatable, Sendable {
+    var kind: MediaKind = .image
     var sort = "Most Reactions"
     var period = "Week"
     var baseModel = ""
@@ -30,16 +34,16 @@ struct FeedFilter: Codable, Equatable {
     var videoDurationRange: VideoDurationRange? = nil
     var effectiveKind: MediaKind { videoDurationRange == nil ? kind : .video }
     func selecting(kind: MediaKind) -> FeedFilter {
-        var value = self; value.kind = kind
-        if kind != .video { value.videoDurationRange = nil }
+        var value = self; value.kind = kind.browsingSelection
+        if value.kind != .video { value.videoDurationRange = nil }
         return value
     }
-    func resetting(in context: FilterContext) -> FeedFilter { .defaults(for: context, kind: kind) }
+    func resetting(in context: FilterContext) -> FeedFilter { .defaults(for: context, kind: effectiveKind.browsingSelection) }
 
-    static func defaults(for context: FilterContext, kind: MediaKind = .all) -> FeedFilter {
+    static func defaults(for context: FilterContext, kind: MediaKind = .image) -> FeedFilter {
         switch context {
-        case .discovery: FeedFilter(kind: kind)
-        case .following, .creator: FeedFilter(kind: kind, sort: "Newest", period: "AllTime")
+        case .discovery: FeedFilter(kind: kind.browsingSelection)
+        case .following, .creator: FeedFilter(kind: kind.browsingSelection, sort: "Newest", period: "AllTime")
         }
     }
     var periodTitle: String { FeedPeriod(rawValue: period)?.title ?? period }
@@ -48,14 +52,14 @@ struct FeedFilter: Codable, Equatable {
         ([effectiveKind.title, periodTitle, sortTitle] + (baseModel.isEmpty ? [] : [baseModel]) + (onlyPG ? ["仅看 PG"] : []) + (videoDurationRange.map { ["视频 " + $0.summary] } ?? [])).joined(separator: " · ")
     }
 
-    static func saved(followed: Bool = false) -> FeedFilter {
-        if let data = UserDefaults.standard.data(forKey: followed ? "defaultFollowingFilter" : "defaultDiscoveryFilter"),
+    static func saved(followed: Bool = false, defaults: UserDefaults = .standard) -> FeedFilter {
+        if let data = defaults.data(forKey: followed ? "defaultFollowingFilter" : "defaultDiscoveryFilter"),
            let value = try? JSONDecoder().decode(FeedFilter.self, from: data) { return value }
-        return defaults(for: followed ? .following : .discovery)
+        return Self.defaults(for: followed ? .following : .discovery)
     }
-    func saveDefault(followed: Bool) {
+    func saveDefault(followed: Bool, defaults: UserDefaults = .standard) {
         if let data = try? JSONEncoder().encode(self) {
-            UserDefaults.standard.set(data, forKey: followed ? "defaultFollowingFilter" : "defaultDiscoveryFilter")
+            defaults.set(data, forKey: followed ? "defaultFollowingFilter" : "defaultDiscoveryFilter")
         }
     }
 
@@ -69,6 +73,28 @@ struct FeedFilter: Codable, Equatable {
         if let creator { q.append(.init(name: "username", value: creator.username)) }
         if let cursor { q.append(.init(name: "cursor", value: cursor)) }
         return q
+    }
+}
+
+extension FeedFilter {
+    private enum CodingKeys: String, CodingKey { case kind, sort, period, baseModel, onlyPG, videoDurationRange }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try values.decode(MediaKind.self, forKey: .kind).browsingSelection
+        sort = try values.decode(String.self, forKey: .sort)
+        period = try values.decode(String.self, forKey: .period)
+        baseModel = try values.decode(String.self, forKey: .baseModel)
+        onlyPG = try values.decode(Bool.self, forKey: .onlyPG)
+        videoDurationRange = try values.decodeIfPresent(VideoDurationRange.self, forKey: .videoDurationRange)
+    }
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(kind.browsingSelection, forKey: .kind)
+        try values.encode(sort, forKey: .sort)
+        try values.encode(period, forKey: .period)
+        try values.encode(baseModel, forKey: .baseModel)
+        try values.encode(onlyPG, forKey: .onlyPG)
+        try values.encodeIfPresent(videoDurationRange, forKey: .videoDurationRange)
     }
 }
 
@@ -107,14 +133,21 @@ struct MediaItem: Decodable, Identifiable, Hashable {
     var creatorID: Int?
     var tags: [MediaTag]? = nil
     var postID: Int? = nil
+    var createdAt: String? = nil
     var metadata: VideoTechnicalMetadata? = nil
+    // Supplied by a verified post result, never inferred from the media filename.
+    var postTitle: String? = nil
     var durationSeconds: Double? { metadata?.duration }
     // Assigned only by the local library, never decoded from a remote response.
     var offlineMediaURL: URL? = nil
     var offlinePosterURL: URL? = nil
-    private enum CodingKeys: String, CodingKey { case id, url, width, height, type, username, browsingLevel, thumbnail, creatorID, tags, metadata; case postID = "postId" }
+    private enum CodingKeys: String, CodingKey { case id, url, width, height, type, username, browsingLevel, thumbnail, creatorID, tags, metadata, createdAt; case postID = "postId" }
     struct Thumbnail: Decodable, Hashable { let url: String? }
     var isVideo: Bool { type == "video" }
+    var attributedCreator: Creator? {
+        guard let id = creatorID, id > 0, let username, !username.isEmpty else { return nil }
+        return Creator(id: id, username: username, image: nil)
+    }
     /// Viewer/history interpretation after decoding. Catalog filtering and
     /// network requests retain the server's original item/type.
     func resolvingMediaType(isVideo: Bool) -> MediaItem {
@@ -248,6 +281,8 @@ struct MediaPage: Decodable {
     var durationEnrichmentFailed = false
     // Local request evidence only; never decoded from the site's media payload.
     var durationEnrichmentHTTPStatus: Int? = nil
+    var collectionCursorKeys: [String]? = nil
+    var continuationKeys: [String] { collectionCursorKeys ?? (metadata.nextCursor.map { [$0] } ?? []) }
     private enum CodingKeys: String, CodingKey { case items, metadata, searchProgress }
     struct Metadata: Decodable { let nextCursor: String?; var sourceIDs: [Int]? = nil }
 }
@@ -267,7 +302,7 @@ enum Board: String, CaseIterable, Identifiable {
 }
 
 enum ClientError: LocalizedError {
-    case signedOut, loadingSite, http(Int), invalidResponse, missingCreator, writeUnknown, siteUnavailable, accountChanged, format(String), collectionAuthorization, collectionWriteUnknown, collectionBusy
+    case signedOut, loadingSite, http(Int), invalidResponse, missingCreator, writeUnknown, siteUnavailable, accountChanged, format(String), collectionAuthorization, collectionWriteUnknown, collectionBusy, noPrivateFavoriteFolder
     var errorDescription: String? {
         switch self {
         case .signedOut: "请先登录 Civitai，再刷新账号状态。"
@@ -282,13 +317,14 @@ enum ClientError: LocalizedError {
         case .format(let path): "站点数据字段暂不匹配（\(path)）。"
         case .collectionAuthorization: "收藏需要补充 Civitai 收藏读取与管理授权。现有登录仍可继续浏览。"
         case .collectionWriteUnknown: "收藏结果尚未确认，请刷新收藏状态后再操作。"
+        case .noPrivateFavoriteFolder: "没有可快速收藏的私密收藏夹。长按书签可选择收藏夹。"
         case .collectionBusy: "正在同步另一项收藏，请稍候。"
         }
     }
 }
 
 /// Civitai treats both images and videos as CollectionType.Image.
-struct SavedCollection: Codable, Identifiable, Hashable {
+struct SavedCollection: Codable, Identifiable, Hashable, Sendable {
     let id: Int
     let name: String
     let userId: Int
@@ -307,7 +343,7 @@ enum OfflineCloudState: String, Codable { case saved, localOnly, unknown }
 enum OfflineFileState: String, Codable { case pending, ready, failed }
 
 /// Deliberately no URL, token, cookie or request headers in the persistent index.
-struct OfflineRecord: Codable, Identifiable, Hashable {
+struct OfflineRecord: Codable, Identifiable, Hashable, Sendable {
     let id: Int
     var video: Bool
     var username: String?
@@ -323,17 +359,17 @@ struct OfflineRecord: Codable, Identifiable, Hashable {
     var tagNames: Set<String>? = nil
     var fileName: String { "\(id)." + (video ? "mp4" : "img") }
     var posterName: String { "\(id).poster.img" }
-    func media(in directory: URL) -> MediaItem {
+    func media(in directory: URL, hasPoster: Bool = false) -> MediaItem {
         var item = MediaItem(id: id, url: "", width: nil, height: nil, type: video ? "video" : "image", username: username, browsingLevel: browsingLevel, thumbnail: nil, creatorID: creatorID)
         item.offlineMediaURL = directory.appendingPathComponent(fileName)
         item.tags = tagNames.map { $0.sorted().map { MediaTag(name: $0) } }
         let poster = directory.appendingPathComponent(posterName)
-        if video && FileManager.default.fileExists(atPath: poster.path) { item.offlinePosterURL = poster }
+        if video && hasPoster { item.offlinePosterURL = poster }
         return item
     }
 }
 
-struct OfflineManifest: Codable {
+struct OfflineManifest: Codable, Sendable {
     var version = 1
     let accountID: Int
     var records: [OfflineRecord] = []

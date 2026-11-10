@@ -25,12 +25,14 @@ import CryptoKit
     private var pausedByUser = false
     private var retryAfter = Date.distantPast
     private let rootURL: URL
-    init(rootURL: URL? = nil) {
+    private let network: @MainActor () -> BackgroundNetworkState
+    init(rootURL: URL? = nil, network: @escaping @MainActor () -> BackgroundNetworkState = { BackgroundNetworkMonitor.shared.state }) {
         self.rootURL = rootURL ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("CivitTagLibrary", isDirectory: true)
+        self.network = network
     }
     var autoEnabled: Bool { UserDefaults.standard.object(forKey: "tagLibraryAuto") as? Bool ?? true }
     var wifiOnly: Bool { UserDefaults.standard.object(forKey: "tagLibraryWiFi") as? Bool ?? true }
-    var canNetwork: Bool { wifiOnly ? OfflineLibrary.shared.unmeteredMetadataNetwork : OfflineLibrary.shared.metadataNetworkConnected }
+    var canNetwork: Bool { network().allowsSync(wifiOnly: wifiOnly) }
 
     func bind(ownerID: Int?) async {
         guard !Task.isCancelled else { return }

@@ -1,62 +1,195 @@
 import SwiftUI
 
 struct FilterView: View {
-    @Binding var filter: FeedFilter
-    var allowAll = true
-    var context: FilterContext = .discovery
-    var saveAsDefaultForFollowing: Bool? = nil
-    var showsMediaSelector = false
+    @Binding private var filter: FeedFilter
+    @State private var draft: FeedFilter
+    private let context: FilterContext
+    private let saveAsDefaultForFollowing: Bool?
+    private let showsMediaSelector: Bool
+    private let isCollection: Bool
     @Environment(\.dismiss) private var dismiss
+
+    init(filter: Binding<FeedFilter>, context: FilterContext = .discovery,
+         saveAsDefaultForFollowing: Bool? = nil, showsMediaSelector: Bool = false, isCollection: Bool = false) {
+        _filter = filter
+        _draft = State(initialValue: filter.wrappedValue)
+        self.context = context
+        self.saveAsDefaultForFollowing = saveAsDefaultForFollowing
+        self.showsMediaSelector = showsMediaSelector
+        self.isCollection = isCollection
+    }
+
     var body: some View {
-        NavigationStack {
-            Form {
+        ScrollView {
+            VStack(alignment: .leading, spacing: FloatingPageChrome.spacing) {
                 if showsMediaSelector {
-                    Section("默认媒体") {
-                        Picker("默认媒体", selection: Binding(get: { filter.effectiveKind }, set: { filter = filter.selecting(kind: $0) })) { ForEach(allowAll ? MediaKind.allCases : [.image, .video]) { Text($0.title).tag($0) } }.pickerStyle(.segmented).accessibilityIdentifier("filter.media-kind")
+                    FloatingMediaPicker(title: "默认媒体", selection: Binding(get: { draft.effectiveKind }, set: { draft = draft.selecting(kind: $0) }), identifier: "filter.media-kind")
+                }
+                if !isCollection {
+                    SettingsControlCard("排序与范围") {
+                        SettingsChoice(title: "排序", selection: $draft.sort,
+                                       options: FeedSort.allCases.map(\.rawValue), name: { FeedSort(rawValue: $0)?.title ?? $0 })
+                            .accessibilityIdentifier("filter.sort")
+                        Divider()
+                        SettingsChoice(title: "时间范围", selection: $draft.period,
+                                       options: FeedPeriod.allCases.map(\.rawValue), name: { FeedPeriod(rawValue: $0)?.title ?? $0 })
+                            .accessibilityIdentifier("filter.period")
                     }
                 }
-                Section("排序与范围") {
-                    Picker("排序", selection: $filter.sort) {
-                        ForEach(FeedSort.allCases) { Text($0.title).tag($0.rawValue) }
-                    }.accessibilityIdentifier("filter.sort")
-                    Picker("时间范围", selection: $filter.period) {
-                        ForEach(FeedPeriod.allCases) { Text($0.title).tag($0.rawValue) }
-                    }.accessibilityIdentifier("filter.period")
-                }
-                Section("内容范围") {
-                    Picker("基础模型", selection: $filter.baseModel) {
-                        Text("全部").tag(""); Text("SDXL").tag("SDXL 1.0"); Text("Flux.1 D").tag("Flux.1 D"); Text("Wan Video").tag("Wan Video")
+                SettingsControlCard("内容范围") {
+                    if !isCollection {
+                        SettingsChoice(title: "基础模型", selection: $draft.baseModel,
+                                       options: ["", "SDXL 1.0", "Flux.1 D", "Wan Video"], name: { value in
+                            switch value {
+                            case "": "全部"
+                            case "SDXL 1.0": "SDXL"
+                            default: value
+                            }
+                        })
+                        Divider()
                     }
-                    Toggle("仅看 PG", isOn: $filter.onlyPG)
-                    Text("关闭“仅看 PG”时，内容范围遵循 Civitai 账号和站点规则。").font(.caption).foregroundStyle(.secondary)
+                    Toggle("仅看 PG", isOn: $draft.onlyPG)
+                        .frame(minHeight: FloatingPageChrome.controlHeight)
+                        .accessibilityIdentifier("filter.only-pg")
+                        .accessibilityHint("关闭后遵循账号和站点的内容范围")
                 }
-                VideoDurationFilterSection(range: $filter.videoDurationRange)
-                Button("重置筛选") { filter = filter.resetting(in: context) }
-                Text("选择立即生效；关闭面板保留当前选择。").font(.caption).foregroundStyle(.secondary)
-            }.navigationTitle("浏览筛选").navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    AppToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() }.buttonStyle(AppActionButtonStyle()) }
+                VideoDurationFilterSection(range: $draft.videoDurationRange)
+                SettingsControlCard {
+                    Button("重置筛选") {
+                        if isCollection { draft = .defaults(for: context, kind: filter.effectiveKind) }
+                        else { draft = draft.resetting(in: context) }
+                    }
+                        .frame(minHeight: FloatingPageChrome.controlHeight)
                 }
-        }.ordinaryAppearance().environment(\.defaultMinListRowHeight, 52)
-            .onChange(of: filter) { _, value in if let followed = saveAsDefaultForFollowing { value.saveDefault(followed: followed) } }
+            }
+            .pageScrollContentInsets()
+        }
+        .floatingTitleBar(isCollection ? "收藏筛选" : "浏览条件") {
+            Button("完成") {
+                filter = draft
+                if let followed = saveAsDefaultForFollowing { draft.saveDefault(followed: followed) }
+                dismiss()
+            }
+        }
+        .ordinaryAppearance()
+    }
+}
+
+struct SettingsControlCard<Content: View>: View {
+    private let title: String?
+    private let content: Content
+
+    init(_ title: String? = nil, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: FloatingPageChrome.groupInset) {
+            if let title {
+                Text(title).font(.caption).foregroundStyle(.secondary)
+                    .accessibilityAddTraits(.isHeader)
+            }
+            PageContentCard { content }
+                .font(.subheadline)
+                .toggleStyle(CompactSettingsToggleStyle())
+        }
+    }
+}
+
+struct CompactSettingsToggleStyle: ToggleStyle {
+    var showsLabel = true
+
+    func makeBody(configuration: Configuration) -> some View {
+        let track = Capsule()
+            .fill(configuration.isOn ? Color.accentColor : Color.secondary.opacity(0.35))
+            .overlay(alignment: configuration.isOn ? .trailing : .leading) {
+                Circle().fill(.white).frame(width: 14, height: 14).padding(3)
+            }
+            .frame(width: 36, height: 20)
+
+        return Button { configuration.isOn.toggle() } label: {
+            Group {
+                if showsLabel {
+                    HStack(spacing: FloatingPageChrome.spacing) {
+                        configuration.label
+                        Spacer(minLength: FloatingPageChrome.spacing)
+                        track
+                    }
+                } else {
+                    track.frame(width: FloatingPageChrome.controlHeight)
+                }
+            }
+            .frame(minHeight: FloatingPageChrome.controlHeight)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityRepresentation {
+            Toggle(isOn: configuration.$isOn) { configuration.label }
+                .toggleStyle(.switch)
+        }
+    }
+}
+
+struct SettingsChoice<Value: Hashable>: View {
+    let title: String
+    let symbol: String?
+    @Binding var selection: Value
+    let options: [Value]
+    let name: (Value) -> String
+    @Environment(\.colorScheme) private var scheme
+
+    init(title: String, symbol: String? = nil, selection: Binding<Value>, options: [Value], name: @escaping (Value) -> String) {
+        self.title = title
+        self.symbol = symbol
+        self._selection = selection
+        self.options = options
+        self.name = name
+    }
+
+    var body: some View {
+        Menu {
+            Picker(title, selection: $selection) {
+                ForEach(options, id: \.self) { Text(name($0)).tag($0) }
+            }
+        } label: {
+            HStack(spacing: FloatingPageChrome.groupInset) {
+                if let symbol { SettingsRowLabel(title, symbol) }
+                else { Text(title).font(.subheadline) }
+                Spacer(minLength: FloatingPageChrome.spacing)
+                HStack(spacing: FloatingPageChrome.groupInset) {
+                    Text(name(selection)).lineLimit(1)
+                    Image(systemName: "chevron.up.chevron.down").font(.caption2.weight(.semibold))
+                }
+                .font(FloatingPageChrome.controlFont)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(AppTheme.pageBackground(for: scheme), in: FloatingPageChrome.surfaceShape(nested: true))
+            }
+            .foregroundStyle(.primary)
+            .frame(minHeight: FloatingPageChrome.controlHeight)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(title)
+        .accessibilityValue(name(selection))
     }
 }
 
 struct VideoDurationFilterSection: View {
     @Binding var range: VideoDurationRange?
     var body: some View {
-        Section {
-            Toggle("筛选视频时长", isOn: Binding(get: { range != nil }, set: { enabled in
+        SettingsControlCard {
+            Toggle("视频时长", isOn: Binding(get: { range != nil }, set: { enabled in
                 range = enabled ? .init() : nil
             }))
-            VideoDurationRangeControl(range: $range)
-            Text("每档1秒，拖动时实时显示；点上方数值可逐秒微调。最短末端为“超过02:00”，最长末端为“不限”。")
-                .font(.caption).foregroundStyle(.secondary)
+            .frame(minHeight: FloatingPageChrome.controlHeight)
+            .accessibilityIdentifier("duration.range.enabled")
+            .accessibilityHint("开启后只匹配已知时长的视频")
             if range != nil {
-                Text("仅匹配已知时长的视频；切换到图片或全部时清除时长限制。").font(.caption).foregroundStyle(.secondary)
+                Divider()
+                VideoDurationRangeControl(range: $range).padding(.vertical, FloatingPageChrome.spacing)
             }
-        } header: { Text("视频时长") } footer: {
-            Text("仅匹配已取得且时长已知的视频。未知暂不展示，可继续查找。关闭后不限制时长。")
         }
     }
 }
@@ -66,10 +199,10 @@ struct SettingsRowLabel: View {
     let symbol: String
     init(_ title: String, _ symbol: String) { self.title = title; self.symbol = symbol }
     var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: symbol).font(.system(size: 19, weight: .regular)).frame(width: 26, height: 26).accessibilityHidden(true)
-            Text(title).fixedSize(horizontal: false, vertical: true)
-        }.frame(minHeight: 34)
+        HStack(spacing: FloatingPageChrome.spacing) {
+            Image(systemName: symbol).font(.system(size: 16, weight: .regular)).frame(width: 22, height: 22).accessibilityHidden(true)
+            Text(title).font(.subheadline).fixedSize(horizontal: false, vertical: true)
+        }.frame(minHeight: 26)
     }
 }
 
@@ -78,27 +211,44 @@ private struct BlockedTagsView: View {
     @State private var name = ""
     @State private var error: String?
     var body: some View {
-        Form {
-            Section {
-                TextField("输入站点标签名", text: $name).textInputAutocapitalization(.never).autocorrectionDisabled().onSubmit(add)
-                Button(action: add) { SettingsRowLabel("添加屏蔽标签", "plus.circle") }.disabled(TagPolicy.normalize(name).isEmpty)
-                if let error { Text(error).font(.caption).foregroundStyle(.red) }
-            } header: { Text("添加标签") } footer: { Text("名称忽略大小写及首尾空白，按站点返回的标签名称精确匹配，不自动扩充同义词。") }
-            Section("已屏蔽 · \(blocklist.names.count)") {
-                if blocklist.names.isEmpty { Text("尚未设置屏蔽标签").foregroundStyle(.secondary) }
-                ForEach(blocklist.names.sorted(), id: \.self) { tag in
-                    HStack {
-                        SettingsRowLabel(tag, "tag.slash")
-                        Spacer()
-                        Button(role: .destructive) { blocklist.remove(tag) } label: { Image(systemName: "minus.circle").frame(width: 44, height: 44) }.accessibilityLabel("删除屏蔽标签 " + tag)
+        ScrollView {
+            VStack(alignment: .leading, spacing: FloatingPageChrome.spacing) {
+                SettingsControlCard {
+                    TextField("输入站点标签名", text: $name)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled().onSubmit(add)
+                        .frame(minHeight: FloatingPageChrome.controlHeight)
+                    if let error { Text(error).font(.caption).foregroundStyle(.red).padding(.bottom, 8) }
+                }
+                SettingsControlCard(blocklist.names.isEmpty ? nil : "已屏蔽 · \(blocklist.names.count)") {
+                    if blocklist.names.isEmpty {
+                        Text("尚未屏蔽标签").foregroundStyle(.secondary)
+                            .frame(minHeight: FloatingPageChrome.controlHeight)
+                    }
+                    if !blocklist.names.isEmpty {
+                        TagPillLayout(spacing: FloatingPageChrome.groupInset) {
+                            ForEach(blocklist.names.sorted(), id: \.self) { tag in
+                                Button(role: .destructive) { blocklist.remove(tag) } label: {
+                                    WorkTagLabel(title: tag, selected: false, blocked: true, removable: true)
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("删除屏蔽标签 " + tag)
+                            }
+                        }
                     }
                 }
+                Text("仅在本机按站点标签名屏蔽作品。标签尚未核实的作品会暂时隐藏。")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .padding(.horizontal, FloatingPageChrome.cardInset)
             }
-            Section("生效范围") {
-                Text("仅保存在本机，应用于本客户端的推荐、关注、作品榜、作者作品、收藏及离线查看；不会更改 Civitai 账号设置或删除作品。")
-                Text("开启屏蔽后，标签尚未取得的作品暂不展示，仍可继续翻页。离线旧文件需联网更新标签后展示。仅依赖站点返回标签，不识别画面，也不能保证站点标签完整。")
-            }.font(.footnote).foregroundStyle(.secondary)
-        }.navigationTitle("屏蔽标签").ordinaryAppearance().appNavigationBack().environment(\.defaultMinListRowHeight, 52)
+            .pageScrollContentInsets()
+        }
+        .floatingTitleBar("屏蔽标签") {
+            Button(action: add) { FloatingPageIcon(symbol: "plus") }
+                .buttonStyle(FloatingPageButtonStyle(iconOnly: true))
+                .accessibilityLabel("添加屏蔽标签")
+                .disabled(TagPolicy.normalize(name).isEmpty)
+        }
+        .ordinaryAppearance()
     }
     private func add() {
         if blocklist.add(name) { name = ""; error = nil }
@@ -106,14 +256,140 @@ private struct BlockedTagsView: View {
     }
 }
 
+private struct MediaRailOrderView: View {
+    @AppStorage(MediaRailAction.defaultsKey) private var railOrder = ""
+    @AppStorage(MediaRailAction.hiddenDefaultsKey) private var hiddenRailActions = ""
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ScaledMetric(relativeTo: .body) private var scaledRowHeight: CGFloat = 50
+    @GestureState private var drag: RailDrag?
+
+    private struct RailDrag {
+        let action: MediaRailAction
+        let offset: CGFloat
+    }
+
+    private let rowSpacing = FloatingPageChrome.groupInset
+    private var rowHeight: CGFloat { max(50, scaledRowHeight) }
+    private var rowStep: CGFloat { rowHeight + rowSpacing }
+    private var actions: [MediaRailAction] { MediaRailAction.ordered(railOrder) }
+    private var hidden: Set<MediaRailAction> { MediaRailAction.hidden(hiddenRailActions) }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .trailing, spacing: FloatingPageChrome.groupInset) {
+                VStack(spacing: rowSpacing) {
+                    ForEach(actions, id: \.self) { action in
+                        row(action)
+                            .offset(y: rowOffset(action))
+                            .zIndex(drag?.action == action ? 1 : 0)
+                    }
+                }
+                .padding(FloatingPageChrome.groupInset)
+                .background(AppTheme.secondarySurface, in: FloatingPageChrome.controlShape)
+                if actions != MediaRailAction.allCases || !hidden.isEmpty {
+                    Button("恢复默认") {
+                        railOrder = ""
+                        hiddenRailActions = ""
+                    }
+                    .buttonStyle(FloatingPageButtonStyle())
+                    .accessibilityIdentifier("settings.media-rail.reset")
+                }
+            }
+            .pageScrollContentInsets()
+        }
+        .floatingTitleBar("播放侧栏")
+        .ordinaryAppearance()
+    }
+
+    private func row(_ action: MediaRailAction) -> some View {
+        let visible = !hidden.contains(action)
+        return HStack(spacing: 2) {
+            SettingsRowLabel(action.title, action.symbol)
+                .foregroundStyle(visible ? Color.primary : Color.secondary)
+            if action == .cleanImage || action == .mute {
+                Text(action == .cleanImage ? "仅图片" : "仅视频")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .accessibilityHidden(true)
+            }
+            Spacer(minLength: 0)
+            Toggle(action.title, isOn: Binding(
+                get: { !hidden.contains(action) },
+                set: { setVisibility($0, for: action) }
+            ))
+            .toggleStyle(CompactSettingsToggleStyle(showsLabel: false))
+            .accessibilityHint(action == .cleanImage ? "仅适用于图片侧栏" : (action == .mute ? "仅适用于视频侧栏" : ""))
+            .accessibilityIdentifier("settings.media-rail.\(action.rawValue)")
+
+            Image(systemName: "line.3.horizontal")
+                .font(.system(size: 16, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+                .highPriorityGesture(reorderGesture(action))
+                .accessibilityLabel("拖动排序：\(action.title)")
+                .accessibilityAdjustableAction { direction in
+                    switch direction {
+                    case .increment: move(action, by: 1)
+                    case .decrement: move(action, by: -1)
+                    @unknown default: break
+                    }
+                }
+                .accessibilityIdentifier("settings.media-rail.drag.\(action.rawValue)")
+        }
+        .padding(.leading, FloatingPageChrome.cardInset)
+        .frame(height: rowHeight)
+        .background(.primary.opacity(0.065), in: FloatingPageChrome.surfaceShape(nested: true))
+    }
+
+    private func reorderGesture(_ action: MediaRailAction) -> some Gesture {
+        DragGesture(minimumDistance: 4, coordinateSpace: .global)
+            .updating($drag) { value, state, _ in
+                guard let index = actions.firstIndex(of: action) else { return }
+                let upper = CGFloat(actions.count - 1 - index) * rowStep
+                let lower = -CGFloat(index) * rowStep
+                state = RailDrag(action: action, offset: min(upper, max(lower, value.translation.height)))
+            }
+            .onEnded { value in
+                move(action, by: Int((value.translation.height / rowStep).rounded()))
+            }
+    }
+
+    private func rowOffset(_ action: MediaRailAction) -> CGFloat {
+        guard let drag, let source = actions.firstIndex(of: drag.action),
+              let index = actions.firstIndex(of: action) else { return 0 }
+        if drag.action == action { return drag.offset }
+        let destination = source + Int((drag.offset / rowStep).rounded())
+        if source < index && index <= destination { return -rowStep }
+        if destination <= index && index < source { return rowStep }
+        return 0
+    }
+
+    private func move(_ action: MediaRailAction, by distance: Int) {
+        var ordered = actions
+        guard let source = ordered.firstIndex(of: action) else { return }
+        let destination = min(max(source + distance, 0), ordered.count - 1)
+        guard destination != source else { return }
+        ordered.remove(at: source)
+        ordered.insert(action, at: destination)
+        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.15)) {
+            railOrder = ordered.map(\.rawValue).joined(separator: ",")
+        }
+    }
+
+    private func setVisibility(_ visible: Bool, for action: MediaRailAction) {
+        var hidden = self.hidden
+        if visible { hidden.remove(action) }
+        else { hidden.insert(action) }
+        hiddenRailActions = MediaRailAction.allCases.filter { hidden.contains($0) }.map(\.rawValue).joined(separator: ",")
+    }
+}
+
 struct SettingsView: View {
     @EnvironmentObject private var session: SiteSession
     @ObservedObject private var cache = MediaCache.shared
-    @ObservedObject private var offline = OfflineLibrary.shared
     @ObservedObject private var orientation = ViewingOrientationController.shared
-    @AppStorage("offlineAutoSave") private var offlineAutoSave = true
-    @AppStorage("offlineWifiOnly") private var offlineWifiOnly = true
-    @AppStorage("offlineLimitGB") private var offlineLimitGB = 10
     @AppStorage("autoplay") private var autoplay = true
     @AppStorage("muted") private var muted = true
     @AppStorage("automaticVideoRepair") private var automaticVideoRepair = true
@@ -135,189 +411,232 @@ struct SettingsView: View {
         let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? ""
         return "\(version) (\(build))"
     }
-    private func storageSize(_ bytes: Int64) -> String {
-        if bytes == 0 { return "0 KB" }
-        let formatter = ByteCountFormatter()
-        formatter.countStyle = .file
-        formatter.allowsNonnumericFormatting = false
-        return formatter.string(fromByteCount: bytes)
-    }
+    @State private var refreshingAccount = false
+
     var body: some View {
-        Form {
-            Section("Civitai 账号") {
-                if let account = session.account {
-                    LabeledContent { Text(account.username) } label: { SettingsRowLabel("当前账号", "person.crop.circle") }
-                    Button { Task { await session.refreshAccount() } } label: { SettingsRowLabel("刷新账号与关注", "arrow.clockwise") }
-                    NavigationLink { AccountPreferencesView() } label: { SettingsRowLabel("账号内容偏好", "gearshape") }
-                    NavigationLink { FollowingView() } label: { SettingsRowLabel("关注的作者", "person.2") }
-                    NavigationLink { CollectionsView() } label: { SettingsRowLabel("我的收藏", "bookmark") }
-                    NavigationLink { OfflineStorageView().appNavigationBack() } label: { SettingsRowLabel("离线收藏与空间管理", "internaldrive") }
-                    Button(role: .destructive) { Task { await session.clearLocalLogin() } } label: { SettingsRowLabel("退出此客户端", "rectangle.portrait.and.arrow.right") }
-                } else {
-                    Button { session.openLogin() } label: { SettingsRowLabel("登录 Civitai", "person.crop.circle") }
-                    NavigationLink { OfflineStorageView().appNavigationBack() } label: { SettingsRowLabel("离线收藏与空间管理", "internaldrive") }
-                }
-                LabeledContent { Text("civitai.red") } label: { SettingsRowLabel("连接站点", "globe") }
-            }
-            Section("外观") {
-                Picker(selection: appearanceSelection) {
-                    ForEach(AppAppearance.allCases) { appearance in Text(appearance.title).tag(appearance) }
-                } label: { SettingsRowLabel("显示模式", "circle.lefthalf.filled") }
-                    .pickerStyle(.menu).accessibilityIdentifier("settings-appearance-picker")
-                    .accessibilityValue(appearanceSelection.wrappedValue.title)
-            }
-            Section("播放") {
-                Toggle(isOn: $autoplay) { SettingsRowLabel("自动播放视频", "play.circle") }
-                Toggle(isOn: $muted) { SettingsRowLabel("视频默认静音", "speaker.slash") }
-                Toggle(isOn: $automaticVideoRepair) { SettingsRowLabel("自动修复不兼容视频", "wand.and.stars") }
-                Text("仅修复当前打开的视频；先无损转封装，必要时转换为 H.264/AAC。划走或进入后台会停止转换，完成的修复文件可复用。").font(.caption).foregroundStyle(.secondary)
-                Toggle(isOn: Binding(get: { orientation.automatic }, set: { orientation.setAutomatic($0) })) { SettingsRowLabel("自动旋转", "rotate.right") }
-                Text("默认关闭；观看时仍可手动切换横竖屏。开启后跟随系统允许的方向。").font(.caption).foregroundStyle(.secondary)
-            }
-            Section("浏览记录") {
-                NavigationLink { BrowsingHistoryView().appNavigationBack() } label: { SettingsRowLabel("最近浏览与接着看", "clock.arrow.circlepath") }
-            }
-            Section("诊断") {
-                NavigationLink { LocalDiagnosticsView().appNavigationBack() } label: { SettingsRowLabel("本机错误与诊断记录", "stethoscope") }
-            }
-            Section("默认浏览设置") {
-                Button { editDefault = 0 } label: { SettingsRowLabel("推荐时间线默认筛选", "slider.horizontal.3") }
-                Button { editDefault = 1 } label: { SettingsRowLabel("关注时间线默认筛选", "person.2") }
-                NavigationLink { BlockedTagsView() } label: { SettingsRowLabel("屏蔽标签", "tag.slash") }
-                NavigationLink { AuthorBlocklistView().appNavigationBack() } label: { SettingsRowLabel("屏蔽的作者", "person.crop.circle.badge.xmark") }
-                Text("作者屏蔽仅在本机生效。不会更改站点设置或删除收藏、浏览记录和离线作品。")
-                    .font(.caption).foregroundStyle(.secondary)
-                NavigationLink { LocalTagLibraryView().appNavigationBack() } label: { SettingsRowLabel("本地标签库与同步", "externaldrive") }
-                Toggle(isOn: $deduplicateMedia) { SettingsRowLabel("合并相同媒体", "rectangle.on.rectangle.slash") }
-                Text("搜索、时间线、作者和收藏列表统一去重。关闭后可查看同媒体的不同作品记录；收藏操作仍针对当前作品，不合并云端关系。").font(.caption).foregroundStyle(.secondary)
-                Text("默认筛选用于下次打开客户端；当前两条时间线分别保留自己的筛选和浏览位置。").font(.caption).foregroundStyle(.secondary)
-            }
-            Section("时间线缓存") {
-                Toggle(isOn: $wifiVideoPrefetch) { SettingsRowLabel("仅在 Wi-Fi 下预取视频", "wifi") }
-                Picker(selection: $mediaPrefetchCount) {
-                    ForEach([3, 6, 10], id: \.self) { Text("后续 \($0) 条").tag($0) }
-                } label: { SettingsRowLabel("预加载作品", "arrow.down.circle") }
-                VStack(alignment: .leading, spacing: 9) {
-                    HStack {
-                        SettingsRowLabel("预载并发", "arrow.down.forward.and.arrow.up.backward")
-                        Spacer()
-                        Text("\(MediaPrefetchConcurrency.validated(mediaPrefetchConcurrency)) 路")
-                            .foregroundStyle(.blue).monospacedDigit()
-                            .accessibilityIdentifier("settings.prefetch-concurrency.value")
-                    }
-                    Slider(value: Binding(get: {
-                        Double(MediaPrefetchConcurrency.steps.firstIndex(of: MediaPrefetchConcurrency.validated(mediaPrefetchConcurrency)) ?? 1)
-                    }, set: { value in
-                        let index = min(max(Int(value.rounded()), 0), MediaPrefetchConcurrency.steps.count - 1)
-                        mediaPrefetchConcurrency = MediaPrefetchConcurrency.steps[index]
-                    }), in: 0...Double(MediaPrefetchConcurrency.steps.count - 1), step: 1)
-                        .accessibilityLabel("预载并发")
-                        .accessibilityValue("\(MediaPrefetchConcurrency.validated(mediaPrefetchConcurrency)) 路")
-                        .accessibilityIdentifier("settings.prefetch-concurrency")
-                    HStack {
-                        ForEach(Array(MediaPrefetchConcurrency.steps.enumerated()), id: \.offset) { index, value in
-                            if index > 0 { Spacer() }
-                            Text("\(value)").font(.caption2).foregroundStyle(.secondary).monospacedDigit()
+        List {
+            Group {
+                Section {
+                    if let account = session.account {
+                        LabeledContent {
+                            Text(account.username).lineLimit(1)
+                        } label: {
+                            SettingsRowLabel("当前账号", "person.crop.circle")
                         }
-                    }.accessibilityHidden(true)
-                    Text("图片与视频共用下载路数，与后续作品条数独立。当前播放优先，缓冲时预载让路，随后自动继续。")
-                        .font(.caption).foregroundStyle(.secondary)
-                }.padding(.vertical, 5)
-                if let status = cache.preloadStatus {
-                    LabeledContent("预加载状态", value: status.summary)
-                    if !status.detail.isEmpty { Text(status.detail).font(.caption).foregroundStyle(.secondary) }
+                        NavigationLink { AccountPreferencesView() } label: { SettingsRowLabel("账号内容偏好", "gearshape") }
+                        NavigationLink { FollowingView() } label: { SettingsRowLabel("关注的作者", "person.2") }
+                        NavigationLink { CollectionsView(showsBack: true) } label: { SettingsRowLabel("我的收藏", "bookmark") }
+                        NavigationLink { OfflineStorageView() } label: { SettingsRowLabel("离线收藏与空间管理", "internaldrive") }
+                            .accessibilityIdentifier("settings.offline-library")
+                        Button(role: .destructive) { Task { await session.clearLocalLogin() } } label: { SettingsRowLabel("退出此客户端", "rectangle.portrait.and.arrow.right") }
+                    } else {
+                        Button { session.openLogin() } label: { SettingsRowLabel("登录 Civitai", "person.crop.circle") }
+                        NavigationLink { OfflineStorageView() } label: { SettingsRowLabel("离线收藏与空间管理", "internaldrive") }
+                            .accessibilityIdentifier("settings.offline-library")
+                    }
+                    LabeledContent { Text("civitai.red") } label: { SettingsRowLabel("连接站点", "globe") }
+                } header: { sectionHeading("Civitai 账号") }
+                Section {
+                    SettingsChoice(title: "显示模式", symbol: "circle.lefthalf.filled",
+                                   selection: appearanceSelection, options: AppAppearance.allCases, name: { $0.title })
+                        .accessibilityIdentifier("settings-appearance-picker")
+                } header: { sectionHeading("外观") }
+                Section {
+                    NavigationLink {
+                        OfflineDownloadSettingsView()
+                    } label: {
+                        SettingsRowLabel("下载设置", "arrow.down.circle")
+                    }
+                    .accessibilityIdentifier("settings.downloads")
+                } header: { sectionHeading("下载") }
+                Section {
+                    NavigationLink { MediaRailOrderView() } label: { SettingsRowLabel("播放侧栏", "sidebar.right") }
+                        .accessibilityIdentifier("settings.media-rail")
+                    Toggle(isOn: $autoplay) { SettingsRowLabel("自动播放视频", "play.circle") }
+                    Toggle(isOn: $muted) { SettingsRowLabel("视频默认静音", "speaker.slash") }
+                    Toggle(isOn: $automaticVideoRepair) { SettingsRowLabel("自动修复不兼容视频", "wand.and.stars") }
+                    Toggle(isOn: Binding(get: { orientation.automatic }, set: { orientation.setAutomatic($0) })) { SettingsRowLabel("自动旋转", "rotate.right") }
+                    if !orientation.automatic {
+                        Button { orientation.toggleOrientation() } label: {
+                            SettingsRowLabel("手动切换方向", "rectangle.portrait.rotate")
+                        }
+                        .accessibilityIdentifier("settings.rotation.toggle")
+                    }
+                } header: { sectionHeading("播放") }
+                Section {
+                    NavigationLink { BrowsingHistoryView() } label: { SettingsRowLabel("最近浏览与接着看", "clock.arrow.circlepath") }
+                } header: { sectionHeading("浏览记录") }
+                Section {
+                    NavigationLink { LocalDiagnosticsView() } label: { SettingsRowLabel("本机错误与诊断记录", "stethoscope") }
+                } header: { sectionHeading("诊断") }
+                Section {
+                    Button { editDefault = 0 } label: { SettingsRowLabel("推荐时间线默认筛选", "slider.horizontal.3") }
+                    Button { editDefault = 1 } label: { SettingsRowLabel("关注时间线默认筛选", "person.2") }
+                    NavigationLink { BlockedTagsView() } label: { SettingsRowLabel("屏蔽标签", "tag.slash") }
+                    NavigationLink { AuthorBlocklistView() } label: { SettingsRowLabel("屏蔽的作者", "person.crop.circle.badge.xmark") }
+                    NavigationLink { LocalTagLibraryView() } label: { SettingsRowLabel("本地标签库与同步", "externaldrive") }
+                    Toggle(isOn: $deduplicateMedia) { SettingsRowLabel("合并相同媒体", "rectangle.on.rectangle.slash") }
+                } header: { sectionHeading("默认浏览设置") }
+                Section {
+                    Toggle(isOn: $wifiVideoPrefetch) { SettingsRowLabel("仅在 Wi-Fi 下预取视频", "wifi") }
+                    SettingsChoice(title: "预加载作品", symbol: "arrow.down.circle",
+                                   selection: $mediaPrefetchCount, options: [3, 6, 10], name: { "后续 \($0) 条" })
+                    // Bring the track closer while keeping the slider's full touch height.
+                    VStack(alignment: .leading, spacing: -FloatingPageChrome.groupInset) {
+                        SettingsRowLabel("预载并发", "arrow.down.forward.and.arrow.up.backward")
+                            .accessibilityHidden(true)
+                        PrefetchConcurrencySlider(value: $mediaPrefetchConcurrency)
+                            .frame(height: FloatingPageChrome.controlHeight)
+                    }
+                    .padding(.vertical, FloatingPageChrome.spacing)
+                    if let status = cache.preloadStatus {
+                        LabeledContent("预加载状态", value: status.summary)
+                    }
+                    LabeledContent { Text(cache.diskUsageKnown ? AppTheme.storageSize(cache.diskBytes) : "暂时无法统计") } label: { SettingsRowLabel("媒体缓存", "internaldrive") }
+                        .accessibilityIdentifier("settings.media-cache-size")
+                    SettingsChoice(title: "磁盘缓存上限", symbol: "externaldrive",
+                                   selection: $cacheLimitGB, options: [1, 5, 10, 20], name: { "\($0) GB" })
+                    LabeledContent { Text("\(cache.cacheHits) 次") } label: { SettingsRowLabel("本次缓存复用", "arrow.triangle.2.circlepath") }
+                    Button { cache.clear() } label: { SettingsRowLabel("清理媒体缓存", "trash") }
+                } header: { sectionHeading("时间线缓存") }
+                Section {
+                    DisclosureGroup(isExpanded: $showsGestureHelp) {
+                        LabeledContent("上下划", value: "上一条／下一条")
+                        LabeledContent("单击视频", value: "暂停／继续")
+                        LabeledContent("双击作品", value: "进入作者主页")
+                        LabeledContent("时间线边缘横滑", value: "上半切关注／推荐，下半切图片／视频")
+                        LabeledContent("作者作品边缘横滑", value: "退出观看")
+                        LabeledContent("视频中央左右划", value: "快退／快进")
+                        LabeledContent("边缘长按", value: "临时 2×，松手恢复")
+                        LabeledContent("中央长按", value: "清屏／恢复")
+                            .accessibilityElement(children: .combine)
+                            .accessibilityLabel("中央长按，清屏／恢复")
+                            .accessibilityIdentifier("settings.gesture.central-hold")
+                    } label: { SettingsRowLabel("手势帮助", "hand.tap") }
+                    .accessibilityIdentifier("settings.gesture-help")
+                } header: { sectionHeading("观看帮助") }
+                Section {
+                    LabeledContent { Text(appVersion) } label: { SettingsRowLabel("版本", "info.circle") }
+                    NavigationLink { MediaRepairLicenseView() } label: { SettingsRowLabel("开源组件", "curlybraces") }
+                } header: { sectionHeading("关于") }
+            }
+            .font(.subheadline)
+            .toggleStyle(CompactSettingsToggleStyle())
+            .floatingCardListRows()
+        }
+        .listStyle(.plain)
+        .listRowSpacing(FloatingPageChrome.groupInset)
+        .avoidOverlaidTabBar(constrainViewport: true)
+        .clipped()
+        .floatingTitleBar("账号与设置") {
+            if session.account != nil {
+                Button {
+                    guard !refreshingAccount else { return }
+                    refreshingAccount = true
+                    Task { await session.refreshAccount(); refreshingAccount = false }
+                } label: {
+                    if refreshingAccount { ProgressView().controlSize(.small) }
+                    else { FloatingPageIcon(symbol: "arrow.clockwise") }
                 }
-                Text("连续准备后续图片和视频，减少滑动时的等待。低数据模式或计费热点会暂停仅 Wi-Fi 的视频预载。")
-                    .font(.caption).foregroundStyle(.secondary)
-                Text("单条视频最多预取 512 MiB，并受当前缓存与可用空间预算限制。")
-                    .font(.caption).foregroundStyle(.secondary)
-                LabeledContent { Text(cache.diskUsageKnown ? storageSize(cache.diskBytes) : "暂时无法统计") } label: { SettingsRowLabel("媒体缓存", "internaldrive") }
-                    .accessibilityIdentifier("settings.media-cache-size")
-                Picker(selection: $cacheLimitGB) {
-                    ForEach([1, 5, 10, 20], id: \.self) { Text("\($0) GB").tag($0) }
-                } label: { SettingsRowLabel("磁盘缓存上限", "externaldrive") }
-                LabeledContent { Text("\(cache.cacheHits) 次") } label: { SettingsRowLabel("本次缓存复用", "arrow.triangle.2.circlepath") }
-                Text("包含原媒体与兼容修复文件，按最近使用时间逐出，保护正在播放和接下来要看的文件。可用空间不足 1 GB 时停止预取并提前清理。上限不会预先占用空间。").font(.caption).foregroundStyle(.secondary)
-                Button { cache.clear() } label: { SettingsRowLabel("清理媒体缓存", "trash") }
+                .buttonStyle(FloatingPageButtonStyle(iconOnly: true))
+                .disabled(refreshingAccount)
+                .accessibilityLabel("刷新账号与关注")
+                .accessibilityIdentifier("settings.account.refresh")
             }
-            Section("离线收藏 · 独立存储") {
-                Toggle(isOn: $offlineAutoSave) { SettingsRowLabel("自动保存全部收藏", "arrow.down.circle") }
-                Toggle(isOn: $offlineWifiOnly) { SettingsRowLabel("仅在 Wi-Fi 下下载收藏", "wifi") }
-                LabeledContent { Text(offline.diskUsageKnown ? storageSize(offline.diskBytes) : "暂时无法统计") } label: { SettingsRowLabel("离线文件", "internaldrive") }
-                LabeledContent { Text("\(offline.readyCount) 项") } label: { SettingsRowLabel("已下载", "checkmark.circle") }
-                Picker(selection: $offlineLimitGB) {
-                    ForEach([1,5,10,20,50], id: \.self) { Text("\($0) GB").tag($0) }
-                } label: { SettingsRowLabel("当前账号离线上限", "externaldrive") }
-                Text(offline.status).font(.caption).foregroundStyle(.secondary)
-                Text("包含历史收藏；跨收藏夹去重。与浏览缓存独立，空间满时暂停下载。取消云端收藏保留本地副本，可在空间管理中按大小、时间和收藏状态清理。").font(.caption).foregroundStyle(.secondary)
-            }
-            Section("观看帮助") {
-                DisclosureGroup(isExpanded: $showsGestureHelp) {
-                    LabeledContent("上下划", value: "上一条／下一条")
-                    LabeledContent("单击视频", value: "暂停／继续")
-                    LabeledContent("双击作品", value: "进入作者主页")
-                    LabeledContent("边缘左右划", value: "图片／全部／视频")
-                    LabeledContent("视频中央左右划", value: "快退／快进")
-                    LabeledContent("边缘长按", value: "临时 2×，松手恢复")
-                    LabeledContent("中央长按", value: "清屏／恢复")
-                        .accessibilityElement(children: .combine)
-                        .accessibilityLabel("中央长按，清屏／恢复")
-                        .accessibilityIdentifier("settings.gesture.central-hold")
-                } label: { SettingsRowLabel("手势帮助", "hand.tap") }
-                .accessibilityIdentifier("settings.gesture-help")
-            }
-            Section("关于") {
-                Text("Civit Viewer · 个人使用的第三方客户端").font(.caption)
-                LabeledContent { Text(appVersion) } label: { SettingsRowLabel("版本", "info.circle") }
-                Text("Google 登录由系统浏览器中的 Civitai 官网处理。授权凭据仅保存在本机 Keychain。").font(.caption).foregroundStyle(.secondary)
-                NavigationLink { MediaRepairLicenseView().appNavigationBack() } label: { SettingsRowLabel("开源组件", "curlybraces") }
-            }
-        }.navigationTitle("账号与设置")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar(.visible, for: .navigationBar)
-            .ordinaryAppearance().environment(\.defaultMinListRowHeight, 52).onAppear { cache.trim() }
+        }
+            .ordinaryAppearance().environment(\.defaultMinListRowHeight, FloatingPageChrome.controlHeight).onAppear { cache.trim() }
             .onChange(of: cacheLimitGB) { _, _ in cache.trim() }
-            .onChange(of: offlineAutoSave) { _, enabled in
-                if enabled { offline.resumeAll(session: session, includeRemovedCopies: true) }
-                else { offline.pause(reason: "自动保存已关闭") }
-            }
-            .onChange(of: offlineWifiOnly) { _, _ in offline.pause(); if offlineAutoSave { offline.requestSync(session: session) } }
-            .onChange(of: offlineLimitGB) { _, _ in if offlineAutoSave { offline.requestSync(session: session) } }
-            .sheet(isPresented: Binding(get: { editDefault != nil }, set: { if !$0 { editDefault = nil } })) {
+            .navigationDestination(isPresented: Binding(get: { editDefault != nil }, set: { if !$0 { editDefault = nil } })) {
                 if editDefault == 1 { FilterView(filter: $defaultFollowing, context: .following, saveAsDefaultForFollowing: true, showsMediaSelector: true) }
                 else { FilterView(filter: $defaultDiscovery, saveAsDefaultForFollowing: false, showsMediaSelector: true) }
             }
     }
+    private func sectionHeading(_ title: String) -> some View {
+        Text(title).font(.footnote.weight(.semibold)).foregroundStyle(Color(uiColor: .secondaryLabel))
+    }
+
 }
 
 struct AccountPreferencesView: View {
     @EnvironmentObject private var session: SiteSession
-    @State private var level = 1
-    @State private var blur = true
-    @State private var saving = false
-    private let levels: [(Int, String)] = [(1,"PG"),(2,"PG-13"),(4,"R"),(8,"X"),(16,"XXX")]
+    @State private var refreshing = false
+
     var body: some View {
-        Form {
-            if session.account?.browsingLevel != nil {
-                Section("账号浏览范围") {
-                    ForEach(levels, id: \.0) { bit, title in
-                        Toggle(title, isOn: Binding(get: { level & bit != 0 }, set: { enabled in if enabled { level |= bit } else { level &= ~bit } }))
+        ScrollView {
+            VStack(alignment: .leading, spacing: FloatingPageChrome.spacing) {
+                if let identity = session.accountSessionID, let account = session.account, let level = account.browsingLevel {
+                    AccountPreferencesForm(identity: identity, level: level, blur: account.blurNsfw)
+                        .id(identity)
+                        .id(account.blurNsfw != nil)
+                } else {
+                    SettingsControlCard {
+                        HStack(spacing: FloatingPageChrome.spacing) {
+                            Text("暂未取得账号浏览偏好。").foregroundStyle(.secondary)
+                            Spacer(minLength: 0)
+                            if refreshing {
+                                ProgressView().controlSize(.small).accessibilityLabel("正在读取账号偏好")
+                            } else {
+                                StatusReloadButton(title: "重新读取账号偏好") {
+                                    refreshing = true
+                                    Task { await session.refreshAccount(); refreshing = false }
+                                }
+                            }
+                        }
+                        .frame(minHeight: FloatingPageChrome.controlHeight)
                     }
                 }
-                if session.account?.blurNsfw != nil { Section { Toggle("模糊成熟内容", isOn: $blur) } }
-                Section {
-                    Button(saving ? "正在保存并核对…" : "保存到 Civitai") {
-                        saving = true
-                        Task { _ = await session.saveBrowsingPreferences(level: level, blur: session.account?.blurNsfw == nil ? nil : blur); saving = false }
-                    }.disabled(saving || level == 0)
-                    Text("使用站点分级；最终可见范围以 Civitai 对当前账号的规则为准。保存后会重新读取服务器值。").font(.caption).foregroundStyle(.secondary)
-                }
-            } else {
-                Text("站点暂未返回账号浏览偏好，请先刷新账号状态。")
-                Button("刷新账号") { Task { await session.refreshAccount() } }
             }
-        }.navigationTitle("账号内容偏好").ordinaryAppearance().appNavigationBack().environment(\.defaultMinListRowHeight, 52).onAppear {
-            level = session.account?.browsingLevel ?? 1; blur = session.account?.blurNsfw ?? true
+            .pageScrollContentInsets()
+        }
+        .floatingTitleBar("账号内容偏好")
+        .ordinaryAppearance()
+    }
+}
+
+private struct AccountPreferencesForm: View {
+    let identity: SiteSession.AccountSessionID
+    @EnvironmentObject private var session: SiteSession
+    @State private var level: Int
+    @State private var blur: Bool
+    @State private var saving = false
+    private let levels: [(Int, String)] = [(1, "PG"), (2, "PG-13"), (4, "R"), (8, "X"), (16, "XXX")]
+
+    init(identity: SiteSession.AccountSessionID, level: Int, blur: Bool?) {
+        self.identity = identity
+        _level = State(initialValue: level)
+        _blur = State(initialValue: blur ?? true)
+    }
+
+    var body: some View {
+        SettingsControlCard("账号浏览范围") {
+            ForEach(levels, id: \.0) { bit, title in
+                if bit != levels.first?.0 { Divider() }
+                Toggle(title, isOn: Binding(get: { level & bit != 0 }, set: { enabled in
+                    if enabled { level |= bit } else { level &= ~bit }
+                }))
+                .disabled(saving)
+            }
+        }
+        if session.account?.blurNsfw != nil {
+            SettingsControlCard {
+                Toggle("模糊成熟内容", isOn: $blur).disabled(saving)
+            }
+        }
+        SettingsControlCard {
+            Button(saving ? "正在保存并核对…" : "保存到 Civitai") {
+                let submittedLevel = level
+                let submittedBlur = session.account?.blurNsfw == nil ? nil : blur
+                saving = true
+                Task {
+                    defer { saving = false }
+                    await session.saveBrowsingPreferences(level: submittedLevel, blur: submittedBlur, for: identity)
+                    guard identity == session.accountSessionID, let account = session.account else { return }
+                    level = account.browsingLevel ?? level
+                    self.blur = account.blurNsfw ?? self.blur
+                }
+            }
+            .frame(minHeight: FloatingPageChrome.controlHeight)
+            .disabled(saving || level == 0)
         }
     }
 }

@@ -7,6 +7,7 @@ enum FeedSource: Hashable {
     case following
     case creator(Creator)
     case collection(Int)
+    case collections(Set<Int>)
     case search(MediaSearchTarget)
 }
 

@@ -21,24 +21,26 @@ private enum OfflineSort: String, CaseIterable, Identifiable {
 
 struct OfflineStorageView: View {
     @EnvironmentObject private var session: SiteSession
-    @Environment(\.ordinaryColorScheme) private var ordinaryScheme
     @ObservedObject private var library = OfflineLibrary.shared
     @ObservedObject private var blocklist = TagBlocklist.shared
     @ObservedObject private var authorBlocklist = AuthorBlocklist.shared
+    @ObservedObject private var chrome = ViewingChromeController.shared
     @State private var editMode: EditMode = .inactive
-    @State private var kind: MediaKind = .all
+    @State private var kind: MediaKind = .image
     @State private var filter: OfflineFilter = .all
     @State private var sort: OfflineSort = .newest
     @State private var selected = Set<Int>()
     @State private var confirmDelete = false
     @State private var confirmClean = false
     @State private var confirmAll = false
+    @State private var confirmationBinding: UUID?
     @State private var viewerItem: MediaItem?
     @State private var viewerItems: [MediaItem] = []
+    @State private var viewerBinding: UUID?
     @State private var focused: Int?
     @State private var creator: CreatorRoute?
     private var visible: [OfflineRecord] {
-        library.records.filter { filter.includes($0) && (kind == .all || (kind == .video ? $0.video : !$0.video)) && TagPolicy.verdict(names: $0.tagNames, blocked: blocklist.names) == .allowed && !authorIsBlocked($0) }.sorted {
+        library.records.filter { filter.includes($0) && (kind == .video ? $0.video : !$0.video) && TagPolicy.verdict(names: $0.tagNames, blocked: blocklist.names) == .allowed && !authorIsBlocked($0) }.sorted {
             switch sort {
             case .largest: $0.bytes == $1.bytes ? $0.id > $1.id : $0.bytes > $1.bytes
             case .oldest: ($0.savedAt ?? .distantPast) < ($1.savedAt ?? .distantPast)
@@ -49,9 +51,8 @@ struct OfflineStorageView: View {
     }
     private var playable: [MediaItem] {
         guard let directory = library.directory else { return [] }
-        return visible.filter { $0.fileState == .ready }.map { $0.media(in: directory) }
+        return visible.filter { $0.fileState == .ready }.map { $0.media(in: directory, hasPoster: library.posterIDs.contains($0.id)) }
     }
-    private var visibleViewerItems: [MediaItem] { viewerItems.filter { !authorBlocklist.blocks($0) } }
     private func authorIsBlocked(_ record: OfflineRecord) -> Bool {
         AuthorHandlePolicy.blocks(creatorID: record.creatorID, username: record.username,
                                   blockedIDs: authorBlocklist.blockedIDs, blockedHandles: authorBlocklist.blockedHandles)
@@ -66,8 +67,8 @@ struct OfflineStorageView: View {
                 Text("\(library.readyCount) / \(library.records.count) 项已下载").font(.caption).foregroundStyle(.secondary)
             }
             HStack(alignment: .firstTextBaseline, spacing: 7) {
-                Text(library.diskUsageKnown ? size(library.diskBytes) : "暂时无法统计").font(.system(size: 29, weight: .semibold, design: .rounded)).contentTransition(.numericText())
-                Text("/ " + size(library.capacity)).font(.subheadline).foregroundStyle(.secondary)
+                Text(library.diskUsageKnown ? AppTheme.storageSize(library.diskBytes) : "暂时无法统计").font(.system(size: 29, weight: .semibold, design: .rounded)).contentTransition(.numericText())
+                Text("/ " + AppTheme.storageSize(library.capacity)).font(.subheadline).foregroundStyle(.secondary)
             }
             if library.diskUsageKnown { ProgressView(value: storageFraction).tint(.blue).accessibilityLabel("离线空间占用") }
             VStack(alignment: .leading, spacing: 6) {
@@ -84,17 +85,11 @@ struct OfflineStorageView: View {
     }
     private var browseControls: some View {
         Section("浏览本地作品") {
-            Picker("媒体", selection: $kind) { ForEach(MediaKind.allCases) { Text($0.chineseTitle).tag($0) } }.pickerStyle(.segmented).padding(.vertical, 3)
-            LabeledContent {
-                Menu { Picker("作品状态", selection: $filter) { ForEach(OfflineFilter.allCases) { Text($0.rawValue).tag($0) } } } label: {
-                    HStack(spacing: 5) { Text(filter.rawValue); Image(systemName: "chevron.down").font(.caption2) }
-                }
-            } label: { SettingsRowLabel("作品状态", "line.3.horizontal.decrease.circle") }
-            LabeledContent {
-                Menu { Picker("排列顺序", selection: $sort) { ForEach(OfflineSort.allCases) { Text($0.rawValue).tag($0) } } } label: {
-                    HStack(spacing: 5) { Text(sort.rawValue); Image(systemName: "chevron.down").font(.caption2) }
-                }
-            } label: { SettingsRowLabel("排列顺序", "arrow.up.arrow.down") }
+            FloatingMediaPicker(title: "媒体", selection: $kind, identifier: "offline.media-kind")
+            SettingsChoice(title: "作品状态", symbol: "line.3.horizontal.decrease.circle",
+                           selection: $filter, options: OfflineFilter.allCases, name: { $0.rawValue })
+            SettingsChoice(title: "排列顺序", symbol: "arrow.up.arrow.down",
+                           selection: $sort, options: OfflineSort.allCases, name: { $0.rawValue })
             if !blocklist.names.isEmpty {
                 Text("屏蔽标签已启用；\(unknownTagCount) 项标签待核实，暂不展示。文件保留。").font(.caption).foregroundStyle(.secondary)
                 if unknownTagCount > 0 { Button("联网更新收藏标签") { Task { await library.refreshTags(session: session) } }.disabled(library.busy || session.account == nil) }
@@ -106,11 +101,13 @@ struct OfflineStorageView: View {
             if library.busy {
                 if let value = library.progress { ProgressView(value: value) }
                 else { ProgressView() }
-                Button { library.pause() } label: { SettingsRowLabel("暂停同步", "pause.circle") }
+                if library.canPauseWork {
+                    Button { library.pauseDownloads() } label: { SettingsRowLabel("暂停同步", "pause.circle") }
+                }
             } else {
                 Button { library.resumeAll(session: session) } label: { SettingsRowLabel("同步并下载收藏", "arrow.down.circle") }.disabled(!session.hasCollectionAccess)
             }
-        } header: { Text("下载任务") } footer: { Text("同步在 App 前台进行，下载网络遵循设置。") }
+        } header: { Text("下载任务") } footer: { FloatingCardListNote("同步在 App 前台进行，下载网络遵循设置。") }
     }
     private var recordsSection: some View {
         Section("本地作品 · \(visible.count)") {
@@ -120,27 +117,52 @@ struct OfflineStorageView: View {
     }
     private var managementSection: some View {
         Section {
-            Button("删除所选本地副本（\(selected.count)）", role: .destructive) { confirmDelete = true }.disabled(selected.isEmpty)
-            Button(selected.isEmpty ? "核对并清理已取消收藏" : "核对并清理所选项") { confirmClean = true }.disabled(library.busy || !session.hasCollectionAccess)
+            Button("删除所选本地副本（\(selected.count)）", role: .destructive) {
+                confirmationBinding = library.bindingID
+                confirmDelete = true
+            }.disabled(selected.isEmpty)
+            Button(selected.isEmpty ? "核对并清理已取消收藏" : "核对并清理所选项") {
+                confirmationBinding = library.bindingID
+                confirmClean = true
+            }.disabled(library.busy || !session.hasCollectionAccess)
             Menu {
-                Button("清理浏览缓存（保留离线文件）") { MediaCache.shared.clear() }
+                Button("清理浏览缓存（保留离线文件）") {
+                    MediaCache.shared.clear()
+                    Task { await CollectionListCache.shared.clear() }
+                }
+                .accessibilityIdentifier("offline.storage.clear-browser-cache")
                 Button("重新下载全部（含手动移除的副本）") { library.resumeAll(session: session, includeRemovedCopies: true) }.disabled(library.busy || !session.hasCollectionAccess)
-                Button("清理全部离线收藏并关闭自动保存", role: .destructive) { confirmAll = true }
-            } label: { SettingsRowLabel("更多空间操作", "ellipsis.circle") }
-        } header: { Text("空间管理") } footer: { Text("删除本地副本不会修改 Civitai 收藏。手动移除后不会自动重新下载；可用“重新下载全部”恢复。空间满时暂停下载，不自动逐出已保存作品。") }
+                Button("清理全部离线收藏并关闭自动保存", role: .destructive) {
+                    confirmationBinding = library.bindingID
+                    confirmAll = true
+                }
+            } label: {
+                SettingsRowLabel("更多空间操作", "ellipsis.circle")
+                    .frame(maxWidth: .infinity, minHeight: FloatingPageChrome.controlHeight, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        } header: { Text("空间管理") } footer: { FloatingCardListNote("删除本地副本不会修改 Civitai 收藏。手动移除后不会自动重新下载；可用“重新下载全部”恢复。空间满时暂停下载，不自动逐出已保存作品。") }
     }
     var body: some View {
         List(selection: $selected) {
-            Section { storageOverview } footer: { Text("独立于浏览缓存保存；取消云端收藏会保留手机副本。") }
-            downloadSection
-            browseControls
-            recordsSection
-            managementSection
+            Group {
+                Section { storageOverview } footer: { FloatingCardListNote("独立于浏览缓存保存；取消云端收藏会保留手机副本。") }
+                downloadSection
+                browseControls
+                recordsSection
+                managementSection
+            }
+            .floatingCardListRows()
         }
-        .navigationTitle("离线收藏与空间").navigationBarTitleDisplayMode(.inline).listStyle(.insetGrouped)
+        .accessibilityIdentifier("offline.storage-list")
+        .listStyle(.plain)
+        .listRowSpacing(FloatingPageChrome.groupInset)
+        .avoidOverlaidTabBar(constrainViewport: true)
+        .ordinaryAppearance()
         .environment(\.editMode, $editMode)
-        .environment(\.defaultMinListRowHeight, 52)
-        .toolbar { Button(editMode.isEditing ? "完成" : "选择") {
+        .environment(\.defaultMinListRowHeight, FloatingPageChrome.controlHeight)
+        .floatingTitleBar("离线收藏与空间") { Button(editMode.isEditing ? "完成" : "选择") {
             withAnimation {
                 if editMode.isEditing { editMode = .inactive; selected = [] }
                 else { editMode = .active }
@@ -150,69 +172,85 @@ struct OfflineStorageView: View {
         .onChange(of: kind) { _, _ in selected = [] }
         .onChange(of: filter) { _, _ in selected = [] }
         .onChange(of: visible.map(\.id)) { _, ids in selected.formIntersection(ids) }
-        .onChange(of: authorBlocklist.entries) { _, _ in
-            guard let focused, let current = viewerItems.first(where: { $0.id == focused }), authorBlocklist.blocks(current) else { return }
-            if let next = visibleViewerItems.first { self.focused = next.id }
-            else { viewerItem = nil; self.focused = nil }
+        .onChange(of: library.bindingID) { _, _ in
+            viewerItem = nil
+            selected = []
+            confirmDelete = false
+            confirmClean = false
+            confirmAll = false
+            confirmationBinding = nil
         }
         .confirmationDialog("删除所选手机副本？云端收藏保留。", isPresented: $confirmDelete, titleVisibility: .visible) {
-            Button("删除 \(selected.count) 项本地副本", role: .destructive) { library.removeLocal(selected); selected = [] }
+            Button("删除 \(selected.count) 项本地副本", role: .destructive) {
+                guard confirmationBinding == library.bindingID else { return }
+                library.removeLocal(selected)
+                selected = []
+            }
         }
         .confirmationDialog("联网核对，只清理已确认不在收藏夹的本地文件。", isPresented: $confirmClean, titleVisibility: .visible) {
-            Button("核对并清理", role: .destructive) { library.cleanUnfavorited(session: session, ids: selected.isEmpty ? nil : selected); selected = [] }
+            Button("核对并清理", role: .destructive) {
+                guard confirmationBinding == library.bindingID else { return }
+                library.cleanUnfavorited(session: session, ids: selected.isEmpty ? nil : selected)
+                selected = []
+            }
         }
         .confirmationDialog("清理全部离线文件，同时关闭自动保存；浏览缓存和云端收藏保留。", isPresented: $confirmAll, titleVisibility: .visible) {
-            Button("清理全部离线收藏", role: .destructive) { library.clearAll(); selected = [] }
+            Button("清理全部离线收藏", role: .destructive) {
+                guard confirmationBinding == library.bindingID else { return }
+                library.clearAll()
+                selected = []
+            }
         }
-        .fullScreenCover(item: $viewerItem, onDismiss: { creator = nil; viewerItems = [] }) { opening in
+        .mediaCover(item: $viewerItem, onDismiss: { creator = nil; viewerItems = []; viewerBinding = nil; focused = nil }) { opening in
             offlineViewer(opening)
         }
     }
     private func offlineViewer(_ opening: MediaItem) -> some View {
-        NavigationStack {
-            ZStack(alignment: .topLeading) {
-                Color.black.ignoresSafeArea()
-                if !visibleViewerItems.isEmpty {
-                    MediaDeck(items: visibleViewerItems, focused: $focused, initialID: opening.id, showsLoadMore: false, onAuthor: { creator = $0 }) {}
-                } else {
-                    ContentUnavailableView("作品被本机作者屏蔽", systemImage: "person.crop.circle.badge.xmark",
-                                           description: Text("离线文件仍保留；取消作者屏蔽后可重新打开。"))
-                        .foregroundStyle(.white)
+        PlaybackNavigation(creator: $creator) { openAuthor in
+            MediaDeck(items: viewerItems, focused: $focused, initialID: opening.id, showsLoadMore: false,
+                      onAuthor: openAuthor) {}
+                .tint(.white)
+                .playbackTitleBar("离线播放", workID: focused, hidden: chrome.hidden && focused != nil,
+                                  closeIdentifier: "offline.playback.close", onClose: { viewerItem = nil })
+                .onChange(of: focused) { _, id in
+                    if let id, let viewerBinding { library.opened(id, binding: viewerBinding) }
                 }
-                Button { viewerItem = nil } label: { Image(systemName: "xmark").padding(15).background(.black.opacity(0.4), in: Circle()) }.padding(15).accessibilityLabel("关闭作品")
-            }.tint(.white).toolbar(.hidden, for: .navigationBar)
-                .onChange(of: focused) { _, id in if let id { library.opened(id) } }
-                .navigationDestination(item: $creator) { CreatorView(creator: $0.creator, initialKind: $0.kind) }
-        }.preferredColorScheme(creator == nil ? .dark : ordinaryScheme)
+        }
     }
     @ViewBuilder private func recordRow(_ record: OfflineRecord) -> some View {
         if editMode.isEditing {
-            OfflineRecordRow(record: record, directory: library.directory, blurMature: session.account?.blurNsfw ?? true).tag(record.id)
+            rowContent(record).tag(record.id)
         } else {
             Button(action: { openRecord(record) }) {
-                OfflineRecordRow(record: record, directory: library.directory, blurMature: session.account?.blurNsfw ?? true)
+                rowContent(record)
             }.tag(record.id).accessibilityIdentifier("offline.item.\(record.id)")
             .contextMenu {
-                Button("删除此本地副本", role: .destructive) { selected = Set([record.id]); confirmDelete = true }
+                Button("删除此本地副本", role: .destructive) {
+                    confirmationBinding = library.bindingID
+                    selected = Set([record.id])
+                    confirmDelete = true
+                }
             }
         }
     }
+    private func rowContent(_ record: OfflineRecord) -> some View {
+        OfflineRecordRow(record: record, directory: library.directory, hasPoster: library.posterIDs.contains(record.id),
+                         blurMature: session.account?.blurNsfw ?? true)
+    }
     private func openRecord(_ record: OfflineRecord) {
         guard record.fileState == .ready, !authorIsBlocked(record), let directory = library.directory else { return }
-        let item = record.media(in: directory)
-        viewerItems = playable; focused = item.id; library.opened(item.id); viewerItem = item
+        let item = record.media(in: directory, hasPoster: library.posterIDs.contains(record.id))
+        let binding = library.bindingID
+        viewerBinding = binding
+        viewerItems = playable; focused = item.id; library.opened(item.id, binding: binding); viewerItem = item
     }
-    private func size(_ value: Int64) -> String {
-        let formatter = ByteCountFormatter()
-        formatter.countStyle = .file
-        formatter.allowsNonnumericFormatting = false
-        return formatter.string(fromByteCount: value)
-    }
+
 }
 
 private struct OfflineRecordRow: View {
     let record: OfflineRecord
     let directory: URL?
+    let hasPoster: Bool
     let blurMature: Bool
     private var title: String { (record.video ? "视频" : "图片") + " #" + String(record.id) }
     private var details: String { fileTitle + " · " + cloudTitle }
@@ -224,7 +262,7 @@ private struct OfflineRecordRow: View {
                 Text("@" + (record.username ?? "作者")).font(.subheadline).lineLimit(1).foregroundStyle(.primary)
                 Text(details).font(.caption).foregroundStyle(.secondary)
                 HStack(spacing: 8) {
-                    Text(ByteCountFormatter.string(fromByteCount: record.bytes, countStyle: .file))
+                    Text(AppTheme.storageSize(record.bytes))
                     if let date = record.savedAt { Text(date.formatted(.dateTime.locale(Locale(identifier: "zh_Hans_CN")).year().month().day())) }
                 }.font(.caption2).foregroundStyle(.secondary)
                 if let date = record.lastOpenedAt { Text("最近打开 " + date.formatted(.dateTime.locale(Locale(identifier: "zh_Hans_CN")).month().day().hour().minute())).font(.caption2).foregroundStyle(.secondary) }
@@ -232,10 +270,9 @@ private struct OfflineRecordRow: View {
         }.padding(.vertical, 4)
     }
     @ViewBuilder private var thumbnail: some View {
-        if let directory, record.fileState == .ready {
+        if let directory, record.fileState == .ready, !record.video || hasPoster {
             let url = directory.appendingPathComponent(record.video ? record.posterName : record.fileName)
-            if FileManager.default.fileExists(atPath: url.path) { CachedImage(url: url) }
-            else { placeholder }
+            CachedImage(url: url)
         } else { placeholder }
     }
     private var placeholder: some View {

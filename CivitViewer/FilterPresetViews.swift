@@ -1,19 +1,22 @@
 import SwiftUI
 
-@MainActor struct FilterPresetRequest: Identifiable {
+struct FilterPresetRequest: Identifiable, Hashable {
     let id = UUID()
     let ownerID: Int?
     let identity: String
     let scope: FilterPresetScope
     let snapshot: FilterPresetSnapshot
-    init(session: SiteSession, scope: FilterPresetScope, filter: FeedFilter, criteria: MediaSearchCriteria? = nil) {
+    @MainActor init(session: SiteSession, scope: FilterPresetScope, filter: FeedFilter, criteria: MediaSearchCriteria? = nil) {
         ownerID = session.tagLibraryOwnerID; identity = session.feedIdentity
         self.scope = scope; snapshot = .init(filter: filter, criteria: criteria)
     }
+
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
 }
 
 /// Every entry shares the same account/session guard, storage and presentation.
-struct FilterPresetSheet: View {
+struct FilterPresetPage: View {
     let request: FilterPresetRequest
     let onApply: (FilterPresetSnapshot) -> Void
     @EnvironmentObject private var session: SiteSession
@@ -47,13 +50,11 @@ struct FilterPresetLibraryView: View {
     @State private var editorName = ""
     @State private var deleteTarget: FilterPreset?
     @State private var operationError: String?
-    @State private var sheetDetent: PresentationDetent = .height(360)
-    @State private var libraryDetent: PresentationDetent = .height(360)
     private var canSave: Bool { (try? current.validated(for: scope)) != nil }
 
     var body: some View {
-        NavigationStack {
-            List {
+        List {
+            Group {
                 VStack(alignment: .leading, spacing: 5) {
                     Text("当前条件").font(.caption).foregroundStyle(.secondary)
                     Text(current.filter.summary).font(.subheadline.weight(.medium))
@@ -61,18 +62,18 @@ struct FilterPresetLibraryView: View {
                         Text(criteria.summary).font(.caption).foregroundStyle(.secondary).lineLimit(2)
                     }
                 }
-                .padding(.vertical, 6).listRowSeparator(.hidden)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 if let loadError {
                     Text(loadError).foregroundStyle(.red).accessibilityIdentifier("preset.library.error")
                 } else if presets.isEmpty {
-                    VStack(spacing: 10) {
-                        Image(systemName: "bookmark").font(.title2).foregroundStyle(.secondary)
-                        Text("还没有保存的方案").font(.headline)
-                        Text(canSave ? "点右上角 ＋ 保存当前筛选。" : "填写搜索条件后即可保存。")
-                            .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("还没有保存的条件").font(.subheadline.weight(.semibold))
+                        Text(canSave ? "用右上角的加号保存当前条件。" : "填写搜索条件后即可保存。")
+                            .font(.footnote).foregroundStyle(.secondary)
                     }
-                    .frame(maxWidth: .infinity).padding(.vertical, 20)
-                    .listRowSeparator(.hidden).accessibilityIdentifier("preset.library.empty")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityElement(children: .contain)
+                    .accessibilityIdentifier("preset.library.empty")
                 } else {
                     ForEach(presets) { preset in
                         Button {
@@ -103,51 +104,55 @@ struct FilterPresetLibraryView: View {
                 }
                 if let operationError { Text(operationError).font(.footnote).foregroundStyle(.red) }
             }
-            .listStyle(.plain)
-            .navigationTitle("筛选方案 · \(scope.title)").navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                AppToolbarItem(placement: .topBarLeading) {
-                    Button { dismiss() } label: { Image(systemName: "xmark") }
-                        .accessibilityLabel("关闭筛选方案").accessibilityIdentifier("preset.library.done")
-                }
-                AppToolbarItem(placement: .topBarTrailing) {
-                    Button { beginSave() } label: { Image(systemName: "plus") }
-                        .disabled(!canSave || !isCurrent())
-                        .accessibilityLabel("保存为方案").accessibilityIdentifier("preset.library.save")
-                }
-            }
-            .navigationDestination(isPresented: $showNameEditor) {
-                FilterPresetNameView(ownerID: ownerID, scope: scope,
-                    snapshot: editorPreset?.snapshot ?? current,
-                    mode: editorPreset.map { .rename($0.id) } ?? .save,
-                    initialName: editorName, isCurrent: isCurrent) { refresh() }
-            }
-            .task { refresh() }
-            .onChange(of: store.revision) { _, _ in refresh() }
-            .onChange(of: showNameEditor) { _, editing in
-                if editing { libraryDetent = sheetDetent; sheetDetent = .large }
-                else { sheetDetent = libraryDetent }
-            }
-            .confirmationDialog("删除“\(deleteTarget?.name ?? "")”？", isPresented: Binding(get: { deleteTarget != nil }, set: { if !$0 { deleteTarget = nil } }), titleVisibility: .visible) {
-                Button("删除方案", role: .destructive) { guard isCurrent() else { deleteTarget = nil; return }; if let target = deleteTarget { remove(target) }; deleteTarget = nil }
-                Button("取消", role: .cancel) { deleteTarget = nil }
-            } message: { Text("只删除这个筛选方案。") }
+            .listRowInsets(EdgeInsets(top: 10, leading: FloatingPageChrome.pageInset + 12,
+                                     bottom: 10, trailing: FloatingPageChrome.pageInset + 12))
+            .listRowBackground(
+                FloatingPageChrome.controlShape.fill(AppTheme.secondarySurface)
+                    .padding(.horizontal, FloatingPageChrome.pageInset)
+            )
+            .listRowSeparator(.hidden)
         }
-        .ordinaryAppearance()
-        .presentationDetents([.height(360), .large], selection: $sheetDetent)
-        .presentationDragIndicator(.visible)
+        .listStyle(.plain)
         .accessibilityIdentifier("preset.library")
+        .listRowSpacing(FloatingPageChrome.groupInset)
+        .avoidOverlaidTabBar()
+        .floatingTitleBar("已存条件 · \(scope.title)", leading: {
+            FloatingPageBackButton(identifier: "preset.library.done")
+        }) {
+            Button { beginSave() } label: { FloatingPageIcon(symbol: "plus") }
+                .buttonStyle(FloatingPageButtonStyle(iconOnly: true))
+                .disabled(!canSave || !isCurrent())
+                .accessibilityLabel("保存当前条件").accessibilityIdentifier("preset.library.save")
+        }
+        .navigationDestination(isPresented: $showNameEditor) {
+            FilterPresetNameView(ownerID: ownerID, scope: scope,
+                snapshot: editorPreset?.snapshot ?? current,
+                mode: editorPreset.map { .rename($0.id) } ?? .save,
+                initialName: editorName, isCurrent: isCurrent) { refresh() }
+        }
+        .task { refresh() }
+        .onChange(of: store.revision) { _, _ in refresh() }
+        .alert("删除“\(deleteTarget?.name ?? "")”？", isPresented: Binding(get: { deleteTarget != nil }, set: { if !$0 { deleteTarget = nil } })) {
+            Button("删除方案", role: .destructive) { guard isCurrent() else { deleteTarget = nil; return }; if let target = deleteTarget { remove(target) }; deleteTarget = nil }
+            Button("取消", role: .cancel) { deleteTarget = nil }
+        } message: { Text("只删除这组已存条件。") }
+        .ordinaryAppearance()
     }
 
     private func refresh() {
         do { presets = try store.list(ownerID: ownerID, scope: scope).sorted { $0.updatedAt > $1.updatedAt }; loadError = nil }
-        catch { loadError = (error as? LocalizedError)?.errorDescription ?? "无法读取筛选方案。" }
+        catch { loadError = (error as? LocalizedError)?.errorDescription ?? "无法读取已存条件。" }
     }
     private func beginSave() {
         guard isCurrent() else { return }
         editorPreset = nil
-        let summary = ([current.filter.summary] + (current.criteria.map { [$0.summary] } ?? [])).joined(separator: " · ")
-        let base = String(summary.prefix(40))
+        let criteria = current.criteria
+        let titlePrefix = criteria?.normalizedText ?? ""
+        let subject = titlePrefix.isEmpty
+            ? (criteria?.author.map { "@" + $0.username } ?? criteria?.tags.first?.name)
+            : titlePrefix
+        let fallback = "\(scope.title) · \(current.filter.effectiveKind.title)"
+        let base = String((subject ?? fallback).prefix(40)).trimmingCharacters(in: .whitespacesAndNewlines)
         let used = Set(presets.map { $0.name.lowercased() })
         var proposed = base
         for suffix in 2...51 where used.contains(proposed.lowercased()) {
@@ -190,70 +195,73 @@ private struct FilterPresetNameView: View {
     }
 
     private var isRename: Bool { if case .rename = mode { true } else { false } }
+
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 22) {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("方案名称").font(.subheadline.weight(.semibold))
-                    TextField("输入名称", text: $name)
+            VStack(alignment: .leading, spacing: FloatingPageChrome.spacing) {
+                VStack(alignment: .leading, spacing: FloatingPageChrome.groupInset) {
+                    HStack {
+                        Text("名称").font(.subheadline.weight(.semibold))
+                        Spacer()
+                        Text("\(name.trimmingCharacters(in: .whitespacesAndNewlines).count) / 40")
+                            .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    }
+                    TextField("输入名称", text: $name, prompt: FloatingPageChrome.fieldPrompt("输入名称"))
                         .textInputAutocapitalization(.never).autocorrectionDisabled()
-                        .font(.body).padding(.horizontal, 12).frame(minHeight: 48)
-                        .background(AppTheme.secondarySurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                        .overlay(alignment: .bottom) { RoundedRectangle(cornerRadius: 1).fill(Color.blue.opacity(0.72)).frame(height: 1).padding(.horizontal, 12) }
+                        .font(.subheadline).padding(.horizontal, 12)
+                        .frame(minHeight: FloatingPageChrome.controlHeight)
+                        .background(AppTheme.secondarySurface, in: FloatingPageChrome.controlShape)
+                        .accessibilityLabel("名称")
                         .accessibilityIdentifier("preset.name.input")
-                    Text("\(name.trimmingCharacters(in: .whitespacesAndNewlines).count) / 40")
-                        .font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .trailing)
-                    if let error { Text(error).font(.footnote).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true).accessibilityIdentifier("preset.name.error") }
+                    if let error {
+                        Text(error).font(.footnote).foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityIdentifier("preset.name.error")
+                    }
                 }
 
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("筛选条件").font(.subheadline.weight(.semibold))
-                    conditionRow("媒体", snapshot.filter.effectiveKind.title)
-                    conditionRow("排序", FeedSort(rawValue: snapshot.filter.sort)?.title ?? snapshot.filter.sortTitle)
-                    conditionRow("时间", snapshot.filter.periodTitle)
-                    if !snapshot.filter.baseModel.isEmpty { conditionRow("模型", snapshot.filter.baseModel) }
-                    conditionRow("内容范围", snapshot.filter.onlyPG ? "仅看 PG" : "遵循账号与站点设置")
-                    if let duration = snapshot.filter.videoDurationRange { conditionRow("视频时长", duration.summary) }
-                }
-
-                if let criteria = snapshot.criteria {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text("搜索条件").font(.subheadline.weight(.semibold))
+                VStack(alignment: .leading, spacing: FloatingPageChrome.spacing) {
+                    if let criteria = snapshot.criteria {
                         if !criteria.normalizedText.isEmpty { conditionRow("标题开头", criteria.normalizedText) }
                         if let author = criteria.author { conditionRow("作者", "@\(author.username)") }
                         if !criteria.tags.isEmpty {
-                            Text("标签").font(.caption).foregroundStyle(.secondary)
-                            LazyVGrid(columns: [GridItem(.adaptive(minimum: 88), alignment: .leading)], alignment: .leading, spacing: 8) {
-                                ForEach(criteria.tags, id: \.id) { tag in
-                                    Text("#\(tag.name)").font(.caption.weight(.medium)).lineLimit(2).fixedSize(horizontal: false, vertical: true)
-                                        .padding(.horizontal, 10).padding(.vertical, 7)
-                                        .background(AppTheme.secondarySurface, in: Capsule())
+                            TagPillLayout(spacing: FloatingPageChrome.groupInset, rowSpacing: 2) {
+                                ForEach(criteria.tags) { tag in
+                                    WorkTagLabel(title: tag.name, selected: false, compact: true)
                                 }
                             }
+                            .accessibilityLabel("标签")
                         }
+                        Divider()
                     }
+                    Text([snapshot.filter.effectiveKind.title, snapshot.filter.sortTitle, snapshot.filter.periodTitle].joined(separator: " · "))
+                        .font(.footnote).foregroundStyle(.secondary)
+                        .accessibilityIdentifier("preset.name.range")
+                    if !snapshot.filter.baseModel.isEmpty { conditionRow("模型", snapshot.filter.baseModel) }
+                    if snapshot.filter.onlyPG { conditionRow("内容范围", "仅看 PG") }
+                    if let duration = snapshot.filter.videoDurationRange { conditionRow("视频时长", duration.summary) }
                 }
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(AppTheme.secondarySurface, in: FloatingPageChrome.controlShape)
             }
-            .padding(.horizontal, AppTheme.spacing).padding(.top, 20).padding(.bottom, 18)
-            .frame(maxWidth: 600, alignment: .leading).frame(maxWidth: .infinity, alignment: .top)
+            .pageScrollContentInsets()
+            .frame(maxWidth: .infinity, alignment: .topLeading)
         }
-        .navigationTitle(isRename ? "重命名方案" : "保存方案").navigationBarTitleDisplayMode(.inline)
-        .appNavigationBack()
-        .toolbar {
-            AppToolbarItem(placement: .confirmationAction) {
-                Button("保存") { save() }
-                    .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !isCurrent())
-                    .accessibilityIdentifier("preset.name.save")
-            }
+        .accessibilityIdentifier("preset.name")
+        .floatingTitleBar(isRename ? "重命名" : "保存条件") {
+            Button("保存") { save() }
+                .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !isCurrent())
+                .accessibilityIdentifier("preset.name.save")
         }
-        .ordinaryAppearance().accessibilityIdentifier("preset.name")
+        .ordinaryAppearance()
     }
 
     private func conditionRow(_ title: String, _ value: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 12) {
             Text(title).font(.caption).foregroundStyle(.secondary).frame(width: 64, alignment: .leading)
             Text(value).font(.subheadline).fixedSize(horizontal: false, vertical: true).frame(maxWidth: .infinity, alignment: .leading)
-        }.frame(minHeight: 32, alignment: .leading)
+        }
     }
 
     private func save() {
@@ -264,6 +272,6 @@ private struct FilterPresetNameView: View {
             case .rename(let id): _ = try FilterPresetStore.shared.updateName(ownerID: ownerID, scope: scope, id: id, name: name)
             }
             error = nil; onSaved(); dismiss()
-        } catch { self.error = (error as? LocalizedError)?.errorDescription ?? "无法保存筛选方案。" }
+        } catch { self.error = (error as? LocalizedError)?.errorDescription ?? "无法保存条件。" }
     }
 }

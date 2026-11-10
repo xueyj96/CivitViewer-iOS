@@ -94,8 +94,7 @@ struct VideoProgressChrome: View {
     let duration: Double
     let bufferedRanges: [SeekTimeRange]
     let enabled: Bool
-    let emphasized: Bool
-    let showTimes: Bool
+    let showTime: Bool
     let onSeek: (Double, MediaPanPhase) -> Void
     let onInteractionChange: (Bool) -> Void
     var preparationVisible = false
@@ -105,16 +104,9 @@ struct VideoProgressChrome: View {
     var body: some View {
         ZStack(alignment: .topLeading) {
             VideoSeekControl(position: position, duration: duration, bufferedRanges: bufferedRanges, enabled: enabled && !preparationCanCancel,
-                             interactionActive: emphasized, onSeek: onSeek, onInteractionChange: onInteractionChange)
+                             onSeek: onSeek, onInteractionChange: onInteractionChange)
                 .frame(height: 44)
                 .allowsHitTesting(!preparationCanCancel).zIndex(0)
-            HStack {
-                Text(clock(position)); Spacer(); Text(duration > 0 ? clock(duration) : "--:--")
-            }.font(.system(size: 11, weight: .medium, design: .monospaced)).foregroundStyle(.white)
-                .shadow(color: .black.opacity(0.6), radius: 2, y: 1)
-                .frame(height: 14).padding(.top, 20)
-                .opacity(showTimes && !preparationVisible ? 1 : 0)
-                .allowsHitTesting(false).accessibilityHidden(!showTimes || preparationVisible)
             if preparationVisible {
                 VideoPreparationOverlay(visible: true,
                     progress: preparationProgress, canCancel: preparationCanCancel,
@@ -123,20 +115,58 @@ struct VideoProgressChrome: View {
             }
         }
         .frame(height: 44)
+        .overlay(alignment: .top) {
+            if showTime && !preparationVisible {
+                Text(Self.clock(position))
+                    .font(.system(size: 12, weight: .semibold).monospacedDigit())
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 9).padding(.vertical, 4)
+                    .background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 6))
+                    .offset(y: -10)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
+        }
         .accessibilityElement(children: .contain).accessibilityIdentifier("media.progress-band")
-        .animation(.easeOut(duration: 0.16), value: showTimes)
         #if DEBUG && targetEnvironment(simulator)
         .playbackQAFrame("progress")
         #endif
     }
-    private func clock(_ value: Double) -> String {
+    static func clock(_ value: Double) -> String {
         guard value.isFinite, value >= 0 else { return "--:--" }
         let seconds = Int(min(value, Double(Int.max - 1)))
         return String(format: "%02d:%02d", seconds / 60, seconds % 60)
     }
 }
 
-struct VideoSurface<Footer: View>: View {
+private struct VideoSwipeSeekFeedback: View {
+    let target: Double
+    let duration: Double
+
+    var body: some View {
+        GeometryReader { geometry in
+            let width = geometry.size.width * 0.62
+            let fraction = duration > 0 ? min(1, max(0, target / duration)) : 0
+            ZStack {
+                Color.black.opacity(0.25)
+                VStack(spacing: 4) {
+                    Text(VideoProgressChrome.clock(target))
+                        .font(.system(size: 26, weight: .bold).monospacedDigit())
+                    Text("/ " + VideoProgressChrome.clock(duration))
+                        .font(.system(size: 11).monospacedDigit()).foregroundStyle(.white.opacity(0.72))
+                    Capsule().fill(.white.opacity(0.28))
+                        .overlay(alignment: .leading) {
+                            Capsule().fill(.white).frame(width: width * fraction)
+                        }
+                        .frame(width: width, height: 3).padding(.top, 10)
+                }.foregroundStyle(.white).shadow(color: .black.opacity(0.55), radius: 2, y: 1)
+            }
+        }
+        .allowsHitTesting(false).accessibilityHidden(true)
+    }
+}
+
+struct VideoSurface<Caption: View, ActionRail: View>: View {
     let url: URL
     let poster: URL?
     let active: Bool
@@ -150,8 +180,8 @@ struct VideoSurface<Footer: View>: View {
     var pausedForOverlay = false
     var retainDuringInterruption = false
     var mediaBlurred = false
-    var onKindSwipe: ((Int) -> Void)? = nil
-    var onKindDrag: ((Double, MediaPanPhase) -> Void)? = nil
+    var onEdgeSwipe: MediaEdgeSwipeAction? = nil
+    var onEdgeDrag: MediaEdgeDragAction? = nil
     var onDoubleTap: (() -> Void)? = nil
     var refreshURL: (() async throws -> URL?)? = nil
     var onConfirmedUnavailable: (() -> Void)? = nil
@@ -159,13 +189,17 @@ struct VideoSurface<Footer: View>: View {
     var onProgress: ((Double, Double, Bool) -> Void)? = nil
     var onDisplayReady: ((Bool) -> Void)? = nil
     var onImageContent: (() -> Void)? = nil
-    let footer: (Binding<Bool>) -> Footer
+    var transitionFrame: UIImage? = nil
+    var usesTransitionPreview = false
+    let caption: () -> Caption
+    let actionRail: (Binding<Bool>) -> ActionRail
     @ObservedObject private var chrome = ViewingChromeController.shared
     @AppStorage("autoplay") private var autoplay = true
     @AppStorage("muted") private var muted = true
     @AppStorage("automaticVideoRepair") private var automaticVideoRepair = true
     @Environment(\.scenePhase) private var scenePhase
-    @Environment(\.viewingBottomBarHeight) private var bottomBarHeight
+    @Environment(\.playbackControlsBottomInset) private var bottomBarHeight
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
     @State private var player: AVPlayer?
     @State private var actualSourceURL: URL?
     @State private var preloadDemandOwner = UUID()
@@ -180,6 +214,8 @@ struct VideoSurface<Footer: View>: View {
     @State private var compatibilityRequest: CompatibilityRequest?
     @State private var repairedSource: MediaRepair.Result?
     @State private var posterRetry = 0
+    @State private var availablePosterSource: URL?
+    @State private var delayedPoster: FirstFrameWait?
     @State private var posterNeedsFrame = false
     @State private var posterCaptureTried = false
     @State private var posterVideoOutput: AVPlayerItemVideoOutput?
@@ -284,15 +320,54 @@ struct VideoSurface<Footer: View>: View {
         #endif
         return bufferedRanges
     }
-    private var chromeEmphasized: Bool {
+    private var showsTrackTime: Bool {
         #if DEBUG && targetEnvironment(simulator)
-        if PlaybackLayoutQA.enabled && PlaybackLayoutQA.variant != "live" { return ["seeking", "paused"].contains(PlaybackLayoutQA.variant) }
+        if PlaybackLayoutQA.enabled && PlaybackLayoutQA.variant != "live" { return PlaybackLayoutQA.variant == "seeking" }
         #endif
-        return barInteractionActive || seekingBase != nil || resumeInFlight || (itemReady && !playing)
+        return barInteractionActive
     }
-    private var chromeShowsTimes: Bool { chromeEmphasized }
+    private var swipeSeekTarget: Double? {
+        #if DEBUG && targetEnvironment(simulator)
+        if PlaybackLayoutQA.enabled && PlaybackLayoutQA.variant == "swipe" { return chromePosition }
+        #endif
+        return barInteractionActive ? nil : seekTarget
+    }
+    private var compactHeight: Bool { verticalSizeClass == .compact }
     private var requestedResume: Double? { resumeCursor.requested(initial: resumePosition, recovery: recoveryPosition) }
     private var awaitingResume: Bool { resumeInFlight || (requestedResume != nil && !resumeApplied) }
+    private struct FirstFrameWait: Equatable {
+        let source: URL
+        let generation: Int
+    }
+    private var simulatedFirstFrameWait: Bool {
+        #if DEBUG && targetEnvironment(simulator)
+        let args = ProcessInfo.processInfo.arguments
+        return VisualControlsQA.enabled && qaBuffering &&
+            (args.contains("--qa-first-frame-poster") ||
+             (args.contains("--qa-neighbor-first-frame") && diagnosticWorkID == 28_037_104))
+        #else
+        false
+        #endif
+    }
+    private var waitingForFirstFrame: Bool { !readyForDisplay || awaitingResume || simulatedFirstFrameWait }
+    private var showsTransitionFrame: Bool { transitionFrame != nil && waitingForFirstFrame && !awaitingResume }
+    private var needsTransitionFallback: Bool {
+        usesTransitionPreview && wantsPlayback && waitingForFirstFrame && !showsTransitionFrame &&
+            (!playbackFailed || recovering || repreparePending)
+    }
+    private var wantsPlayback: Bool { userIntent.shouldPlay(autoplay: autoplay) || holdingRate }
+    private var firstFrameWait: FirstFrameWait? {
+        guard active, scenePhase == .active, !pausedForOverlay, wantsPlayback, waitingForFirstFrame,
+              !playbackFailed || recovering || repreparePending else { return nil }
+        return .init(source: url, generation: playbackGeneration)
+    }
+    private var posterPresentation: CachedPoster.Presentation {
+        guard waitingForFirstFrame, !showsTransitionFrame else { return .hidden }
+        if !wantsPlayback { return .preview }
+        if needsTransitionFallback { return .imageOnly }
+        guard let firstFrameWait, delayedPoster == firstFrameWait else { return .hidden }
+        return .imageOnly
+    }
     private var canScrub: Bool { active && itemReady && duration > 0 && !resumeInFlight && !playbackFailed && !seekRanges.isEmpty }
     private var loading: Bool {
         #if DEBUG && targetEnvironment(simulator)
@@ -343,19 +418,28 @@ struct VideoSurface<Footer: View>: View {
     var body: some View {
         ZStack {
             Group {
-                CachedPoster(source: url, declared: poster, active: active, fit: true,
+                CachedPoster(source: url, declared: poster, active: active, fit: true, presentation: posterPresentation,
                     retryToken: posterRetry, diagnosticWorkID: diagnosticWorkID,
                     onFailure: { failed in
                         if failed { posterNeedsFrame = true; installPosterOutput() }
+                    }, onImageAvailability: { available in
+                        availablePosterSource = available ? url : nil
                     })
+                if showsTransitionFrame, let transitionFrame {
+                    Image(uiImage: transitionFrame).resizable().scaledToFit()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .accessibilityHidden(true).allowsHitTesting(false)
+                }
                 if let player {
                     // A replacement player owns a new layer observation. Reusing
                     // the old representable retains its captured player identity.
                     PlayerLayerView(player: player, readyForDisplay: $readyForDisplay)
-                        .id(ObjectIdentifier(player)).opacity(awaitingResume ? 0 : 1)
+                        .id(ObjectIdentifier(player)).opacity(waitingForFirstFrame ? 0 : 1)
                 }
             }.blur(radius: mediaBlurred ? 24 : 0)
-            VideoWaitingIndicator(visible: currentVideoWaiting)
+            VideoWaitingIndicator(visible: (currentVideoWaiting || needsTransitionFallback) && !showsTransitionFrame &&
+                !(posterPresentation == .imageOnly && availablePosterSource == url), immediate: needsTransitionFallback)
+                .accessibilityHidden(!active)
             if playbackFailed && !recovering && !repreparePending {
                 VStack(spacing: 12) {
                     Text(recoveryMessage).foregroundStyle(.white)
@@ -376,30 +460,47 @@ struct VideoSurface<Footer: View>: View {
                     .frame(width: 64, height: 64).background(.black.opacity(0.35), in: Circle())
                     .allowsHitTesting(false).accessibilityHidden(true).viewingChromeHidden(chromeHidden)
             }
-            if let seekTarget {
-                Text(Self.time(seekTarget)).font(.title2.monospacedDigit().bold()).padding(18).background(.black.opacity(0.65), in: Capsule()).allowsHitTesting(false).viewingChromeHidden(chromeHidden)
-            } else if holdingRate {
+            if holdingRate && seekTarget == nil {
                 VStack { Text("2× 播放").font(.headline).padding(12).background(.black.opacity(0.65), in: Capsule()).padding(.top, 120); Spacer() }.allowsHitTesting(false).viewingChromeHidden(chromeHidden)
             }
-            VStack {
-                Spacer(minLength: 0)
-                VStack(spacing: 0) {
-                    footer($muted)
-                    Group {
+            VStack(spacing: 0) {
+                caption().padding(.leading, PlaybackChrome.horizontalInset).padding(.trailing, 72)
+                Group {
                     if active && (!playbackFailed || recovering || repreparePending) {
                         VideoProgressChrome(position: chromePosition, duration: chromeDuration, bufferedRanges: chromeBufferedRanges,
-                                            enabled: canScrub && chromeDuration > 0, emphasized: chromeEmphasized,
-                                            showTimes: chromeShowsTimes, onSeek: scrub,
+                                            enabled: canScrub && chromeDuration > 0,
+                                            showTime: showsTrackTime, onSeek: scrub,
                                             onInteractionChange: { barInteractionActive = $0 },
                                             preparationVisible: repairingVideo,
                                             preparationProgress: preparationFraction, preparationCanCancel: preparationCanCancel,
                                             onPreparationCancel: cancelRepair)
                     } else { Color.clear.frame(height: 44).accessibilityHidden(true) }
-                    }.frame(height: 44)
-                }.padding(.horizontal, 20).padding(.bottom, bottomBarHeight)
+                }
+                .padding(.leading, PlaybackChrome.horizontalInset)
+                .padding(.trailing, compactHeight ? 72 : PlaybackChrome.horizontalInset)
+            }
+            .padding(.bottom, bottomBarHeight)
+            .background(alignment: .bottom) {
+                LinearGradient(stops: [
+                    .init(color: .black.opacity(0.82), location: 0),
+                    .init(color: .black.opacity(0.42), location: 0.45),
+                    .init(color: .clear, location: 1)
+                ], startPoint: .bottom, endPoint: .top)
+                .frame(height: 190 + bottomBarHeight).allowsHitTesting(false).accessibilityHidden(true)
+            }
+            .frame(maxHeight: .infinity, alignment: .bottom)
+            .viewingChromeHidden(chromeHidden)
+        }
+        .overlay(alignment: compactHeight ? .trailing : .bottomTrailing) {
+            actionRail($muted)
+                .playbackRailInsets(bottomBarHeight: bottomBarHeight, compactHeight: compactHeight)
+                .viewingChromeHidden(chromeHidden)
+        }
+        .overlay {
+            if let target = swipeSeekTarget {
+                VideoSwipeSeekFeedback(target: target, duration: chromeDuration)
                     .viewingChromeHidden(chromeHidden)
             }
-
         }
         .overlayPreferenceValue(VideoPreparationGestureAnchorKey.self) { anchor in
             GeometryReader { proxy in
@@ -417,7 +518,7 @@ struct VideoSurface<Footer: View>: View {
             if preparationGestureFrame != next { preparationGestureFrame = next }
         }
         .background {
-            MediaGestureLayer(active: (gesturesActive ?? active) && !pausedForOverlay, isVideo: true, topExclusion: chromeHidden ? 0 : gestureTopExclusion, bottomExclusion: chromeHidden ? 0 : bottomBarHeight + 44, excludedFrames: effectiveGestureExcludedFrames, onKindSwipe: onKindSwipe, onKindDrag: onKindDrag, onSeek: seek, onRateHold: holdRate, onTap: togglePlayback, onDoubleTap: onDoubleTap, onChromeHold: onChromeHold)
+            MediaGestureLayer(active: (gesturesActive ?? active) && !pausedForOverlay, isVideo: true, topExclusion: chromeHidden ? 0 : gestureTopExclusion, bottomExclusion: chromeHidden ? 0 : bottomBarHeight + 44, excludedFrames: effectiveGestureExcludedFrames, onEdgeSwipe: onEdgeSwipe, onEdgeDrag: onEdgeDrag, onSeek: seek, onRateHold: holdRate, onTap: togglePlayback, onDoubleTap: onDoubleTap, onChromeHold: onChromeHold)
         }
         #if DEBUG && targetEnvironment(simulator)
         .overlay(alignment: .topTrailing) {
@@ -426,22 +527,36 @@ struct VideoSurface<Footer: View>: View {
                     .accessibilityIdentifier("media.qa.buffering-toggle")
                     .buttonStyle(.bordered).padding(.top, 180)
             }
+            if CollectionPagingQA.enabled, active,
+               ProcessInfo.processInfo.arguments.contains("--qa-compatibility-template") {
+                Button("打开兼容播放测试", action: presentCompatibility)
+                    .accessibilityIdentifier("media.qa.compatibility-open")
+                    .buttonStyle(.bordered)
+                    .padding(.top, 92)
+            }
             if (CollectionPagingQA.enabled || PlaybackLayoutQA.enabled) && active {
                 let state = "player=\(qaPlayerID?.uuidString ?? "none");prepare=\(qaPrepareCount);created=\(qaCreationCount);position=\(String(format: "%.3f", currentTime));muted=\(player?.isMuted ?? muted);rate=\(player?.rate ?? 0);chrome=\(chromeHidden);toggles=\(chrome.qaToggleCount);taps=\(qaTapCount);rateHolds=\(qaRateHoldCount);seekStarts=\(qaSeekStartCount)"
                 let seekState = ";intent=\(playing);inFlight=\(resumeInFlight);interactivePending=\(interactiveSeekID != nil);seekBase=\(seekingBase != nil);resumeApplied=\(resumeApplied);hasResume=\(requestedResume != nil);active=\(active);overlay=\(pausedForOverlay);ready=\(itemReady);failed=\(playbackFailed);gen=\(playbackGeneration);seekCallbacks=\(qaSeekEvents.callbacks);seekCommits=\(qaSeekEvents.commits);seekFinished=\(qaSeekEvents.lastFinished.map { String($0) } ?? "none");nativePosition=\(String(format: "%.3f", player?.currentTime().seconds ?? -1));timeStatus=\(player?.timeControlStatus.rawValue ?? -1)"
-                let nativeState = ";itemStatus=\(player?.currentItem?.status.rawValue ?? -1);itemErrorCode=\((player?.currentItem?.error as NSError?)?.code ?? 0);source=\(actualSourceKind.rawValue)"
+                let nativeState = ";itemStatus=\(player?.currentItem?.status.rawValue ?? -1);itemErrorCode=\((player?.currentItem?.error as NSError?)?.code ?? 0);source=\(actualSourceKind.rawValue);posterMode=\(posterPresentation);coverReady=\(availablePosterSource == url);transitionFrame=\(showsTransitionFrame)"
                 Text(state + seekState + nativeState).font(.system(size: 1)).frame(width: 1, height: 1).opacity(0.01).allowsHitTesting(false)
                     .accessibilityIdentifier("media.qa.player").accessibilityValue(state + seekState + nativeState)
             }
         }
         #endif
+        .task(id: firstFrameWait) {
+            delayedPoster = nil
+            guard let wait = firstFrameWait else { return }
+            do { try await Task.sleep(for: .milliseconds(400)) } catch { return }
+            guard !Task.isCancelled, firstFrameWait == wait else { return }
+            delayedPoster = wait
+        }
         .accessibilityAction(named: Text(playing ? "暂停视频" : "播放视频"), togglePlayback)
         .onAppear { if active { prepare() } }
         .onChange(of: active) { _, value in
             if value { prepare() }
             else {
                 if !retainDuringInterruption && resumePosition == nil { resumeCursor.reset(); userIntent.reset() }
-                release()
+                release(interrupted: retainDuringInterruption)
             }
         }
         .onChange(of: url) { _, _ in
@@ -498,11 +613,11 @@ struct VideoSurface<Footer: View>: View {
                 else if item.status == .readyToPlay { applyResume(item) }
             }
         }
-        .onDisappear { release() }
-        .fullScreenCover(item: $compatibilityRequest, onDismiss: {
+        .onDisappear { release(interrupted: retainDuringInterruption) }
+        .mediaCover(item: $compatibilityRequest, onDismiss: {
             onDisplayReady?(false)
         }) { request in
-            CompatibilityVideoView(url: request.sourceURL, initialPosition: request.initialPosition,
+            CompatibilityVideoView(url: request.sourceURL, workID: request.workID, initialPosition: request.initialPosition,
                 onProgress: { position, length, flush in
                     compatibilityPosition = PlaybackResumePolicy.position(position: position, duration: length)
                     onProgress?(position, length, flush)
@@ -708,7 +823,7 @@ struct VideoSurface<Footer: View>: View {
         // pending until that value is known instead of silently dropping it.
         if PlaybackResumePolicy.waitsForDuration(position: requestedResume, duration: duration) { return }
         resumeApplied = true
-        guard let target = PlaybackResumePolicy.position(position: requestedResume, duration: duration), target > 0 else {
+        guard let target = resumeCursor.target(initial: resumePosition, recovery: recoveryPosition, duration: duration), target > 0 else {
             recoveryPosition = nil; syncPlayback(); onDisplayReady?(readyForDisplay); return
         }
         resumeInFlight = true
@@ -763,20 +878,20 @@ struct VideoSurface<Footer: View>: View {
         }
         if readyForDisplay && (repairFirstPosition == nil || currentTime < (repairFirstPosition ?? 0)) { repairFirstPosition = currentTime }
     }
-    private func release() {
+    private func release(interrupted: Bool = false) {
         recoveryTask?.cancel(); recoveryTask = nil; playbackGeneration += 1
         recoveryAttempted = false; recovering = false; resolvedURL = nil
         repairStage = nil; repairProgress = nil
         repairAttempted = false
-        retirePlayer()
+        retirePlayer(interrupted: interrupted)
         recoveryPosition = nil
     }
-    private func retirePlayer() {
+    private func retirePlayer(interrupted: Bool = false) {
         MediaCache.shared.removeForegroundVideoDemand(owner: preloadDemandOwner)
         stopPosterCapture()
         interactiveSeekID = nil
         if !resumeInFlight, itemReady, duration > 0 {
-            resumeCursor.capture(position: player?.currentTime().seconds ?? currentTime, duration: duration, enabled: resumePosition != nil || retainDuringInterruption)
+            resumeCursor.capture(position: player?.currentTime().seconds ?? currentTime, duration: duration, enabled: resumePosition != nil || retainDuringInterruption, interrupted: interrupted)
         }
         captureProgress(flush: true); onDisplayReady?(false)
         statusObserver = nil; playbackObserver = nil; bufferObserver = nil; durationObserver = nil; seekableObserver = nil
@@ -934,6 +1049,10 @@ struct VideoSurface<Footer: View>: View {
     }
     private func openCompatibility() {
         guard active, playbackFailed, compatibilityAvailable else { return }
+        presentCompatibility()
+    }
+
+    private func presentCompatibility() {
         stopPosterCapture()
         recoveryTask?.cancel(); recoveryTask = nil; playbackGeneration += 1; recovering = false
         nativeRetrySuspended = true; player?.pause()
@@ -1051,5 +1170,4 @@ struct VideoSurface<Footer: View>: View {
         else { holdingRate = false; playing = wasPlayingBeforeHold }
         syncPlayback()
     }
-    private static func time(_ seconds: Double) -> String { String(format: "%02d:%02d", Int(seconds) / 60, Int(seconds) % 60) }
 }

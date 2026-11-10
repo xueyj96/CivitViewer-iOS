@@ -63,7 +63,9 @@ final class MediaPreloader: ObservableObject {
     private var networkPaused = Set<Key>()
     private var concurrencyLimit = MediaPrefetchConcurrency.defaultValue
 
-    init(cache: MediaCache = .shared, network: AnyPublisher<Bool, Never>? = nil) {
+    convenience init() { self.init(cache: .shared) }
+
+    init(cache: MediaCache, network: AnyPublisher<Bool, Never>? = nil) {
         self.cache = cache
         networkCancellable = (network ?? cache.prefetchNetwork)
             .sink { [weak self] allowed in
@@ -236,7 +238,6 @@ final class MediaPreloader: ObservableObject {
 
     private func reconcile() {
         guard !stopped, !invalidated else { return }
-        defer { publishStatus() }
         for (key, revision) in Array(spaceDeferred) where revision < completionRevision && cache.hasPrefetchSpace(video: key.video) {
             attempted.remove(key); failed.remove(key); failureCodes[key] = nil; spaceDeferred[key] = nil
         }
@@ -249,7 +250,18 @@ final class MediaPreloader: ObservableObject {
         for key in desired where key.video && wifiOnly && !networkValue && !ready.contains(key) {
             networkPaused.insert(key)
         }
-        let pausedJobs = jobs.keys.filter { ($0.video && wifiOnly && !networkValue) || playbackBlocks($0) }
+        // Keep the two nearest future videos moving during a foreground wait. A
+        // new page/rebuffer should not repeatedly discard every future file.
+        let nextVideosWhileWaiting: Set<Key> = if playbackDemand.waiting {
+            Set(desired.filter {
+                $0.video && !playbackDemand.urls.contains($0.url) && !ready.contains($0) &&
+                    !networkPaused.contains($0) && (!attempted.contains($0) || jobs[$0] != nil)
+            }.prefix(2))
+        } else { [] }
+        defer { publishStatus(nextVideosWhileWaiting: nextVideosWhileWaiting) }
+        let pausedJobs = jobs.keys.filter {
+            ($0.video && wifiOnly && !networkValue) || playbackBlocks($0, allowing: nextVideosWhileWaiting)
+        }
         for key in pausedJobs {
             cancelJob(key)
             failed.remove(key)
@@ -259,7 +271,7 @@ final class MediaPreloader: ObservableObject {
         // retained far download must yield to a newly nearest missing work.
         let ranked = desired.compactMap { candidates[$0] }
             .filter { !ready.contains($0.key) && (!attempted.contains($0.key) || jobs[$0.key] != nil) }
-            .filter { !($0.key.video && wifiOnly && !networkValue) && !playbackBlocks($0.key) }
+            .filter { !($0.key.video && wifiOnly && !networkValue) && !playbackBlocks($0.key, allowing: nextVideosWhileWaiting) }
             .sorted { $0.priority < $1.priority }
         let currentImages = Set(jobs.keys.filter { $0 == currentKey && !$0.video })
         let futureSlots = max(0, concurrencyLimit - currentImages.count)
@@ -274,7 +286,7 @@ final class MediaPreloader: ObservableObject {
             guard let candidate = desired.compactMap({ candidates[$0] })
                 .filter({ !attempted.contains($0.key) && jobs[$0.key] == nil })
                 .filter({ !($0.key.video && wifiOnly && !networkValue) })
-                .filter({ !playbackBlocks($0.key) })
+                .filter({ !playbackBlocks($0.key, allowing: nextVideosWhileWaiting) })
                 .sorted(by: { $0.priority < $1.priority }).first else { break }
             let key = candidate.key
             if key.url.isFileURL {
@@ -291,8 +303,9 @@ final class MediaPreloader: ObservableObject {
         }
     }
 
-    private func playbackBlocks(_ key: Key) -> Bool {
-        key.video && (playbackDemand.waiting || playbackDemand.urls.contains(key.url))
+    private func playbackBlocks(_ key: Key, allowing nextVideosWhileWaiting: Set<Key>) -> Bool {
+        key.video && (playbackDemand.urls.contains(key.url) ||
+                      (playbackDemand.waiting && !nextVideosWhileWaiting.contains(key)))
     }
 
     private func launch(_ key: Key) {
@@ -329,7 +342,7 @@ final class MediaPreloader: ObservableObject {
         reconcile()
     }
 
-    private func publishStatus() {
+    private func publishStatus(nextVideosWhileWaiting: Set<Key>) {
         guard context != nil, !stopped, !invalidated else { return }
         let primary = Set(candidates.values.filter { $0.priority < 100 }.map(\.key))
         let failures = primary.intersection(failed)
@@ -340,7 +353,7 @@ final class MediaPreloader: ObservableObject {
             spaceLimited: failures.filter { failureCodes[$0] == .storage }.count,
             networkFailed: failures.filter { failureCodes[$0] == .network || failureCodes[$0] == .http }.count)
         var status = value
-        status.playbackDeferred = primary.filter { !ready.contains($0) && playbackBlocks($0) }.count
+        status.playbackDeferred = primary.filter { !ready.contains($0) && playbackBlocks($0, allowing: nextVideosWhileWaiting) }.count
         cache.setPreloadStatus(status, owner: owner)
     }
 }

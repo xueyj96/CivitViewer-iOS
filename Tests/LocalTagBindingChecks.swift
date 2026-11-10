@@ -1,12 +1,6 @@
 import Foundation
 import Combine
 
-@MainActor final class OfflineLibrary {
-    static let shared = OfflineLibrary()
-    var metadataNetworkConnected: Bool { true }
-    var unmeteredMetadataNetwork: Bool { true }
-}
-
 @MainActor private final class TagSourceFake: TagLibrarySource {
     let tagLibraryOwnerID: Int?
     let tagLibraryIdentity: String
@@ -45,7 +39,11 @@ import Combine
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
-        let library = LocalTagLibrary(rootURL: root)
+        let metered = BackgroundNetworkState(connected: true, unmetered: false)
+        var network = BackgroundNetworkState.offline
+        let library = LocalTagLibrary(rootURL: root, network: { network })
+        check(!network.allowsSync(wifiOnly: true) && !network.allowsSync(wifiOnly: false), "Offline blocks both sync policies")
+        check(!metered.allowsSync(wifiOnly: true) && metered.allowsSync(wifiOnly: false), "Metered or restricted connections need opt-in")
         library.setActive(true)
         let sourceA = TagSourceFake(ownerID: 101), sourceB = TagSourceFake(ownerID: 202)
         await library.bind(ownerID: 101)
@@ -55,6 +53,11 @@ import Combine
         await library.bind(ownerID: 202)
         let localB = try await library.page(ownerID: 202, keyword: "", common: false, cursor: nil)
         check(localB.items.isEmpty && sourceB.pageCalls.isEmpty && library.stats.stored == 0, "Binding B selects its isolated empty local database")
+        library.requestSync(source: sourceB, prefix: "p", manual: true)
+        await library.waitForSync()
+        check(!library.canNetwork && sourceB.commonCalls == 0 && sourceB.pageCalls.isEmpty, "Even a manual sync waits for an available connection")
+        network = .init(connected: true, unmetered: true)
+        check(library.canNetwork, "Unmetered network becomes available to the bound tag store")
 
         try await expectContextChanged {
             _ = try await library.page(ownerID: 101, keyword: "", common: false, cursor: nil)

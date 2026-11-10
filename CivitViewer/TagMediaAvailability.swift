@@ -238,6 +238,10 @@ struct TagObservationEstimate: Equatable {
         var contexts: [DiskContext]
     }
     private struct Key: Hashable { let context: String; let tagID: Int }
+    private struct ContextTouch {
+        let date: Date
+        let order: Int
+    }
     private enum LoadedFile { case missing, data(Data), invalid }
 
     private let rootURL: URL?
@@ -247,7 +251,8 @@ struct TagObservationEstimate: Equatable {
     private let maxContexts = 4
     private let fileName = "observations-v1.json"
     private var records: [Key: TagRecord] = [:]
-    private var contextTouches: [String: Date] = [:]
+    private var contextTouches: [String: ContextTouch] = [:]
+    private var touchOrder = 0
     private var loadTask: Task<LoadedFile, Never>?
     private var loaded = false
     private var persistenceWritable = true
@@ -307,7 +312,7 @@ struct TagObservationEstimate: Equatable {
     func observe(items: [MediaItem], scope: String, policy: TagAvailabilityPolicy) {
         let context = contextHash(scope: scope, policy: policy)
         let stamp = now()
-        contextTouches[context] = stamp
+        var observed = false
         for item in items where item.id > 0 {
             let witness = witnessKey(item: item, deduplicate: policy.deduplicateMediaAssets)
             guard !witness.isEmpty else { continue }
@@ -322,8 +327,11 @@ struct TagObservationEstimate: Equatable {
                 record.emptyUntil = nil
                 record.touchedAt = stamp
                 records[key] = record
+                observed = true
             }
         }
+        guard observed else { return }
+        touch(context, at: stamp)
         trim()
         revision &+= 1
         scheduleWriteIfNeeded()
@@ -333,7 +341,7 @@ struct TagObservationEstimate: Equatable {
         guard tagID > 0 else { return }
         let context = contextHash(scope: scope, policy: policy)
         let stamp = now()
-        contextTouches[context] = stamp
+        touch(context, at: stamp)
         let key = Key(context: context, tagID: tagID)
         var record = records[key] ?? TagRecord(witnesses: [], emptyUntil: nil, touchedAt: stamp)
         record.emptyUntil = stamp.addingTimeInterval(24 * 60 * 60)
@@ -488,10 +496,23 @@ struct TagObservationEstimate: Equatable {
         return SHA256.hash(data: Data(canonical.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
+    private func touch(_ context: String, at date: Date) {
+        touchOrder += 1
+        contextTouches[context] = ContextTouch(date: date, order: touchOrder)
+    }
+
+    private func contextIsOlder(_ lhs: String, than rhs: String) -> Bool {
+        let earlier = contextTouches[lhs] ?? ContextTouch(date: .distantPast, order: 0)
+        let later = contextTouches[rhs] ?? ContextTouch(date: .distantPast, order: 0)
+        if earlier.date != later.date { return earlier.date < later.date }
+        if earlier.order != later.order { return earlier.order < later.order }
+        return lhs < rhs
+    }
+
     private func trim() {
         var contexts = Set(records.keys.map(\.context))
         while contexts.count > maxContexts {
-            guard let oldest = contexts.min(by: { (contextTouches[$0] ?? .distantPast) < (contextTouches[$1] ?? .distantPast) }) else { break }
+            guard let oldest = contexts.min(by: { contextIsOlder($0, than: $1) }) else { break }
             records = records.filter { $0.key.context != oldest }
             contextTouches.removeValue(forKey: oldest)
             contexts.remove(oldest)
@@ -499,7 +520,11 @@ struct TagObservationEstimate: Equatable {
         for context in contexts {
             let keys = records.keys.filter { $0.context == context }
             if keys.count > maxTagsPerContext {
-                let remove = keys.sorted { (records[$0]?.touchedAt ?? .distantPast) < (records[$1]?.touchedAt ?? .distantPast) }
+                let remove = keys.sorted {
+                    let first = records[$0]?.touchedAt ?? .distantPast
+                    let second = records[$1]?.touchedAt ?? .distantPast
+                    return first == second ? $0.tagID < $1.tagID : first < second
+                }
                     .prefix(keys.count - maxTagsPerContext)
                 for key in remove { records.removeValue(forKey: key) }
             }
@@ -508,15 +533,18 @@ struct TagObservationEstimate: Equatable {
 
     private func makeDiskFile() -> DiskFile {
         let contexts = Dictionary(grouping: records, by: { $0.key.context }).map { hash, values in
-            DiskContext(hash: hash, touchedAt: contextTouches[hash] ?? .distantPast,
+            DiskContext(hash: hash, touchedAt: contextTouches[hash]?.date ?? .distantPast,
                         tags: values.map { DiskTag(tagID: $0.key.tagID, record: $0.value) }.sorted { $0.tagID < $1.tagID })
-        }.sorted { $0.touchedAt > $1.touchedAt }
+        }.sorted { contextIsOlder($1.hash, than: $0.hash) }
         return DiskFile(version: 1, contexts: contexts)
     }
 
     private func merge(_ file: DiskFile) {
-        for context in file.contexts {
-            contextTouches[context.hash] = max(contextTouches[context.hash] ?? .distantPast, context.touchedAt)
+        for (index, context) in file.contexts.enumerated() where !context.tags.isEmpty {
+            if context.touchedAt > (contextTouches[context.hash]?.date ?? .distantPast) {
+                // The v1 file lists newest contexts first. Runtime touches win equal-date ties.
+                contextTouches[context.hash] = ContextTouch(date: context.touchedAt, order: -index)
+            }
             for diskTag in context.tags where diskTag.tagID > 0 {
                 let key = Key(context: context.hash, tagID: diskTag.tagID)
                 guard let current = records[key] else { records[key] = diskTag.record; continue }

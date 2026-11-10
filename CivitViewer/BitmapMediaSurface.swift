@@ -11,8 +11,8 @@ struct BitmapMediaSurface: View {
     var pausedForOverlay = false
     var onReady: ((Bool) -> Void)? = nil
     var onVideoContent: (() -> Void)? = nil
-    var onKindSwipe: ((Int) -> Void)? = nil
-    var onKindDrag: ((Double, MediaPanPhase) -> Void)? = nil
+    var onEdgeSwipe: MediaEdgeSwipeAction? = nil
+    var onEdgeDrag: MediaEdgeDragAction? = nil
     var onDoubleTap: (() -> Void)? = nil
     @AppStorage("autoplay") private var autoplay = true
     @State private var resource: CachedImageResource?
@@ -77,8 +77,8 @@ struct BitmapMediaSurface: View {
         .onChange(of: active) { _, value in if value { playing = autoplay } }
         .onChange(of: autoplay) { _, value in playing = value }
         .background {
-            MediaGestureLayer(active: active, isVideo: false, topExclusion: gestureTopExclusion, excludedFrames: gestureExcludedFrames, onKindSwipe: onKindSwipe,
-                              onKindDrag: onKindDrag, onTap: (resource?.frameCount ?? 0) > 1 ? { playing.toggle() } : nil,
+            MediaGestureLayer(active: active, isVideo: false, topExclusion: gestureTopExclusion, excludedFrames: gestureExcludedFrames, onEdgeSwipe: onEdgeSwipe,
+                              onEdgeDrag: onEdgeDrag, onTap: (resource?.frameCount ?? 0) > 1 ? { playing.toggle() } : nil,
                               onDoubleTap: onDoubleTap)
         }
         .onDisappear { activeRequest = nil; activeAnimation = nil; frames = []; resource = nil; onReady?(false) }
@@ -153,14 +153,18 @@ struct CoverPlaceholder: View {
 }
 
 struct CachedPoster: View {
+    enum Presentation { case preview, imageOnly, hidden }
+
     let source: URL
     let declared: URL?
     var active = false
     var fit = false
+    var presentation: Presentation = .preview
     var retryToken = 0
     var allowLocalExtraction = false
     var diagnosticWorkID: Int? = nil
     var onFailure: ((Bool) -> Void)? = nil
+    var onImageAvailability: ((Bool) -> Void)? = nil
     var showsFailure = true
     var emptyPlaceholder: String? = nil
     var placeholderTitle: String? = nil
@@ -172,11 +176,11 @@ struct CachedPoster: View {
     var body: some View {
         GeometryReader { geometry in
             ZStack {
-                if let image {
+                if presentation != .hidden, let image {
                     Image(uiImage: image).resizable().aspectRatio(contentMode: fit ? .fit : .fill)
                         .frame(width: geometry.size.width, height: geometry.size.height).clipped()
                         .blur(radius: imageBlur)
-                } else {
+                } else if presentation == .preview {
                     CoverPlaceholder(symbol: "play.rectangle",
                         title: placeholderTitle ?? "视频预览",
                         detail: emptyPlaceholder)
@@ -215,6 +219,7 @@ struct CachedPoster: View {
                 notePoster(.posterFailed, error: error, stage: stage)
             }
         }
+        .onChange(of: image != nil, initial: true) { _, available in onImageAvailability?(available) }
         .onReceive(MediaCache.shared.posterUpdates) { key in
             guard key == MediaCache.shared.posterCacheKey(for: source) else { return }
             cacheRevision += 1

@@ -34,15 +34,16 @@ struct VideoPreparationPresentedKey: PreferenceKey {
     }
 }
 
-/// Only the focused video's inability to play drives this passive indicator.
+/// Passive feedback for the current video or the page being revealed by a swipe.
 struct VideoWaitingIndicator: View {
     let visible: Bool
+    var immediate = false
     @State private var isPresented = false
 
     var body: some View {
         ZStack {
             Color.clear.accessibilityHidden(true)
-            if visible && isPresented {
+            if visible && (immediate || isPresented) {
                 ProgressView().tint(.white).controlSize(.small).dynamicTypeSize(.medium)
                     .accessibilityLabel("视频正在缓冲")
                     .accessibilityIdentifier("media.waiting")
@@ -205,7 +206,7 @@ struct VideoPreparationOverlayQAView: View {
                 Color.gray.opacity(0.25)
                 VideoWaitingIndicator(visible: stage != .hidden)
                 VideoProgressChrome(position: 3, duration: 30, bufferedRanges: [.init(start: 0, end: 12)],
-                    enabled: false, emphasized: false, showTimes: false,
+                    enabled: false, showTime: false,
                     onSeek: { _, _ in }, onInteractionChange: { _ in },
                     preparationVisible: stage == .repair,
                     preparationProgress: progress, preparationCanCancel: stage == .repair,

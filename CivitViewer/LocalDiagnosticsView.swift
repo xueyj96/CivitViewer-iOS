@@ -15,50 +15,55 @@ struct LocalDiagnosticsView: View {
 
     var body: some View {
         List {
-            Section {
-                Text("仅保存在本机。记录公开作品或标签编号、查询范围、处理数量及系统错误码；不包含账号、搜索文字、请求地址或任意错误文本。最多保留 7 天、1,000 条。")
-                    .font(.footnote).foregroundStyle(.secondary)
-                HStack {
-                    Button("准备导出") { Task { await prepareExport() } }.disabled(busy)
-                    if let exportURL {
-                        ShareLink(item: exportURL) { Label("分享文件…", systemImage: "square.and.arrow.up") }
+            Group {
+                Section {
+                    Text("仅保存在本机。记录公开作品或标签编号、查询范围、处理数量及系统错误码；不包含账号、搜索文字、请求地址或任意错误文本。最多保留 7 天、1,000 条。")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    HStack {
+                        Button("准备导出") { Task { await prepareExport() } }.disabled(busy)
+                        if let exportURL {
+                            ShareLink(item: exportURL) { Label("分享文件…", systemImage: "square.and.arrow.up") }
+                        }
+                        Spacer()
+                        Button("清除", role: .destructive) { showingClear = true }.disabled(entries.isEmpty || busy)
                     }
-                    Spacer()
-                    Button("清除", role: .destructive) { showingClear = true }.disabled(entries.isEmpty || busy)
+                    .buttonStyle(.borderless)
+                    if let errorMessage { Text(errorMessage).font(.caption).foregroundStyle(.secondary) }
                 }
-                if let errorMessage { Text(errorMessage).font(.caption).foregroundStyle(.secondary) }
-            }
-            if loading { Section { ProgressView("读取本机记录…") } }
-            Section("本机记录（最新在前）") {
-                if entries.isEmpty && !loading { Text("暂无记录").foregroundStyle(.secondary) }
-                ForEach(entries) { entry in
-                    VStack(alignment: .leading, spacing: 5) {
-                        HStack {
-                            Text(entry.area.title).font(.subheadline.weight(.semibold))
-                            Text(entry.code.title).font(.subheadline)
-                            Spacer()
-                            if let status = entry.httpStatus { Text("HTTP \(status)").font(.caption.monospacedDigit()) }
-                        }
-                        HStack(spacing: 10) {
-                            Text(entry.timestamp.formatted(.dateTime.locale(Locale(identifier: "zh_Hans_CN")).month().day().hour().minute().second()))
-                            Text("版本 \(entry.build)")
-                            if let count = entry.count { Text(entry.code.isFrameReadyMeasurement ? "首帧 \(count) ms" : "数量 \(count)") }
-                            if entry.suppressed > 0 { Text("合并 \(entry.suppressed) 条重复记录") }
-                        }.font(.caption).foregroundStyle(.secondary)
-                        if let playback = entry.playback {
-                            Text(playback.summary).font(.caption.monospacedDigit()).textSelection(.enabled)
-                        }
-                        if let tagSearch = entry.tagSearch {
-                            Text(tagSearch.summary).font(.caption.monospacedDigit()).textSelection(.enabled)
-                        }
-                    }.padding(.vertical, 3)
+                if loading { Section { ProgressView("读取本机记录…") } }
+                Section("本机记录（最新在前）") {
+                    if entries.isEmpty && !loading { Text("暂无记录").foregroundStyle(.secondary) }
+                    ForEach(entries) { entry in
+                        VStack(alignment: .leading, spacing: 5) {
+                            HStack {
+                                Text(entry.area.title).font(.subheadline.weight(.semibold))
+                                Text(entry.code.title).font(.subheadline)
+                                Spacer()
+                                if let status = entry.httpStatus { Text("HTTP \(status)").font(.caption.monospacedDigit()) }
+                            }
+                            HStack(spacing: 10) {
+                                Text(entry.timestamp.formatted(.dateTime.locale(Locale(identifier: "zh_Hans_CN")).month().day().hour().minute().second()))
+                                Text("版本 \(entry.build)")
+                                if let count = entry.count { Text(entry.code.isFrameReadyMeasurement ? "首帧 \(count) ms" : "数量 \(count)") }
+                                if entry.suppressed > 0 { Text("合并 \(entry.suppressed) 条重复记录") }
+                            }.font(.caption).foregroundStyle(.secondary)
+                            if let playback = entry.playback {
+                                Text(playback.summary).font(.caption.monospacedDigit()).textSelection(.enabled)
+                            }
+                            if let tagSearch = entry.tagSearch {
+                                Text(tagSearch.summary).font(.caption.monospacedDigit()).textSelection(.enabled)
+                            }
+                        }.padding(.vertical, 3)
+                    }
                 }
             }
+            .floatingCardListRows()
         }
-        .navigationTitle("本机诊断记录")
-        #if os(iOS)
-        .navigationBarTitleDisplayMode(.inline)
-        #endif
+        .accessibilityIdentifier("diagnostics.card-list")
+        .listStyle(.plain)
+        .listRowSpacing(FloatingPageChrome.groupInset)
+        .avoidOverlaidTabBar(constrainViewport: true)
+        .floatingTitleBar("本机诊断记录").ordinaryAppearance()
         .task { await reload() }
         .onDisappear { leaveView() }
         .confirmationDialog("清除本机诊断记录？", isPresented: $showingClear, titleVisibility: .visible) {

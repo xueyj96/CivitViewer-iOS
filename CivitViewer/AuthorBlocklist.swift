@@ -134,31 +134,55 @@ import UIKit
 
 struct AuthorBlocklistView: View {
     @ObservedObject private var blocklist = AuthorBlocklist.shared
+    @State private var choosingAuthor = false
 
     var body: some View {
-        List {
-            Section {
-                Text("仅在本机隐藏已屏蔽作者的作品，不会取消关注、移除收藏或删除浏览记录与媒体。")
-                    .font(.footnote).foregroundStyle(.secondary)
-                if let error = blocklist.error { Text(error).font(.caption).foregroundStyle(.red) }
-                if blocklist.entries.isEmpty { Text("尚未屏蔽作者").foregroundStyle(.secondary) }
-            }
-            Section("已屏蔽 · \(blocklist.entries.count)") {
-                ForEach(blocklist.entries) { author in
-                    HStack {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("@" + author.username).font(.body.weight(.medium))
-                            Text("作者 ID \(author.id)").font(.caption).foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        Button("取消屏蔽", role: .destructive) { blocklist.remove(id: author.id) }
-                            .accessibilityLabel("取消屏蔽作者 " + author.username)
-                    }.padding(.vertical, 3)
+        ScrollView {
+            VStack(alignment: .leading, spacing: FloatingPageChrome.spacing) {
+                if let error = blocklist.error {
+                    Text(error).font(.caption).foregroundStyle(.red)
                 }
+                if blocklist.entries.isEmpty {
+                    SettingsControlCard {
+                        SettingsRowLabel("尚未屏蔽作者", "person.crop.circle.badge.xmark")
+                            .foregroundStyle(.secondary)
+                            .frame(minHeight: FloatingPageChrome.controlHeight)
+                    }
+                } else {
+                    ForEach(blocklist.entries) { author in
+                        SettingsControlCard {
+                            HStack(spacing: FloatingPageChrome.spacing) {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("@" + author.username).font(.subheadline.weight(.medium))
+                                    Text("作者 ID \(author.id)").font(.caption).foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Button(role: .destructive) { blocklist.remove(id: author.id) } label: {
+                                    FloatingPageIcon(symbol: "minus.circle")
+                                        .frame(width: FloatingPageChrome.controlHeight, height: FloatingPageChrome.controlHeight)
+                                }
+                                .buttonStyle(.plain).foregroundStyle(.red)
+                                .accessibilityLabel("取消屏蔽作者 " + author.username)
+                            }
+                        }
+                    }
+                }
+                Text("仅在本机隐藏该作者的作品，关注、收藏和浏览记录会保留。")
+                    .font(.caption).foregroundStyle(.secondary).padding(.horizontal, FloatingPageChrome.cardInset)
             }
+            .pageScrollContentInsets()
         }
-        .navigationTitle("屏蔽作者")
-        .navigationBarTitleDisplayMode(.inline)
+        .floatingTitleBar("屏蔽作者") {
+            Button { choosingAuthor = true } label: { FloatingPageIcon(symbol: "plus") }
+                .buttonStyle(FloatingPageButtonStyle(iconOnly: true))
+                .accessibilityLabel("添加屏蔽作者")
+        }
+        .navigationDestination(isPresented: $choosingAuthor) {
+            AuthorSearchPicker(selected: Binding(get: { nil }, set: { author in
+                if let author, !blocklist.contains(id: author.id) { _ = blocklist.add(author) }
+            }), title: "添加屏蔽作者")
+        }
+        .ordinaryAppearance()
     }
 }
 #endif

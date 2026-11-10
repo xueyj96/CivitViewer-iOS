@@ -1,7 +1,24 @@
 import SwiftUI
 import UIKit
 
+enum ScreenEdgeGesture {
+    static let width: CGFloat = 30
+    static let commitDistance = 45.0
+
+    static func contains(distance: CGFloat) -> Bool {
+        (0...width).contains(distance)
+    }
+}
+
 enum MediaPanPhase { case began, changed, ended, cancelled }
+enum MediaEdgeRegion { case upper, lower }
+typealias MediaEdgeSwipeAction = (Int, MediaEdgeRegion) -> Void
+typealias MediaEdgeDragAction = (Double, MediaPanPhase, MediaEdgeRegion) -> Void
+
+final class MediaPagePanGestureRecognizer: UIPanGestureRecognizer {
+    fileprivate var edgeRegion: MediaEdgeRegion?
+    var isDraggingEdge: Bool { edgeRegion != nil && (state == .began || state == .changed) }
+}
 
 /// Observe only the owning page's touches without putting a hit-testing view
 /// over SwiftUI buttons. Navigation may retain enabled pages behind another one.
@@ -12,8 +29,8 @@ struct MediaGestureLayer: UIViewRepresentable {
     var topExclusion: CGFloat = 110
     var bottomExclusion: CGFloat = 120
     var excludedFrames: [CGRect] = []
-    var onKindSwipe: ((Int) -> Void)?
-    var onKindDrag: ((Double, MediaPanPhase) -> Void)? = nil
+    var onEdgeSwipe: MediaEdgeSwipeAction?
+    var onEdgeDrag: MediaEdgeDragAction? = nil
     var onSeek: ((Double, MediaPanPhase) -> Void)? = nil
     var onRateHold: ((Bool) -> Void)? = nil
     var onTap: (() -> Void)? = nil
@@ -49,12 +66,11 @@ struct MediaGestureLayer: UIViewRepresentable {
         var bottomExclusionOverride: CGFloat?
         weak var probe: Probe?
         private weak var host: UIView?
-        private lazy var pan = UIPanGestureRecognizer(target: self, action: #selector(panned))
+        private lazy var pan = MediaPagePanGestureRecognizer(target: self, action: #selector(panned))
         private lazy var hold = UILongPressGestureRecognizer(target: self, action: #selector(held))
         private lazy var centerHold = UILongPressGestureRecognizer(target: self, action: #selector(centerHeld))
         private lazy var tap = UITapGestureRecognizer(target: self, action: #selector(tapped))
         private lazy var doubleTap = UITapGestureRecognizer(target: self, action: #selector(doubleTapped))
-        private var edgePan = false
         private var panTouchOrigin: CGPoint?
         private var holding = false
         init(_ configuration: MediaGestureLayer) { self.configuration = configuration; super.init() }
@@ -103,7 +119,7 @@ struct MediaGestureLayer: UIViewRepresentable {
         }
         private func edge(_ point: CGPoint) -> Bool {
             guard let view = probe else { return false }
-            return point.x < 30 || point.x > view.bounds.width - 30
+            return ScreenEdgeGesture.contains(distance: min(point.x - view.bounds.minX, view.bounds.maxX - point.x))
         }
         private func center(_ point: CGPoint) -> Bool {
             guard let view = probe, !edge(point) else { return false }
@@ -122,8 +138,19 @@ struct MediaGestureLayer: UIViewRepresentable {
                 // UIPan's initial movement can be absent from its translation.
                 // Use the received touch origin instead of reconstructing it.
                 guard let start = panTouchOrigin, valid(start) else { return false }
-                edgePan = edge(start)
-                return edgePan ? configuration.onKindSwipe != nil : configuration.isVideo
+                pan.edgeRegion = nil
+                if edge(start) {
+                    guard configuration.onEdgeSwipe != nil else { return false }
+                    // Classify the original touch once, in screen coordinates.
+                    // Crossing the midpoint during the drag doesn't change its action.
+                    if let window = view.window {
+                        pan.edgeRegion = view.convert(start, to: window).y < window.bounds.midY ? .upper : .lower
+                    } else {
+                        pan.edgeRegion = start.y < view.bounds.midY ? .upper : .lower
+                    }
+                    return true
+                }
+                return configuration.isVideo
             }
             guard valid(point) else { return false }
             if recognizer === centerHold { return chromeAction != nil && center(point) }
@@ -171,18 +198,23 @@ struct MediaGestureLayer: UIViewRepresentable {
             traceGesture(pan, stage: "action")
             #endif
             guard let view = probe else { return }
-            let delta = Double(pan.translation(in: view).x)
-            if edgePan {
+            if let region = pan.edgeRegion {
+                let delta = Double(pan.translation(in: view.window).x)
                 switch pan.state {
-                case .began: configuration.onKindDrag?(delta, .began)
-                case .changed: configuration.onKindDrag?(delta, .changed)
-                case .ended: configuration.onKindDrag?(delta, .ended)
-                case .cancelled, .failed: configuration.onKindDrag?(delta, .cancelled)
+                case .began: configuration.onEdgeDrag?(delta, .began, region)
+                case .changed: configuration.onEdgeDrag?(delta, .changed, region)
+                case .ended:
+                    pan.edgeRegion = nil
+                    configuration.onEdgeDrag?(delta, .ended, region)
+                    if abs(delta) >= ScreenEdgeGesture.commitDistance { configuration.onEdgeSwipe?(delta < 0 ? 1 : -1, region) }
+                case .cancelled, .failed:
+                    pan.edgeRegion = nil
+                    configuration.onEdgeDrag?(delta, .cancelled, region)
                 default: break
                 }
-                if pan.state == .ended && abs(delta) >= 45 { configuration.onKindSwipe?(delta < 0 ? 1 : -1) }
                 return
             }
+            let delta = Double(pan.translation(in: view).x)
             switch pan.state {
             case .began: configuration.onSeek?(delta, .began)
             case .changed: configuration.onSeek?(delta, .changed)
@@ -216,10 +248,21 @@ struct MediaGestureLayer: UIViewRepresentable {
             if let view = probe {
                 let p = recognizer.location(in: view)
                 fields["location"] = ["x": Double(p.x), "y": Double(p.y)]
+                if recognizer === pan {
+                    fields["probe"] = ["width": Double(view.bounds.width), "height": Double(view.bounds.height)]
+                    fields["edgeAction"] = configuration.onEdgeSwipe != nil
+                    if let start = panTouchOrigin {
+                        fields["start"] = ["x": Double(start.x), "y": Double(start.y)]
+                        fields["startValid"] = valid(start)
+                        fields["startAtEdge"] = edge(start)
+                    }
+                }
             }
             if let pan = recognizer as? UIPanGestureRecognizer {
                 let v = pan.velocity(in: probe)
                 fields["velocity"] = ["x": Double(v.x), "y": Double(v.y)]
+                let delta = pan.translation(in: probe?.window)
+                fields["translation"] = ["x": Double(delta.x), "y": Double(delta.y)]
             }
             trace.record("window.\(stage)", fields, sampleKey: stage == "action" && recognizer.state == .changed ? "window.\(name).changed" : nil)
         }
@@ -288,7 +331,7 @@ private struct MediaGestureScopeQAPage: View {
         .background(author ? Color.blue.opacity(0.85) : Color.black).foregroundStyle(.white)
         .background {
             if !author {
-                MediaGestureLayer(active: true, isVideo: false, onKindSwipe: { _ in state.switches += 1 })
+                MediaGestureLayer(active: true, isVideo: false, onEdgeSwipe: { _, _ in state.switches += 1 })
             }
         }
     }

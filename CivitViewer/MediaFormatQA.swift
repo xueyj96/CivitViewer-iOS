@@ -266,6 +266,20 @@ private struct AutoContinuationQAReadback: View {
     private static let posterRun = UUID().uuidString
     static var posterStreamURL: URL { root.appendingPathComponent("stream49-" + posterRun + ".mp4") }
     static let collection = SavedCollection(id: 28_037_002, name: "分页测试收藏", userId: ownerID, type: "Image", mode: nil, read: "Private")
+    static var collections: [SavedCollection] {
+        let arguments = ProcessInfo.processInfo.arguments
+        if arguments.contains("--qa-no-collections") { return [] }
+        if arguments.contains("--qa-multiple-collections") {
+            return [collection, SavedCollection(id: 28_037_003, name: "另一个收藏夹", userId: ownerID, type: "Image", mode: nil, read: "Public")]
+        }
+        return [collection]
+    }
+    static var otherCollectionItems: [MediaItem] {
+        var item = MediaItem(id: 28_037_106, url: "https://example.invalid/other-folder", width: 192, height: 256,
+                             type: "image", username: "PagingFixture", browsingLevel: 1, thumbnail: nil, tags: [])
+        item.offlineMediaURL = root.appendingPathComponent("pattern-5.png")
+        return [item] + Array(items.prefix(1))
+    }
     static var biographyCase: String? {
         ProcessInfo.processInfo.arguments.first(where: { $0.hasPrefix("--qa-biography-case=") })?.components(separatedBy: "=").last
     }
@@ -324,6 +338,17 @@ private struct AutoContinuationQAReadback: View {
             if index == 0 && ProcessInfo.processInfo.arguments.contains("--qa-theme-ui") { item.offlineMediaURL = nil }
             if VisualControlsQA.enabled {
                 item.offlineMediaURL = nil; item.creatorID = VisualControlsQA.creatorID
+                if index == 2, ProcessInfo.processInfo.arguments.contains("--qa-playback-follow-fallback") {
+                    item.creatorID = nil
+                    item.postTitle = "带标题的测试作品"
+                }
+            }
+            if detailsTagsEnabled {
+                item.createdAt = "2026-05-04T12:30:00.000Z"
+                item.postID = 28_037_500
+                if ProcessInfo.processInfo.arguments.contains("--qa-details-preview") {
+                    item.postTitle = video ? "街景短片 · 测试样例" : "城市风景 · 测试样例"
+                }
             }
             if wideVideo { item.offlineMediaURL = root.appendingPathComponent("wide.mp4") }
             if video { item.offlinePosterURL = root.appendingPathComponent("pattern-\(index).png") }
@@ -479,7 +504,7 @@ struct CollectionPagingQAView: View {
             } else if ready {
                 MainTabs(selectedTab: $selectedTab, onTimelineTap: { timelineTopRequest53 += 1 }, onTimelineDoubleTap: { timelineRestartRequest53 += 1 },
                          timeline: TimelineView(isVisible: selectedTab == 0, restartRequest: timelineRestartRequest53, topRequest: timelineTopRequest53), authors: LeaderboardView(),
-                         search: SearchView(), settings: SettingsView())
+                         search: SearchView(), collections: CollectionsView())
             } else { ProgressView() }
         }
         .frame(maxWidth: VisualControlsQA.width ?? (ProcessInfo.processInfo.arguments.contains("--qa-theme-compact") ? 320 : .infinity))

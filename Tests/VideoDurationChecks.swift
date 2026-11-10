@@ -82,11 +82,10 @@ import Foundation
                 check(VideoDurationScale.index(atFraction: fraction, finiteFraction: finiteFraction) == index, "every finite drag position roundtrips across track widths")
             }
         }
-        check(VideoDurationScale.tickSeconds == [30,60,90,120], "only meaningful finite tick labels are present")
         let finiteSpan = 0.8
-        for seconds in VideoDurationScale.tickSeconds {
+        for seconds in [30, 60, 90, 120] {
             let fraction = VideoDurationScale.fraction(for: VideoDurationScale.index(for: seconds), finiteFraction: finiteSpan)
-            check(abs(fraction - Double(seconds - 2) / 118 * finiteSpan) < 0.000001, "tick geometry follows the finite seconds scale")
+            check(abs(fraction - Double(seconds - 2) / 118 * finiteSpan) < 0.000001, "positions follow the finite seconds scale")
         }
         check(VideoDurationScale.fraction(for: VideoDurationScale.terminalIndex, finiteFraction: finiteSpan) == 1 && VideoDurationScale.fraction(for: VideoDurationScale.finiteLastIndex, finiteFraction: finiteSpan) == finiteSpan, "special terminal has separate physical space from finite 120")
         check(VideoDurationScale.index(atFraction: -1, finiteFraction: finiteSpan) == 0 && VideoDurationScale.index(atFraction: 2, finiteFraction: finiteSpan) == VideoDurationScale.terminalIndex, "drag outside track clamps to real endpoints")
@@ -117,9 +116,9 @@ import Foundation
         let oldFilter = try decoder.decode(FeedFilter.self, from: Data("{\"kind\":\"all\",\"sort\":\"Newest\",\"period\":\"Week\",\"baseModel\":\"\",\"onlyPG\":false}".utf8))
         check(oldFilter.videoDurationRange == nil, "old persisted filter remains disabled")
         var active = oldFilter; active.videoDurationRange = long
-        check(active.effectiveKind == .video && active.kind == .all, "active range presents videos while preserving the prior disabled selection")
+        check(active.effectiveKind == .video && active.kind == .image, "active range presents videos while preserving the prior disabled selection")
         check(active.selecting(kind: .image).videoDurationRange == nil && active.selecting(kind: .image).effectiveKind == .image, "explicit image selection clears the incompatible video range")
-        check(active.selecting(kind: .all).videoDurationRange == nil && active.selecting(kind: .video).videoDurationRange == long, "all clears range while video selection preserves it")
+        check(active.selecting(kind: .all).videoDurationRange == nil && active.selecting(kind: .video).videoDurationRange == long, "legacy all selection falls back to image and clears range while video preserves it")
         let encoded = try JSONEncoder().encode(active)
         check(try decoder.decode(FeedFilter.self, from: encoded) == active && active != oldFilter, "range persists and participates in equality")
         var exclusiveFilter = active; exclusiveFilter.videoDurationRange = beyondTwo
@@ -129,7 +128,7 @@ import Foundation
         let recoveredFilter = try decoder.decode(FeedFilter.self, from: JSONSerialization.data(withJSONObject: legacyFilterJSON))
         check(recoveredFilter.videoDurationRange == long && recoveredFilter.videoDurationRange!.contains(120), "legacy saved FeedFilter with min120 restores >=120 instead of becoming strict")
         check(active.resetting(in: .discovery).videoDurationRange == nil, "reset disables range")
-        check(active.query().first { $0.name == "type" }?.value == "video" && active.kind == .all, "range requests video without changing selected kind")
+        check(active.query().first { $0.name == "type" }?.value == "video" && active.kind == .image, "range requests video without changing selected kind")
         check(!active.query().contains { $0.name.lowercased().contains("duration") }, "no invented server duration parameters")
         _ = try decoder.decode(MediaPage.self, from: Data("{\"items\":[],\"metadata\":{}}".utf8))
         var unfiltered = FeedAccumulator()
@@ -153,7 +152,7 @@ import Foundation
         var retryClock = Date(timeIntervalSince1970: 4_000)
         let site = DurationSource(), store = FeedStore(now: { retryClock })
         site.fetch = { _ in page([item(1)]) }; site.durationFetch = { [.init(id: 1, metadata: .init(duration: 121))] }
-        _ = await store.activate(session: site, filter: oldFilter, source: .discovery)
+        _ = await store.activate(session: site, filter: oldFilter.selecting(kind: .video), source: .discovery)
         check(site.metadataCalls == 0 && store.items.count == 1, "disabled performs zero enrichment calls")
         _ = await store.activate(session: site, filter: active, source: .discovery)
         check(site.metadataCalls == 1 && store.items.first?.durationSeconds == 121, "enabled enriches once before filtering")
@@ -230,7 +229,7 @@ import Foundation
         let stale = Task { await store.activate(session: site, filter: active, source: .discovery, force: true) }
         await started.wait()
         site.fetch = { _ in page([item(2, 3)]) }
-        let current = await store.activate(session: site, filter: oldFilter, source: .discovery)
+        let current = await store.activate(session: site, filter: oldFilter.selecting(kind: .video), source: .discovery)
         release.open(); _ = await stale.value
         check(store.items.map(\.id) == [2] && store.accepts(current, identity: site.feedIdentity), "old enriched response after range change cannot commit")
         let accountStarted = DurationGate(), accountRelease = DurationGate()

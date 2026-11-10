@@ -5,30 +5,28 @@ struct LeaderboardView: View {
     @State private var board: Board = .seasonal
     @State private var recent: RecentPublication = .any
     var body: some View {
-        VStack(spacing: 0) {
-            VStack(alignment: .leading, spacing: 10) {
-                Picker("作者榜类型", selection: $board) { ForEach(Board.allCases) { Text($0.title).tag($0) } }.pickerStyle(.segmented)
-                HStack {
-                    Text("作品更新").font(.caption).foregroundStyle(.secondary)
-                    Spacer()
-                    Menu {
-                        Picker("作品更新时间", selection: $recent) {
-                            ForEach(RecentPublication.allCases) { Text($0.title).tag($0) }
-                        }
-                    } label: { AppFilterLabel(title: recent.title, symbol: "calendar") }
-                        .buttonStyle(AppActionButtonStyle())
-                        .accessibilityLabel("作品更新：" + recent.title)
-                        .accessibilityIdentifier("leaderboard.recent-filter")
-                }
-            }.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, AppTheme.spacing).padding(.top, 12).padding(.bottom, 4)
-            ZStack {
-                ForEach(Board.allCases) { value in
-                    LeaderboardList(board: value, visible: board == value, recent: recent)
-                        .opacity(board == value ? 1 : 0)
-                        .allowsHitTesting(board == value).accessibilityHidden(board != value)
-                }
+        ZStack {
+            ForEach(Board.allCases) { value in
+                LeaderboardList(board: value, visible: board == value, recent: recent)
+                    .opacity(board == value ? 1 : 0)
+                    .allowsHitTesting(board == value).accessibilityHidden(board != value)
             }
-        }.navigationTitle("作者榜").navigationBarTitleDisplayMode(.inline).ordinaryAppearance()
+        }
+        .floatingPageBar("leaderboard.top-bar") {
+            HStack(spacing: FloatingPageChrome.groupInset) {
+                FloatingSegmentedControl(title: "作者榜类型", selection: $board, options: Board.allCases,
+                                         optionTitle: { $0.title }, identifier: "leaderboard.board")
+                Menu {
+                    Picker("作品更新时间", selection: $recent) {
+                        ForEach(RecentPublication.allCases) { Text($0.title).tag($0) }
+                    }
+                } label: { AppFilterLabel(title: recent.title, symbol: "calendar") }
+                .accessibilityLabel("作品更新：" + recent.title)
+                .accessibilityIdentifier("leaderboard.recent-filter")
+            }
+            .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
+        }
+        .ordinaryAppearance()
     }
 }
 
@@ -40,9 +38,9 @@ private struct LeaderboardList: View {
     @EnvironmentObject private var session: SiteSession
     @State private var entries: [LeaderboardEntry] = []
     @State private var loading = false
+    @State private var loadID: UUID?
     @State private var loaded = false
     @State private var error: String?
-    @State private var showActivityInfo = false
     @State private var showUnknown = false
     @StateObject private var activity = CreatorActivityStore()
     private struct ActivityKey: Equatable { let visible: Bool; let active: Bool; let identity: String; let ids: [Int] }
@@ -55,6 +53,7 @@ private struct LeaderboardList: View {
         }
     }
     private var unknown: [LeaderboardEntry] { entries.filter { activity.result(for: $0.id) == nil || activity.result(for: $0.id) == .unverified } }
+    private var unchecked: Bool { entries.contains { activity.result(for: $0.id) == nil } }
     private var activitySummary: String {
         let verified = (entries.count - unknown.count).formatted(.number.locale(Locale(identifier: "en_US")))
         let total = entries.count.formatted(.number.locale(Locale(identifier: "en_US")))
@@ -63,135 +62,166 @@ private struct LeaderboardList: View {
     var body: some View {
         Group {
             if entries.isEmpty {
-                if loading { ProgressView().frame(maxHeight: .infinity) }
+                if loading || (!loaded && error == nil) {
+                    ProgressView().controlSize(.small).accessibilityLabel("正在加载作者榜").frame(maxHeight: .infinity)
+                }
                 else if let error { FailureView(message: error) { Task { await load() } } }
-                else { ContentUnavailableView { Label("当前榜单暂无结果", systemImage: "person.3") } actions: { Button("刷新榜单") { Task { await load() } } } }
+                else {
+                    ScrollView {
+                        PageStatusCard(title: "当前榜单暂无结果", symbol: "person.3")
+                            .padding(.horizontal, FloatingPageChrome.pageInset)
+                    }
+                    .refreshable { await load() }
+                }
             } else {
                 List {
-                    if recent != .any {
-                        Section {
-                            HStack(spacing: 10) {
-                                Text(activitySummary)
-                                    .font(.caption.monospacedDigit())
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                                    .minimumScaleFactor(0.8)
-                                    .accessibilityIdentifier("leaderboard.activity.summary")
-                                Spacer(minLength: 2)
-                                if activity.busy {
-                                    ProgressView()
-                                        .controlSize(.small)
-                                        .accessibilityLabel("正在核实作品发布时间")
-                                } else {
-                                    Button("继续") { Task { await activity.checkNext(entries.map(\.user), source: session) } }
-                                        .font(.subheadline.weight(.semibold))
-                                        .buttonStyle(.plain)
-                                        .foregroundStyle(.blue)
-                                        .controlSize(.small)
-                                        .frame(minWidth: 44, minHeight: 44)
-                                        .accessibilityLabel("继续核实下一批作者")
-                                        .disabled(unknown.isEmpty)
-                                        .accessibilityIdentifier("leaderboard.activity.next")
-                                }
-                                Menu {
-                                    Button("重试待核实作者") {
-                                        Task { await activity.checkNext(unknown.map(\.user), source: session, retryUnknown: true) }
-                                    }
-                                    .disabled(activity.busy || unknown.isEmpty)
-                                    Button("筛选说明") { showActivityInfo = true }
-                                        .accessibilityIdentifier("leaderboard.activity.info")
-                                } label: {
-                                    Image(systemName: "ellipsis")
-                                        .font(.subheadline.weight(.semibold))
-                                        .frame(width: 44, height: 44)
-                                        .contentShape(Rectangle())
-                                }
-                                .accessibilityLabel("作品更新筛选更多操作")
-                                .accessibilityIdentifier("leaderboard.activity.more")
-                            }
+                    Section {
+                        let results = matching
+                        ForEach(results) { entry in row(entry, startsSection: entry.id == results.first?.id) }
+                        if results.isEmpty && !activity.busy && !activity.checks.isEmpty {
+                            Text(unknown.isEmpty ? "没有符合条件的作者" : "暂未找到符合条件的作者").foregroundStyle(.secondary)
                         }
+                    } header: {
+                        if recent != .any { activityHeader }
                     }
-                    Section(recent == .any ? "榜单作者" : "符合更新范围") {
-                        ForEach(matching) { entry in row(entry) }
-                        if matching.isEmpty { Text("当前已核实作者中没有符合条件的结果").foregroundStyle(.secondary) }
-                    }
-                    if recent != .any && !unknown.isEmpty {
+                    .listSectionSeparator(.hidden)
+                    if recent != .any && !unknown.isEmpty && (!activity.busy || showUnknown) {
+                        let failed = unknown.filter { activity.result(for: $0.id) == .unverified }
                         Section {
                             DisclosureGroup("待核实 · \(unknown.count) 位", isExpanded: $showUnknown) {
+                                if !failed.isEmpty {
+                                    StatusReloadButton(title: "重试待核实作者") {
+                                        Task { await activity.checkNext(failed.map(\.user), source: session, retryUnknown: true) }
+                                    }
+                                        .disabled(activity.busy)
+                                }
                                 ForEach(unknown) { entry in row(entry) }
                             }
                             .accessibilityIdentifier("leaderboard.activity.unknown")
                         }
                     }
-                }.listStyle(.plain).refreshable { await load() }
+                }
+                .listStyle(.plain)
+                .contentMargins(.top, 0, for: .scrollContent)
+                .refreshable { await load() }
                     .overlay(alignment: .bottom) {
-                        if error != nil { Button("刷新失败，点此重试") { Task { await load() } }.padding(12).background(AppTheme.secondarySurface, in: Capsule()).padding() }
+                        if error != nil {
+                            HStack(spacing: 4) {
+                                Text("刷新失败").font(.footnote)
+                                StatusReloadButton { Task { await load() } }
+                            }.padding(.leading, 12).background(AppTheme.secondarySurface, in: Capsule()).padding()
+                        }
                     }
-                    .sheet(isPresented: $showActivityInfo) { CreatorActivityInfoView() }
             }
-        }.task(id: visible) { if visible && !loaded && !loading { await load() } }
+        }.task(id: visible) { if visible && !loaded { await load(replacing: true) } }
             .task(id: activityKey) {
                 guard visible, recent != .any else { return }
                 await activity.checkNext(entries.map(\.user), source: session)
             }
     }
-    private func row(_ entry: LeaderboardEntry) -> some View {
-        NavigationLink { CreatorView(creator: entry.user) } label: {
-            HStack(spacing: 14) {
-                Text(String(format: "%02d", entry.position)).font(.caption.monospacedDigit()).foregroundStyle(.secondary).frame(width: 25)
-                AvatarView(name: entry.user.username)
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(entry.user.username).font(.headline)
-                    if recent == .any { Text("图片／视频").font(.caption).foregroundStyle(.secondary) }
-                    else if case .published(let date) = activity.result(for: entry.id) {
-                        Text("作品发布 " + date.formatted(.dateTime.locale(Locale(identifier: "zh_Hans_CN")).year().month().day())).font(.caption).foregroundStyle(.secondary)
-                    } else { Text("作品更新时间待核实").font(.caption).foregroundStyle(.secondary) }
+    private var activityHeader: some View {
+        HStack(spacing: 8) {
+            Text("符合更新范围")
+                .accessibilityValue(activitySummary)
+                .accessibilityIdentifier("leaderboard.activity.summary")
+            Spacer(minLength: 4)
+            Group {
+                if activity.busy {
+                    ProgressView().controlSize(.small)
+                        .accessibilityLabel("正在核实作品发布时间")
+                        .accessibilityIdentifier("leaderboard.activity.loading")
+                } else if unchecked {
+                    Button {
+                        Task { await activity.checkNext(entries.map(\.user), source: session) }
+                    } label: {
+                        Text("继续").font(.subheadline.weight(.semibold)).foregroundStyle(.blue)
+                            .frame(minWidth: 44, minHeight: 44).contentShape(Rectangle())
+                    }.buttonStyle(.plain)
+                        .accessibilityLabel("继续核实下一批作者")
+                        .accessibilityIdentifier("leaderboard.activity.next")
                 }
-                Spacer()
-                if session.following.contains(entry.user.id) { Image(systemName: "checkmark.circle.fill").foregroundStyle(.blue) }
-            }.padding(.vertical, 7)
+            }.frame(minWidth: 44, minHeight: 44, alignment: .trailing)
         }
+    }
+    private func row(_ entry: LeaderboardEntry, startsSection: Bool = false) -> some View {
+        let shape = FloatingPageChrome.controlShape
+        return NavigationLink { CreatorView(creator: entry.user) } label: {
+            HStack(spacing: 10) {
+                HStack(spacing: FloatingPageChrome.spacing + FloatingPageChrome.groupInset) {
+                    ZStack(alignment: .trailing) {
+                        Text("0000").hidden().accessibilityHidden(true)
+                        Text(String(format: "%02d", entry.position))
+                    }
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: true, vertical: false)
+                    AvatarView(name: entry.user.username, size: 28)
+                }
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(entry.user.username)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                    if recent != .any, case .published(let date) = activity.result(for: entry.id) {
+                        Text(date.formatted(.dateTime.locale(Locale(identifier: "zh_Hans_CN")).year().month().day()))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer(minLength: 0)
+                if session.following.contains(entry.user.id) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.blue)
+                        .accessibilityLabel("已关注")
+                }
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .accessibilityHidden(true)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .frame(minHeight: FloatingPageChrome.controlHeight)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(AppTheme.secondarySurface, in: shape)
+            .contentShape(shape)
+        }
+        .buttonStyle(.plain)
+        .navigationLinkIndicatorVisibility(.hidden)
+        .listRowInsets(EdgeInsets(top: startsSection ? 0 : 2, leading: FloatingPageChrome.pageInset, bottom: 2, trailing: FloatingPageChrome.pageInset))
+        .listRowBackground(Color.clear)
+        .listRowSeparator(.hidden)
         .accessibilityIdentifier("leaderboard.author.\(entry.user.id)")
     }
-    private func load() async {
-        guard !loading else { return }
-        loading = true; error = nil
-        defer { loading = false }
+    private func load(replacing: Bool = false) async {
+        guard replacing || !loading else { return }
+        let request = UUID()
+        loadID = request
+        loading = true
+        error = nil
+        defer {
+            if loadID == request { loading = false }
+        }
         do {
             let value = try await session.leaderboard(board)
-            guard !Task.isCancelled else { return }
-            entries = value.filter { !$0.user.username.isEmpty }; loaded = true
-        } catch { if !Task.isCancelled { self.error = error.localizedDescription } }
-    }
-}
-
-private struct CreatorActivityInfoView: View {
-    @Environment(\.dismiss) private var dismiss
-    var body: some View {
-        NavigationStack {
-            List {
-                Text("筛选依据当前账号可见的已发布图片／视频作品帖。")
-                Text("作者仍按原榜单名次排列。")
-                Text("未知、失败或尚未扫完表示待核实，不代表没有更新。")
-                Text("核实结果缓存 10 分钟。")
-            }
-            .listStyle(.plain)
-            .navigationTitle("作品更新筛选说明")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("完成") { dismiss() }
-                }
-            }
+            guard !Task.isCancelled, loadID == request else { return }
+            entries = value.filter { !$0.user.username.isEmpty }
+            loaded = true
+        } catch {
+            if !Task.isCancelled, loadID == request { self.error = error.localizedDescription }
         }
-        .accessibilityIdentifier("leaderboard.activity.info-sheet")
-        .presentationDetents([.medium, .large])
     }
 }
 
 struct AvatarView: View {
     let name: String
-    var body: some View { Text(String(name.prefix(1)).uppercased()).font(.headline).foregroundStyle(.white).frame(width: 43, height: 43).background(Color(red: 0.18, green: 0.36, blue: 0.43), in: Circle()) }
+    var size: CGFloat = 43
+    var body: some View {
+        Text(String(name.prefix(1)).uppercased())
+            .font(.system(size: size * 0.43, weight: .semibold))
+            .foregroundStyle(.white)
+            .frame(width: size, height: size)
+            .background(Color(red: 0.18, green: 0.36, blue: 0.43), in: Circle())
+    }
 }
 
 struct CreatorView: View {
@@ -205,36 +235,77 @@ struct CreatorView: View {
     @State private var focused: Int?
     @State private var viewerItem: MediaItem?
     @State private var authorBlockError: String?
-    @State private var headerScrollRequest = 0
+    @State private var favoriteBatch = FavoriteBatchSelection()
+    @State private var gridWidth: CGFloat = 0
     private var requestKey: FeedStoreRequestKey { .init(identity: session.feedIdentity, filter: filter, source: .creator(creator)) }
     private var creatorBlocked: Bool { authorBlocklist.contains(id: creator.id) }
+    private let profileAvatarSize: CGFloat = 34
+    private let profileCardInset: CGFloat = 10
     private var creatorIdentityHeader: some View {
-        HStack(spacing: 14) {
-            AvatarView(name: creator.username)
-            VStack(alignment: .leading, spacing: 5) { Text(creator.username).font(.title3.bold()); Text("@" + creator.username).font(.caption).foregroundStyle(.secondary) }
-            Spacer(); FollowButton(creator: creator)
-        }.padding(AppTheme.spacing)
+        HStack(spacing: FloatingPageChrome.spacing) {
+            AvatarView(name: creator.username, size: profileAvatarSize)
+            Text("@" + creator.username).font(.subheadline.weight(.semibold)).lineLimit(1)
+            Spacer(minLength: 6)
+            FollowButton(creator: creator)
+        }
+        .padding(.horizontal, profileCardInset)
+        .padding(.vertical, 3)
+        .background(AppTheme.secondarySurface, in: FloatingPageChrome.controlShape)
+        .padding(.horizontal, FloatingPageChrome.pageInset)
     }
     private var creatorFeedHeader: some View {
         VStack(spacing: 0) {
             creatorIdentityHeader
-            if let authorBlockError { Text(authorBlockError).font(.caption).foregroundStyle(.red).padding(.horizontal, 18) }
-            CreatorBiographyView(creator: creator, onCollapse: { headerScrollRequest += 1 })
-                .padding(.horizontal, 18).padding(.bottom, 12)
-            HStack {
-                Picker("作者媒体类型", selection: Binding(get: { filter.effectiveKind }, set: { filter = filter.selecting(kind: $0) })) { Text(MediaKind.image.title).tag(MediaKind.image); Text(MediaKind.video.title).tag(MediaKind.video) }.pickerStyle(.segmented).accessibilityIdentifier("creator.media-kind")
-                Button { showFilter = true } label: { Image(systemName: "line.3.horizontal.decrease") }.buttonStyle(AppActionButtonStyle()).accessibilityLabel("作者作品筛选")
-            }.padding(.horizontal, 16).padding(.bottom, 14)
-            HStack {
-                Menu {
-                    Picker("时间范围", selection: $filter.period) { ForEach(FeedPeriod.allCases) { Text($0.title).tag($0.rawValue) } }
-                } label: { AppFilterLabel(title: filter.periodTitle, symbol: "calendar") }.buttonStyle(AppActionButtonStyle()).accessibilityLabel("时间范围：" + filter.periodTitle)
-                Spacer()
-                Menu {
-                    Picker("排序方式", selection: $filter.sort) { ForEach(FeedSort.allCases) { Text($0.title).tag($0.rawValue) } }
-                } label: { AppFilterLabel(title: filter.sortTitle, symbol: "arrow.up.arrow.down") }.buttonStyle(AppActionButtonStyle()).accessibilityLabel("排序方式：" + filter.sortTitle)
-            }.font(.subheadline).padding(.horizontal, 20).padding(.bottom, 12)
+            if let authorBlockError { Text(authorBlockError).font(.caption).foregroundStyle(.red).padding(.horizontal, AppTheme.spacing) }
         }
+        .padding(.bottom, 8)
+    }
+    private var floatingBar: some View {
+        HStack(spacing: FloatingPageChrome.groupInset) {
+            FloatingPageBackButton()
+            if creatorBlocked { Spacer() }
+            else {
+                FloatingMediaPicker(title: "作者媒体类型",
+                                    selection: Binding(get: { filter.effectiveKind }, set: selectMediaKind),
+                                    identifier: "creator.media-kind")
+                    .disabled(favoriteBatch.works != nil)
+            }
+            creatorActions.disabled(favoriteBatch.works != nil)
+        }
+    }
+    private var creatorActions: some View {
+        Menu {
+            if !creatorBlocked {
+                Button("筛选作品", systemImage: FloatingPageChrome.filterSymbol) { showFilter = true }
+                    .accessibilityIdentifier("creator.filter")
+            }
+            if !creatorBlocked && feed.requestKey == requestKey && !feed.items.isEmpty {
+                Button("多选收藏", systemImage: "checklist") { favoriteBatch.begin() }
+                    .accessibilityIdentifier("favorite-batch.select")
+            }
+            if let profileURL {
+                Link(destination: profileURL) { Label("在 Civitai 打开", systemImage: "safari") }
+                    .accessibilityIdentifier("creator.open-site")
+                ShareLink(item: profileURL) { Label("分享作者", systemImage: "square.and.arrow.up") }
+                    .accessibilityIdentifier("creator.share")
+                Divider()
+            }
+            if creatorBlocked {
+                Button("取消本机屏蔽", systemImage: "person.crop.circle.badge.checkmark") {
+                    authorBlocklist.remove(id: creator.id); authorBlockError = nil
+                }
+            } else {
+                Button("在本机屏蔽作者", systemImage: "person.crop.circle.badge.xmark", role: .destructive) {
+                    if !authorBlocklist.add(creator) { authorBlockError = "无法加入本机屏蔽名单。" }
+                    else { authorBlockError = nil }
+                }
+            }
+        } label: { FloatingPageIcon(symbol: "ellipsis") }
+        .buttonStyle(FloatingPageButtonStyle(iconOnly: true))
+        .menuOrder(.fixed)
+        .accessibilityLabel("作者更多操作")
+        .accessibilityValue(creatorBlocked ? "" : filter.summary)
+        .accessibilityIdentifier("creator.actions")
     }
     private var profileURL: URL? {
         let username = creator.username.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -259,48 +330,35 @@ struct CreatorView: View {
                     if let authorBlockError { Text(authorBlockError).font(.caption).foregroundStyle(.red) }
                 }
             } else {
-                MediaGrid(feed: feed, emptyDescription: filter.summary + "。可切换媒体类型，或调整时间与内容范围。", resetFilter: { filter = .defaults(for: .creator, kind: filter.kind) }, adjustFilter: { showFilter = true }, isVisible: viewerItem == nil, refreshFromStart: refreshFeed, header: AnyView(creatorFeedHeader), headerScrollRequest: headerScrollRequest, open: { item in focused = item.id; viewerItem = item }) { await feed.next(session: session) }
+                MediaGrid(feed: feed, emptyDescription: filter.summary + "。可切换媒体类型，或调整时间与内容范围。",
+                          isVisible: viewerItem == nil, refreshFromStart: refreshFeed, header: AnyView(creatorFeedHeader),
+                          horizontalInset: AppTheme.spacing, showRoutineTagSummary: false, favoriteSelection: favoriteBatch.works,
+                          beginSelection: { item in
+                    guard feed.requestKey == requestKey else { return }
+                    favoriteBatch.begin(selecting: item.id)
+                }, open: { item in
+                    if favoriteBatch.works != nil { favoriteBatch.toggle(item.id) }
+                    else { focused = item.id; viewerItem = item }
+                }) { await feed.next(session: session) }
+                    .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { gridWidth = $0 }
+                    .simultaneousGesture(DragGesture(minimumDistance: 24).onEnded(handleMediaSwipe))
             }
         }
-        .navigationTitle("作者作品").navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            AppToolbarItem(placement: .topBarTrailing) {
-                Menu {
-                    if let profileURL {
-                        Link(destination: profileURL) { Label("在 Civitai 打开", systemImage: "safari") }
-                            .accessibilityIdentifier("creator.open-site")
-                        ShareLink(item: profileURL) { Label("分享作者", systemImage: "square.and.arrow.up") }
-                            .accessibilityIdentifier("creator.share")
-                        Divider()
-                    }
-                    if creatorBlocked {
-                        Button {
-                            authorBlocklist.remove(id: creator.id); authorBlockError = nil
-                        } label: { Label("取消本机屏蔽", systemImage: "person.crop.circle.badge.checkmark") }
-                    } else {
-                        Button(role: .destructive) {
-                            if !authorBlocklist.add(creator) { authorBlockError = authorBlocklist.error ?? "无法加入本机屏蔽名单。" }
-                            else { authorBlockError = nil }
-                        } label: { Label("在本机屏蔽作者", systemImage: "person.crop.circle.badge.xmark") }
-                    }
-                } label: {
-                    Image(systemName: "ellipsis").frame(minWidth: 44, minHeight: 44)
-                }
-                .accessibilityLabel("作者更多操作")
-                .accessibilityIdentifier("creator.actions")
-                .buttonStyle(AppActionButtonStyle())
+        .avoidOverlaidTabBar()
+        .floatingPageBar("creator.top-bar") { floatingBar }
+        .navigationDestination(isPresented: $showFilter) { FilterView(filter: $filter, context: .creator) }
+        .favoriteBatchBottomBar($favoriteBatch, canManage: !creatorBlocked && feed.requestKey == requestKey)
+        .favoriteBatchEditor($favoriteBatch)
+        .mediaCover(item: $viewerItem) { opening in
+            FeedMediaViewer(items: feed.items, focused: $focused, initialID: opening.id,
+                            continuationState: feed.continuationState,
+                            loadMoreAutomatically: { await feed.nextAutomatically(session: session) },
+                            refreshFromStart: refreshFeed, restartRetryAvailableAt: feed.restartRetryAvailableAt,
+                            onDetailsVisibility: { feed.setTagPolicyDeferred($0) }, title: "作者作品",
+                            onEdgeSwipe: { _, _ in viewerItem = nil },
+                            onOpenAuthor: { _ in viewerItem = nil }, onClose: { viewerItem = nil }) {
+                await feed.next(session: session)
             }
-        }
-        .sheet(isPresented: $showFilter) { FilterView(filter: $filter, allowAll: false, context: .creator) }
-        .fullScreenCover(item: $viewerItem) { opening in
-            ZStack(alignment: .topLeading) {
-                Color.black.ignoresSafeArea()
-                MediaDeck(items: feed.items, focused: $focused, initialID: opening.id,
-                          continuationState: feed.continuationState, loadMoreAutomatically: { await feed.nextAutomatically(session: session) },
-                          refreshFromStart: refreshFeed, restartRetryAvailableAt: feed.restartRetryAvailableAt,
-                          onAuthor: { _ in viewerItem = nil }, onDetailsVisibility: { feed.setTagPolicyDeferred($0) }) { await feed.next(session: session) }
-                CreatorViewerCloseButton { viewerItem = nil }
-            }.preferredColorScheme(.dark)
         }
         .task(id: requestKey) {
             guard !creatorBlocked else { feed.invalidatePendingRequests(); return }
@@ -308,25 +366,31 @@ struct CreatorView: View {
             let commit = await feed.activate(session: session, filter: filter, source: .creator(creator), blockedTags: blocklist.names)
             if !retainedKey && feed.accepts(commit, identity: session.feedIdentity) { focused = nil }
         }
-        .onChange(of: blocklist.names) { _, tags in feed.applyBlockedTags(tags) }
+        .onChange(of: requestKey) { _, _ in favoriteBatch.reset() }
+        .onChange(of: blocklist.names) { _, tags in feed.applyBlockedTags(tags); favoriteBatch.reset() }
         .onChange(of: authorBlocklist.entries) { _, _ in
-            if creatorBlocked { viewerItem = nil; feed.invalidatePendingRequests() }
+            if creatorBlocked { viewerItem = nil; feed.invalidatePendingRequests(); favoriteBatch.reset() }
             else { Task { _ = await feed.activate(session: session, filter: filter, source: .creator(creator), blockedTags: blocklist.names) } }
         }
         .ordinaryAppearance()
-        .appNavigationBack()
     }
+    private func selectMediaKind(_ kind: MediaKind) {
+        guard filter.effectiveKind != kind else { return }
+        filter = filter.selecting(kind: kind)
+    }
+
+    private func handleMediaSwipe(_ drag: DragGesture.Value) {
+        // Leave the edge touch to the navigation stack's interactive pop.
+        let distanceFromEdge = min(drag.startLocation.x, gridWidth - drag.startLocation.x)
+        let dx = drag.translation.width
+        guard viewerItem == nil, !showFilter, favoriteBatch.works == nil,
+              distanceFromEdge > ScreenEdgeGesture.width,
+              abs(dx) >= 48, abs(dx) > abs(drag.translation.height) * 1.4 else { return }
+        selectMediaKind(dx < 0 ? .video : .image)
+    }
+
     private func refreshFeed() async {
         if await feed.restartCurrentFeed(session: session)?.status == .committed { focused = feed.items.first?.id }
-    }
-}
-
-private struct CreatorViewerCloseButton: View {
-    let close: () -> Void
-    @ObservedObject private var chrome = ViewingChromeController.shared
-    var body: some View {
-        Button(action: close) { Image(systemName: "xmark").foregroundStyle(.white).padding(15).background(.black.opacity(0.4), in: Circle()) }
-            .padding(15).accessibilityLabel("关闭作品").viewingChromeHidden(chrome.hidden)
     }
 }
 
@@ -341,11 +405,11 @@ extension FeedStore {
 
 struct MediaGrid: View {
     @ObservedObject var feed: FeedStore
+    var previewItems: [MediaItem]? = nil
+    var waitingForPreviewOpen: Int? = nil
     var continuationState: FeedContinuationState? = nil
     @EnvironmentObject private var session: SiteSession
     var emptyDescription: String? = nil
-    var resetFilter: (() -> Void)? = nil
-    var adjustFilter: (() -> Void)? = nil
     var anchor: Binding<Int?>? = nil
     var scrollRequest = 0
     var loadsOnAppearance = true
@@ -354,7 +418,10 @@ struct MediaGrid: View {
     var loadMoreAutomatically: (() async -> Void)? = nil
     var refreshFromStart: (() async -> Void)? = nil
     var header: AnyView? = nil
-    var headerScrollRequest = 0
+    var horizontalInset: CGFloat = 10
+    var showRoutineTagSummary = true
+    var favoriteSelection: Set<Int>? = nil
+    var beginSelection: ((MediaItem) -> Void)? = nil
     let open: (MediaItem) -> Void
     let loadMore: () async -> Void
     @State private var userScrolled = false
@@ -388,35 +455,44 @@ struct MediaGrid: View {
                     .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 16)
             }
             if feed.duplicatesDiscarded > 0 { Text("已去除 \(feed.duplicatesDiscarded) 项重复结果").font(.caption).foregroundStyle(.secondary).padding(.horizontal, 16).padding(.vertical, 6) }
-            if feed.hiddenByTags > 0 || feed.unverifiedTags > 0 {
+            if feed.unverifiedTags > 0 || (feed.hiddenByTags > 0 && (showRoutineTagSummary || (previewItems ?? feed.items).isEmpty)) {
                 Text("标签屏蔽已隐藏 \(feed.hiddenByTags) 项；\(feed.unverifiedTags) 项标签待核实，暂不展示。").font(.caption).foregroundStyle(.secondary).padding(.horizontal, 16).padding(.vertical, 8)
             }
             if feed.hiddenByAuthors > 0 {
                 Text("本机作者屏蔽隐藏 \(feed.hiddenByAuthors) 项；取消屏蔽后可重新显示。").font(.caption).foregroundStyle(.secondary).padding(.horizontal, 16).padding(.vertical, 6)
             }
             LazyVGrid(columns: [.init(.flexible(), spacing: 8), .init(.flexible(), spacing: 8)], spacing: 8) {
-                ForEach(feed.items) { item in
-                    MediaGridCell(item: item, blurred: (session.account?.blurNsfw ?? true) && ((item.browsingLevel ?? 1) & 28 != 0)) { open(item) }
+                ForEach(previewItems ?? feed.items) { item in
+                    MediaGridCell(item: item, blurred: (session.account?.blurNsfw ?? true) && ((item.browsingLevel ?? 1) & 28 != 0),
+                                  favoriteSelected: favoriteSelection?.contains(item.id),
+                                  beginSelection: beginSelection.map { select in { select(item) } }) { open(item) }
+                        .overlay {
+                            if waitingForPreviewOpen == item.id {
+                                ProgressView().controlSize(.small).tint(.white).padding(10)
+                                    .background(.black.opacity(0.65), in: Circle())
+                                    .allowsHitTesting(false).accessibilityLabel("正在更新收藏")
+                            }
+                        }
                         .onAppear {
                             visibleCells.insert(item.id)
                         }
                         .onDisappear { visibleCells.remove(item.id) }
                 }
-            }.scrollTargetLayout().padding(.horizontal, 10)
-            FeedContinuationStatusView(state: continuationStatus, empty: feed.items.isEmpty,
-                                       performing: continuationAction != nil, restartRetryAvailableAt: feed.restartRetryAvailableAt,
-                                       retry: { startExplicitAction(loadMore) },
-                                       restart: { startExplicitAction(refreshFromStart ?? { _ = await feed.restartCurrentFeed(session: session) }) },
-                                       adjust: adjustFilter).padding(.vertical, 16)
-            if feed.items.isEmpty, continuationStatus == .ended {
-                if let emptyDescription { Text(emptyDescription).font(.caption).foregroundStyle(.secondary).padding(.horizontal, 20) }
-                if let resetFilter { Button("重置筛选", action: resetFilter).frame(minHeight: 44) }
+            }.scrollTargetLayout().padding(.horizontal, horizontalInset)
+            if previewItems == nil || continuationStatus.failure != nil {
+                FeedContinuationStatusView(state: continuationStatus, empty: (previewItems ?? feed.items).isEmpty,
+                                           performing: continuationAction != nil, restartRetryAvailableAt: feed.restartRetryAvailableAt,
+                                           retry: { startExplicitAction(loadMore) },
+                                           restart: { startExplicitAction(refreshFromStart ?? { _ = await feed.restartCurrentFeed(session: session) }) })
+                    .padding(.vertical, 16)
+            }
+            if feed.items.isEmpty, continuationStatus == .ended, let emptyDescription {
+                Text(emptyDescription).font(.caption).foregroundStyle(.secondary).padding(.horizontal, 20)
             }
         }
         .modifier(MediaGridPosition(anchor: anchor))
         .onAppear { if let id = anchor?.wrappedValue { proxy.scrollTo(id, anchor: .top) } }
         .onChange(of: scrollRequest) { _, _ in userScrolled = false; if let id = anchor?.wrappedValue { proxy.scrollTo(id, anchor: .top) } }
-        .onChange(of: headerScrollRequest) { _, _ in withAnimation(.easeInOut(duration: 0.2)) { proxy.scrollTo(-1001, anchor: .top) } }
         .task(id: automaticLoadKey) {
             let key = automaticLoadKey
             guard key.active, key.permitted, key.demanded, feed.canAutomaticallyContinue else { return }
@@ -442,7 +518,7 @@ struct MediaGrid: View {
         #if DEBUG && targetEnvironment(simulator)
         .overlay(alignment: .topLeading) {
             if CollectionPagingQA.enabled {
-                Text("count=\(feed.items.count);loading=\(feed.loading);error=\(feed.error ?? "none")")
+                Text(verbatim: "count=\(feed.items.count);loading=\(feed.loading);error=\(feed.error ?? "none")")
                     .font(.system(size: 1)).frame(width: 1, height: 1).opacity(0.01).allowsHitTesting(false)
                     .accessibilityIdentifier("collection.qa.grid")
             }
@@ -475,6 +551,8 @@ private struct MediaGridPosition: ViewModifier {
 private struct MediaGridCell: View {
     let item: MediaItem
     let blurred: Bool
+    var favoriteSelected: Bool? = nil
+    var beginSelection: (() -> Void)? = nil
     let open: () -> Void
     @State private var failure: String?
     @State private var retry = 0
@@ -497,7 +575,7 @@ private struct MediaGridCell: View {
                                          failure = failed ? "封面暂时无法加载" : nil
                                      }, showsFailure: false,
                                      placeholderTitle: "视频 · #\(item.id)\(item.username.map { " · \($0)" } ?? "")", imageBlur: blurred ? 20 : 0)
-                    } else if let url = item.mediaURL {
+                    } else if let url = item.mediaURL ?? (item.isVideo ? item.posterURL : nil) {
                         CachedImage(url: url, allowsRetry: false, retryToken: retry, showsFailure: false,
                                     onFailureMessage: { message in
                                         #if DEBUG && targetEnvironment(simulator)
@@ -505,7 +583,7 @@ private struct MediaGridCell: View {
                                         #endif
                                         failure = message
                                     },
-                                    placeholderTitle: "图片 · #\(item.id)\(item.username.map { " · \($0)" } ?? "")", imageBlur: blurred ? 20 : 0)
+                                    placeholderTitle: coverTitle, imageBlur: blurred ? 20 : 0)
                     } else {
                         ZStack {
                             Color.secondary.opacity(0.1)
@@ -513,10 +591,13 @@ private struct MediaGridCell: View {
                                 title: "\(item.isVideo ? "视频" : "图片") · #\(item.id)\(item.username.map { " · \($0)" } ?? "")")
                         }
                     }
-                }.opacity(failure == nil ? 1 : 0).frame(height: cardHeight).contentShape(Rectangle())
+                }.opacity(failure == nil || favoriteSelected != nil ? 1 : 0).frame(height: cardHeight).contentShape(Rectangle())
             }.buttonStyle(.plain).accessibilityLabel("\(item.isVideo ? "视频" : "图片") \(item.id)")
+                .highPriorityGesture(LongPressGesture(minimumDuration: 0.45, maximumDistance: 12)
+                    .onEnded { _ in beginSelection?() }, including: beginSelection == nil ? .none : .all)
+                .accessibilityAddTraits(favoriteSelected == true ? .isSelected : [])
                 .accessibilityIdentifier("media.grid.cell.\(item.id)")
-            if item.isVideo {
+            if item.isVideo && favoriteSelected == nil {
                 Image(systemName: "play.fill").font(.caption).foregroundStyle(.white).padding(8).background(.black.opacity(0.4), in: Circle()).padding(8).allowsHitTesting(false)
             }
             if let failure {
@@ -524,8 +605,15 @@ private struct MediaGridCell: View {
                                         retryLabel: item.isVideo ? "重试封面" : "重试图片",
                                         retryIdentifier: "media.grid.retry.\(item.id)", retry: { retry += 1 })
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .allowsHitTesting(favoriteSelected == nil)
+                    .accessibilityHidden(favoriteSelected != nil)
             }
         }.frame(height: cardHeight).clipShape(RoundedRectangle(cornerRadius: 9))
+        .overlay(alignment: .topTrailing) {
+            if let favoriteSelected {
+                FavoriteSelectionMark(selected: favoriteSelected, onMedia: true).padding(9).allowsHitTesting(false)
+            }
+        }
         #if DEBUG && targetEnvironment(simulator)
         .overlay(alignment: .bottomLeading) {
             if ProcessInfo.processInfo.arguments.contains("--qa-grid-retry55") {
@@ -587,46 +675,61 @@ struct FollowingView: View {
                 ContentUnavailableView { Label("登录后查看关注", systemImage: "star") } description: { Text("与 Civitai 账号同步关注关系。") } actions: { Button("登录 Civitai") { session.openLogin() }.buttonStyle(AppActionButtonStyle(tone: .accent)) }
             } else {
                 List {
-                    Section {
-                        Picker("关注作者排序", selection: $sortRaw) {
-                            ForEach(FollowingSort.allCases) { value in Text(value.title).tag(value.rawValue) }
-                        }.pickerStyle(.segmented)
-                        Button {
-                            if sort == .followed { reverseTime.toggle() } else { reverseName.toggle() }
-                        } label: {
-                            HStack {
-                                Label(sort == .followed ? "关注时间" : "名称顺序", systemImage: "arrow.up.arrow.down")
-                                Spacer()
-                                Text(sort == .followed ? (reverse ? "最早关注在前" : "最近关注在前") : (reverse ? "Z–A" : "A–Z")).foregroundStyle(.secondary)
-                            }
-                        }
-                    } footer: {
-                        Text(sort == .followed ? "按站点记录的真实关注时间排列。重新关注会按新的关注时间排序。" : "按作者昵称排序，忽略大小写，并将名称中的数字按数值排列。")
-                    }
-                    if current, store.complete {
-                        Section("已关注 \(store.creators.count) 位") {
-                            ForEach(store.ordered(sort, reverse: reverse)) { creator in
-                            NavigationLink { CreatorView(creator: creator) } label: { HStack(spacing: 12) { AvatarView(name: creator.username); Text(creator.username) }.padding(.vertical, 5) }
-                            }
-                            if store.creators.isEmpty { Text("你还没有关注作者").foregroundStyle(.secondary) }
-                        }
-                    } else {
+                    Group {
                         Section {
-                            if !current || store.loading { ProgressView("正在读取关注作者…") }
-                            if current, store.totalItems > 0 { Text("已读取 \(store.creators.count) / \(store.totalItems) 位").font(.subheadline).foregroundStyle(.secondary) }
-                            if current, let error = store.error {
-                                Text(error).font(.caption).foregroundStyle(.secondary)
-                                Button("重新加载关注列表") { Task { await load(force: true) } }
-                            } else if current, store.canContinue, !store.loading {
-                                Button("继续读取关注作者") { Task { await store.nextBatch(source: session) } }
+                            FloatingSegmentedControl(title: "关注作者排序",
+                                                     selection: Binding(get: { sort }, set: { sortRaw = $0.rawValue }),
+                                                     options: FollowingSort.allCases, optionTitle: { $0.title },
+                                                     identifier: "following.sort")
+                            Button {
+                                if sort == .followed { reverseTime.toggle() } else { reverseName.toggle() }
+                            } label: {
+                                HStack {
+                                    Label(sort == .followed ? "关注时间" : "名称顺序", systemImage: "arrow.up.arrow.down")
+                                    Spacer()
+                                    Text(sort == .followed ? (reverse ? "最早关注在前" : "最近关注在前") : (reverse ? "Z–A" : "A–Z")).foregroundStyle(.secondary)
+                                }
                             }
                         } footer: {
-                            Text("完整读取后统一排序。作者较多时会分批加载，避免只对部分作者排序。")
+                            FloatingCardListNote(sort == .followed ? "按站点记录的真实关注时间排列。重新关注会按新的关注时间排序。" : "按作者昵称排序，忽略大小写，并将名称中的数字按数值排列。")
+                        }
+                        if current, store.complete {
+                            Section("已关注 \(store.creators.count) 位") {
+                                ForEach(store.ordered(sort, reverse: reverse)) { creator in
+                                NavigationLink { CreatorView(creator: creator) } label: { HStack(spacing: 12) { AvatarView(name: creator.username); Text(creator.username) }.padding(.vertical, 5) }
+                                }
+                                if store.creators.isEmpty { Text("你还没有关注作者").foregroundStyle(.secondary) }
+                            }
+                        } else {
+                            Section {
+                                if !current || store.loading { ProgressView("正在读取关注作者…") }
+                                if current, store.totalItems > 0 { Text("已读取 \(store.creators.count) / \(store.totalItems) 位").font(.subheadline).foregroundStyle(.secondary) }
+                                if current, let error = store.error {
+                                    HStack(spacing: FloatingPageChrome.spacing) {
+                                        Text(error).font(.caption).foregroundStyle(.secondary)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                        Spacer(minLength: 0)
+                                        StatusReloadButton(title: "重新加载关注列表") { Task { await load(force: true) } }
+                                    }
+                                } else if current, store.canContinue, !store.loading {
+                                    Button("继续读取关注作者") { Task { await store.nextBatch(source: session) } }
+                                }
+                            } footer: {
+                                FloatingCardListNote("完整读取后统一排序。作者较多时会分批加载，避免只对部分作者排序。")
+                            }
                         }
                     }
-                }.listStyle(.insetGrouped).id(orderIdentity).refreshable { await load(force: true) }
+                    .floatingCardListRows()
+                }
+                .accessibilityIdentifier("following.card-list")
+                .listStyle(.plain)
+                .listRowSpacing(FloatingPageChrome.groupInset)
+                .id(orderIdentity)
+                .refreshable { await load(force: true) }
             }
-        }.navigationTitle("我的关注").task(id: key) { await load(force: false) }.ordinaryAppearance().appNavigationBack()
+        }
+        .avoidOverlaidTabBar(constrainViewport: true)
+        .floatingTitleBar("我的关注").task(id: key) { await load(force: false) }.ordinaryAppearance()
     }
     private func load(force: Bool) async {
         guard !Task.isCancelled else { return }

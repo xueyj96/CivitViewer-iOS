@@ -138,7 +138,6 @@ struct VideoSeekControl: UIViewRepresentable {
     var duration: Double
     var bufferedRanges: [SeekTimeRange]
     var enabled: Bool
-    var interactionActive: Bool = false
     let onSeek: (Double, MediaPanPhase) -> Void
     var onInteractionChange: ((Bool) -> Void)? = nil
 
@@ -170,7 +169,6 @@ struct VideoSeekControl: UIViewRepresentable {
     final class SeekTrackView: UIControl {
         var positionFraction: CGFloat = 0 { didSet { setNeedsDisplay() } }
         var bufferedSegments: [SeekTimeRange] = [] { didSet { if oldValue != bufferedSegments { setNeedsDisplay() } } }
-        var emphasized = false { didSet { setNeedsDisplay() } }
         var controlEnabled = true { didSet { isUserInteractionEnabled = controlEnabled; alpha = controlEnabled ? 1 : 0.55 } }
         var durationValue: Double = 0
         var positionValue: Double = 0
@@ -201,21 +199,19 @@ struct VideoSeekControl: UIViewRepresentable {
         override func draw(_ rect: CGRect) {
             guard let context = UIGraphicsGetCurrentContext() else { return }
             context.clear(rect)
-            let horizontalInset: CGFloat = 6
-            let trackHeight: CGFloat = emphasized ? 4 : 2
-            // Keep the full 44-point hit area while drawing closer to the author row.
-            let trackCenterY = min(bounds.midY, 12)
-            let trackRect = CGRect(x: horizontalInset, y: trackCenterY - trackHeight / 2,
-                                   width: max(0, bounds.width - horizontalInset * 2), height: trackHeight)
+            let trackHeight: CGFloat = 2.5
+            let trackCenterY = min(bounds.midY, 18)
+            let trackRect = CGRect(x: 0, y: trackCenterY - trackHeight / 2,
+                                   width: bounds.width, height: trackHeight)
             guard trackRect.width > 0 else { return }
             let trackPath = CGPath(roundedRect: trackRect, cornerWidth: trackHeight / 2,
                                    cornerHeight: trackHeight / 2, transform: nil)
-            let baseColor = UIColor(white: 0.25, alpha: 0.6)
+            let baseColor = UIColor.white.withAlphaComponent(0.30)
             context.setFillColor(baseColor.cgColor)
             context.addPath(trackPath); context.fillPath()
             context.saveGState()
             context.addPath(trackPath); context.clip()
-            context.setFillColor(UIColor.white.withAlphaComponent(0.48).cgColor)
+            context.setFillColor(UIColor.white.withAlphaComponent(0.32).cgColor)
             for interval in bufferedSegments {
                 let bufferedRect = CGRect(x: trackRect.minX + trackRect.width * interval.start,
                                           y: trackRect.minY, width: trackRect.width * (interval.end - interval.start),
@@ -229,12 +225,6 @@ struct VideoSeekControl: UIViewRepresentable {
                 context.fill(playedRect)
             }
             context.restoreGState()
-            if emphasized {
-                let centerY = trackRect.midY
-                let thumb = CGRect(x: trackRect.minX + playedWidth - 5, y: centerY - 5, width: 10, height: 10)
-                context.setFillColor(UIColor.white.cgColor)
-                context.fillEllipse(in: thumb)
-            }
         }
     }
 
@@ -263,7 +253,6 @@ struct VideoSeekControl: UIViewRepresentable {
             view.durationValue = value.duration
             view.positionValue = value.position
             view.controlEnabled = value.enabled && value.duration.isFinite && value.duration > 0
-            view.emphasized = tracking || value.interactionActive
             if !tracking {
                 view.positionFraction = fraction(value.position, duration: value.duration)
             }
@@ -327,7 +316,6 @@ struct VideoSeekControl: UIViewRepresentable {
         func cancelDrag() {
             guard tracking else { return }
             tracking = false
-            updateEmphasis()
             lastFraction = fraction(startPosition, duration: configuration.duration)
             view?.positionFraction = CGFloat(lastFraction)
             configuration.onSeek(lastFraction, .cancelled)
@@ -344,24 +332,17 @@ struct VideoSeekControl: UIViewRepresentable {
         private func beginInteraction() {
             guard !tracking else { return }
             tracking = true
-            updateEmphasis()
             configuration.onInteractionChange?(true)
         }
 
         private func endInteraction() {
             guard tracking else { return }
             tracking = false
-            updateEmphasis()
             configuration.onInteractionChange?(false)
         }
 
-        private func updateEmphasis() {
-            view?.emphasized = tracking || configuration.interactionActive
-        }
-
         private func touchFraction(_ x: CGFloat, width: CGFloat) -> Double {
-            let adjusted = min(max(x, 6), max(6, width - 6))
-            return Double((adjusted - 6) / max(1, width - 12))
+            return Double(min(max(x, 0), width) / max(1, width))
         }
 
         private func fraction(_ value: Double, duration: Double) -> Double {

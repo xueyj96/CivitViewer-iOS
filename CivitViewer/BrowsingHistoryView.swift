@@ -5,7 +5,7 @@ struct BrowsingHistoryView: View {
     @ObservedObject private var history = BrowsingHistory.shared
     @ObservedObject private var blocklist = TagBlocklist.shared
     @ObservedObject private var authorBlocklist = AuthorBlocklist.shared
-    @State private var kind: MediaKind = .all
+    @State private var kind: MediaKind = .image
     @State private var query = ""
     @State private var limit = 30
     @State private var verified: [Int: MediaItem] = [:]
@@ -14,13 +14,14 @@ struct BrowsingHistoryView: View {
     @State private var loadError = false
     @State private var validatedIdentity: String?
     @State private var clearConfirmation = false
+    @State private var favoriteBatch = FavoriteBatchSelection()
     @State private var request: HistoryPlaybackRequest?
     private var context: HistoryContext? { history.context(ownerID: session.tagLibraryOwnerID) }
     private var matching: [HistoryRecord] {
         let keyword = query.trimmingCharacters(in: .whitespacesAndNewlines)
         return history.records.filter { record in
             !authorBlocklist.blocks(record) &&
-            (kind == .all || record.kind == kind) &&
+            record.kind == kind &&
             (keyword.isEmpty || (record.authorName ?? "").localizedCaseInsensitiveContains(keyword) || String(record.id).contains(keyword))
         }
     }
@@ -41,69 +42,90 @@ struct BrowsingHistoryView: View {
 
     var body: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 22) {
-                VStack(alignment: .leading, spacing: 15) {
-                    HStack(alignment: .firstTextBaseline) {
-                        Text("\(history.records.count)").font(.system(size: 36, weight: .semibold, design: .rounded)).monospacedDigit()
-                        Text("条最近浏览").font(.subheadline).foregroundStyle(.secondary)
-                        Spacer()
-                        Image(systemName: "clock.arrow.circlepath").font(.title2).foregroundStyle(.blue)
-                    }
-                    Toggle("记录浏览历史", isOn: Binding(get: { history.recordingEnabled }, set: { value in
+            LazyVStack(alignment: .leading, spacing: FloatingPageChrome.spacing) {
+                HStack(spacing: FloatingPageChrome.spacing) {
+                    FloatingPageIcon(symbol: "magnifyingglass").foregroundStyle(.secondary).accessibilityHidden(true)
+                    TextField("作者名或作品编号", text: $query)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                }
+                .font(FloatingPageChrome.controlFont)
+                .padding(.horizontal, FloatingPageChrome.cardInset)
+                .frame(height: FloatingPageChrome.controlHeight)
+                .background(AppTheme.secondarySurface, in: FloatingPageChrome.controlShape)
+
+                SettingsControlCard {
+                    Toggle(isOn: Binding(get: { history.recordingEnabled }, set: { value in
                         if let context { history.setRecordingEnabled(value, context: context) }
-                    })).disabled(context == nil)
-                    Text(history.recordingEnabled ? "画面显示后停留 2 秒记入，保留 30 天，最多 5,000 条。" : "已暂停新增记录和保存播放位置，已有历史保留。")
-                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                    if !authorBlocklist.entries.isEmpty {
-                        Text("本机作者屏蔽只隐藏对应历史条目；记录仍保留，取消屏蔽后可重新显示。")
-                            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    })) {
+                        SettingsRowLabel("记录浏览历史", "clock.arrow.circlepath")
                     }
-                }.padding(18).background(.background, in: RoundedRectangle(cornerRadius: 20))
+                    .disabled(context == nil)
+                    .accessibilityHint("保留最近 30 天的记录，最多 5,000 条")
+                }
 
                 if !history.checkpoints.isEmpty {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("接着看").font(.headline)
-                        ForEach(history.checkpoints, id: \.lane) { checkpoint in
+                    Text("接着看").font(.caption).foregroundStyle(.secondary)
+                        .accessibilityAddTraits(.isHeader)
+                    ForEach(history.checkpoints, id: \.lane) { checkpoint in
+                        SettingsControlCard {
                             Button {
                                 if let context { request = .init(checkpoint: checkpoint, context: context, resumePosition: history.resumePosition(for: checkpoint.focusedID)) }
                             } label: {
-                                HStack(spacing: 13) {
-                                    Image(systemName: checkpoint.lane == .following ? "person.2" : "play.rectangle").font(.title3).frame(width: 26)
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text(checkpoint.lane.title + "时间线").font(.subheadline.weight(.semibold)).foregroundStyle(.primary)
-                                        Text(checkpoint.filter.effectiveKind.chineseTitle + " · " + checkpoint.updatedAt.formatted(.relative(presentation: .named).locale(Locale(identifier: "zh_Hans_CN")))).font(.caption).foregroundStyle(.secondary)
+                                HStack(spacing: FloatingPageChrome.spacing) {
+                                    Image(systemName: checkpoint.lane == .following ? "person.2" : "play.rectangle")
+                                        .frame(width: 22).accessibilityHidden(true)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(checkpoint.lane.title + "时间线").font(.subheadline.weight(.medium))
+                                        Text(checkpoint.filter.effectiveKind.chineseTitle + " · " + checkpoint.updatedAt.formatted(.relative(presentation: .named).locale(Locale(identifier: "zh_Hans_CN"))))
+                                            .font(.caption).foregroundStyle(.secondary)
                                     }
-                                    Spacer(); Image(systemName: "play.circle.fill").font(.title2)
-                                }.padding(14).background(.background, in: RoundedRectangle(cornerRadius: 15))
-                            }.buttonStyle(.plain).foregroundStyle(.blue).disabled(context == nil)
+                                    Spacer()
+                                    FloatingPageIcon(symbol: "play.fill").foregroundStyle(.tint)
+                                }
+                                .padding(.vertical, FloatingPageChrome.groupInset)
+                                .frame(minHeight: FloatingPageChrome.controlHeight)
+                                .contentShape(Rectangle())
+                            }.buttonStyle(.plain).disabled(context == nil)
                         }
                     }
                 }
 
-                Picker("历史媒体类型", selection: $kind) { ForEach(MediaKind.allCases) { Text($0.chineseTitle).tag($0) } }.pickerStyle(.segmented)
+                FloatingMediaPicker(title: "历史媒体类型", selection: $kind, identifier: "history.media-kind")
                 if let error = history.error {
-                    VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 8) {
                         Text(error).font(.subheadline)
-                        Button("重新读取") { Task { await history.retry(ownerID: session.tagLibraryOwnerID, identity: session.tagLibraryIdentity) } }
+                        StatusReloadButton(title: "重新读取浏览记录") {
+                            Task { await history.retry(ownerID: session.tagLibraryOwnerID, identity: session.tagLibraryIdentity) }
+                        }
                     }
                 }
                 if history.ready && matching.isEmpty {
-                    ContentUnavailableView(query.isEmpty ? "还没有浏览记录" : "没有匹配的浏览记录", systemImage: "clock", description: Text(query.isEmpty ? "在作品画面停留两秒，之后可以从这里找回。" : "可按作者名或作品编号查找。"))
+                    PageStatusCard(title: history.records.isEmpty ? "还没有浏览记录" : "没有匹配的浏览记录", symbol: "clock")
                 }
                 ForEach(dayGroups, id: \.0) { day, rows in
                     VStack(alignment: .leading, spacing: 12) {
                         Text(dayTitle(day)).font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
                         VStack(spacing: 0) {
                             ForEach(rows) { record in
-                                Button { open(record) } label: { historyRow(record) }.buttonStyle(.plain).accessibilityIdentifier("history.item.\(record.id)")
+                                Button {
+                                    if favoriteBatch.works != nil { favoriteBatch.toggle(record.id) }
+                                    else { open(record) }
+                                } label: { historyRow(record) }
+                                    .buttonStyle(.plain)
+                                    .disabled(favoriteBatch.works != nil && verified[record.id] == nil)
+                                    .accessibilityAddTraits(favoriteBatch.works?.contains(record.id) == true ? .isSelected : [])
+                                    .accessibilityIdentifier("history.item.\(record.id)")
                                     .contextMenu {
-                                        Button("从历史中删除", systemImage: "trash", role: .destructive) {
-                                            if let context { history.remove(ids: [record.id], context: context) }
+                                        if favoriteBatch.works == nil {
+                                            Button("从历史中删除", systemImage: "trash", role: .destructive) {
+                                                if let context { history.remove(ids: [record.id], context: context) }
+                                            }
                                         }
                                     }
                                 if record.id != rows.last?.id { Divider().padding(.leading, 86) }
                             }
-                        }.background(.background, in: RoundedRectangle(cornerRadius: 18))
+                        }.background(AppTheme.secondarySurface, in: FloatingPageChrome.controlShape)
                     }
                 }
                 if loading { ProgressView("正在核对作品…").frame(maxWidth: .infinity) }
@@ -111,29 +133,36 @@ struct BrowsingHistoryView: View {
                     Text("\(page.count - visible.count) 项因屏蔽标签或标签待核实暂不展示。").font(.caption).foregroundStyle(.secondary)
                 }
                 if loadError {
-                    Button("作品信息暂未取得，点此重试") { Task { await hydrate(retry: true) } }.font(.subheadline)
+                    HStack(spacing: 8) {
+                        Text("作品信息暂未取得").font(.subheadline).foregroundStyle(.secondary)
+                        StatusReloadButton { Task { await hydrate(retry: true) } }
+                    }
                 }
-                if limit < matching.count { Button("展开更多记录") { limit += 30 }.frame(maxWidth: .infinity).padding(12) }
-                Text("浏览记录只保存在当前账号的本机空间。打开作品时重新核对账号可见范围；清理历史不会删除收藏或缓存文件。")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            }.padding(18)
-        }.background(Color(uiColor: .systemGroupedBackground))
-            .navigationTitle("最近浏览").navigationBarTitleDisplayMode(.large)
-            .searchable(text: $query, prompt: "作者名或作品编号")
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
+                if limit < matching.count { Button("加载更多记录") { limit += 30 }.frame(maxWidth: .infinity).padding(12) }
+            }
+            .pageScrollContentInsets()
+        }
+            .scrollDismissesKeyboard(.interactively)
+            .ordinaryAppearance()
+            .floatingTitleBar("最近浏览") {
+                FavoriteBatchToolbar(selection: $favoriteBatch, canSelect: context != nil && visible.contains { verified[$0.id] != nil })
+                if favoriteBatch.works == nil {
                     Button("清空", role: .destructive) { clearConfirmation = true }.disabled(history.records.isEmpty || context == nil)
                 }
             }
+            .favoriteBatchEditor($favoriteBatch)
             .confirmationDialog("清空本机浏览记录与接着看位置？", isPresented: $clearConfirmation, titleVisibility: .visible) {
                 Button("清空浏览历史", role: .destructive) { if let context { history.clear(context: context) } }
             } message: { Text("仅清理当前账号的浏览历史。收藏、离线文件和时间线缓存会保留。") }
             .task(id: loadKey) { await hydrate() }
             .onChange(of: session.tagLibraryIdentity) { _, _ in verified = [:]; checked = []; request = nil }
-            .onChange(of: session.feedIdentity) { _, _ in verified = [:]; checked = [] }
+            .onChange(of: session.feedIdentity) { _, _ in verified = [:]; checked = []; favoriteBatch.reset() }
+            .onChange(of: context) { _, _ in favoriteBatch.reset() }
+            .onChange(of: blocklist.names) { _, _ in favoriteBatch.reset() }
+            .onChange(of: authorBlocklist.entries) { _, _ in favoriteBatch.reset() }
             .onChange(of: kind) { _, _ in limit = 30 }
             .onChange(of: query) { _, _ in limit = 30 }
-            .fullScreenCover(item: $request) { HistoryPlaybackView(request: $0) }
+            .mediaCover(item: $request) { HistoryPlaybackView(request: $0) }
     }
 
     private func historyRow(_ record: HistoryRecord) -> some View {
@@ -156,7 +185,11 @@ struct BrowsingHistoryView: View {
                 }
             }
             Spacer(minLength: 2)
-            Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
+            if let works = favoriteBatch.works {
+                FavoriteSelectionMark(selected: works.contains(record.id))
+            } else {
+                Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
+            }
         }.padding(14).contentShape(Rectangle())
     }
     private func open(_ record: HistoryRecord) {
@@ -206,11 +239,11 @@ struct HistoryPlaybackView: View {
     let request: HistoryPlaybackRequest
     var onLatest: (() -> Void)? = nil
     @EnvironmentObject private var session: SiteSession
-    @Environment(\.ordinaryColorScheme) private var ordinaryScheme
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var history = BrowsingHistory.shared
     @ObservedObject private var blocklist = TagBlocklist.shared
     @ObservedObject private var authorBlocklist = AuthorBlocklist.shared
+    @ObservedObject private var chrome = ViewingChromeController.shared
     @State private var items: [MediaItem] = []
     @State private var focused: Int?
     @State private var creator: CreatorRoute?
@@ -229,42 +262,45 @@ struct HistoryPlaybackView: View {
         return request.resumePosition.map { [request.focusedID: $0] } ?? [:]
     }
     var body: some View {
-        NavigationStack {
+        PlaybackNavigation(creator: $creator) { openAuthor in
             ZStack(alignment: .top) {
                 Color.black.ignoresSafeArea()
                 if !currentItems.isEmpty {
                     MediaDeck(items: currentItems, focused: $focused, initialID: request.focusedID,
-                              isVisible: navigationVisible, showsLoadMore: false, onAuthor: { creator = $0 },
+                              isVisible: navigationVisible, showsLoadMore: false, onAuthor: openAuthor,
                               historyCheckpoint: { item in
                         guard let lane = request.lane, let filter = request.filter else { return nil }
                         return TimelineCheckpoint.window(lane: lane, filter: filter, items: currentItems, focusedID: item.id)
                     }, resumePositions: resumePositions,
                               endAction: onLatest == nil ? nil : latest) {}
-                } else if loading { ProgressView("正在核对作品…").tint(.white).foregroundStyle(.white).frame(maxHeight: .infinity) }
+                } else if loading {
+                    ProgressView().tint(.white).frame(maxHeight: .infinity).accessibilityLabel("正在核对作品")
+                }
                 else {
                     ContentUnavailableView { Label("这段内容暂不可用", systemImage: "photo.badge.exclamationmark") } description: {
                         Text(message ?? "作品可能已不在当前可见范围，或被当前标签设置屏蔽。浏览记录会保留。")
                     } actions: {
-                        Button("重试") { Task { await load() } }
-                        if onLatest != nil { Button("加载当前最新内容", action: latest) }
+                        StatusReloadButton { Task { await load() } }
+                            .environment(\.colorScheme, .dark)
                     }.foregroundStyle(.white)
                 }
                 if !currentItems.isEmpty && !currentItems.contains(where: { $0.id == request.focusedID }) {
-                    Text("原作品当前不可见，已定位到相邻可见作品").font(.caption).padding(10).foregroundStyle(.white).background(.black.opacity(0.7), in: Capsule()).padding(.top, 10)
+                    Text("原作品当前不可见，已定位到相邻可见作品")
+                        .font(.caption).padding(10).foregroundStyle(.white)
+                        .background(.black.opacity(0.7), in: FloatingPageChrome.controlShape)
+                        .padding(.horizontal, FloatingPageChrome.pageInset)
+                        .padding(.top, PageHeaderLayout.singleRow.reservedHeight)
+                        .viewingChromeHidden(chrome.hidden)
                 }
-            }.toolbar {
-                ToolbarItem(placement: .topBarLeading) { Button { dismiss() } label: { Image(systemName: "xmark") }.accessibilityLabel("关闭浏览记录") }
-                ToolbarItem(placement: .principal) {
-                    VStack(spacing: 2) {
-                        Text(request.lane.map { $0.title + " · 接着看" } ?? "最近浏览").font(.headline)
-                        if let filter = request.filter { Text(filter.effectiveKind.chineseTitle + " · " + filter.sortTitle).font(.caption2).foregroundStyle(.secondary) }
-                    }
-                }
-                if onLatest != nil { ToolbarItem(placement: .topBarTrailing) { Button("最新", action: latest).accessibilityLabel("加载当前最新时间线") } }
-            }.navigationBarTitleDisplayMode(.inline)
-                .navigationDestination(item: $creator) { CreatorView(creator: $0.creator, initialKind: $0.kind) }
+            }
+            .playbackTitleBar(request.lane.map { $0.title + " · 接着看" } ?? "最近浏览",
+                              workID: currentItems.first(where: { $0.id == focused })?.id,
+                              hidden: chrome.hidden && !currentItems.isEmpty,
+                              closeLabel: "关闭浏览记录", onClose: { dismiss() }) {
+                if onLatest != nil { Button("最新", action: latest).accessibilityLabel("加载当前最新时间线") }
+            }
                 .onAppear { navigationVisible = true }.onDisappear { navigationVisible = false }
-        }.preferredColorScheme(creator == nil ? .dark : ordinaryScheme).tint(.white)
+        }.tint(.white)
             .task { await load() }
             .onChange(of: session.tagLibraryIdentity) { _, _ in items = []; dismiss() }
             .onChange(of: history.generation) { _, _ in if !history.accepts(request.context) { items = []; dismiss() } }

@@ -83,13 +83,27 @@ import Foundation
         check(second.items.map(\.id) == [3_000] && second.searchProgress?.pages == 3 && second.searchProgress?.candidates == 102 && second.searchProgress?.matches == 26, "Later pages continue the chosen lane and accumulate scan progress")
         check(denseSource.requests.count == 3 && denseSource.requests.last?.tagID == 900, "Continuation does not re-probe other tags")
 
-        // A true AND intersection excludes one-sided matches even if both lanes end.
+        // One complete lane proves the full intersection, even when it contains one-sided matches.
         let andSource = CandidateStub()
         let shared = item(10,[11,22]), leftOnly = item(11,[11]), rightOnly = item(12,[22])
         andSource.fetch = { request in request.tagID == 11 ? page([shared,leftOnly], nil) : page([shared,rightOnly], nil) }
         let andResult = try await TagConjunctionPager.page(criteria: criteria([11,22]), filter: filter, cursor: nil, source: andSource)
         check(andResult.items.map(\.id) == [10], "Conjunction keeps the intersection and does not degrade to OR")
-        check(andResult.metadata.nextCursor == nil && andResult.searchProgress?.anchorTagID == 11, "Equal exhausted candidates choose one complete lane")
+        check(andResult.metadata.nextCursor == nil && andResult.searchProgress?.anchorTagID == 11, "An exhausted candidate completes the search")
+        check(andSource.requests.map(\.tagID) == [11] && andResult.searchProgress?.pages == 1, "A nonempty complete lane skips later probes")
+
+        let completeAfterPartial = CandidateStub()
+        let orderedMatches = [item(25,[21,22,23]), item(24,[21,22,23])]
+        completeAfterPartial.fetch = { request in
+            switch request.tagID {
+            case 21: return page([orderedMatches[0]], "more")
+            case 22: return page(orderedMatches + [item(26,[22])], nil)
+            default: throw URLError(.timedOut)
+            }
+        }
+        let completed = try await TagConjunctionPager.page(criteria: criteria([21,22,23], author: author), filter: filter, cursor: nil, source: completeAfterPartial)
+        check(completed.items.map(\.id) == [25,24] && completed.metadata.nextCursor == nil, "A later complete lane returns all matches in server order")
+        check(completeAfterPartial.requests.map(\.tagID) == [21,22] && completed.searchProgress?.pages == 2, "A known-complete result avoids an unnecessary request that could fail")
 
         // Zero matches with an upstream cursor is a scan continuation, not a final empty result.
         let zeroSource = CandidateStub()

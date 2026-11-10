@@ -100,7 +100,12 @@ private struct NativeMediaPagerController: UIViewControllerRepresentable {
         private var activeAccessibilityIdentifier = ""
         private weak var observedBoundaryPan: UIPanGestureRecognizer?
         private var boundaryGate: UIPanGestureRecognizer?
+        private var locksLeadingBoundary = false
         private var boundaryVisualOffset: CGFloat = 0
+        private var isAtPageBoundary: Bool {
+            guard let currentID else { return false }
+            return currentID == ids.first || currentID == ids.last
+        }
         #if DEBUG && targetEnvironment(simulator)
         private let debugInstanceID = UUID().uuidString
         private var debugLastState: Data?
@@ -134,20 +139,30 @@ private struct NativeMediaPagerController: UIViewControllerRepresentable {
             // Replacing its neighbors while that drag/bounce still owns the
             // scroll offset cancels the gesture. Defer native queue changes
             // through both native transitions and boundary scrolling.
-            if transition != nil || nativeScrollIsMoving {
+            let edgeDragActive = isVisible && isMediaEdgeDragActive
+            if transition != nil || nativeScrollIsMoving || edgeDragActive {
                 #if DEBUG && targetEnvironment(simulator)
-                if pending?.ids != value.ids { touchTrace?.record("native.deferQueue", ["incomingCount": value.ids.count]) }
+                if pending?.ids != value.ids {
+                    touchTrace?.record("native.deferQueue", ["incomingCount": value.ids.count, "edgeDragActive": edgeDragActive])
+                }
                 #endif
                 pending = value
-                // Updating SwiftUI state is safe during a native transition; replacing
-                // UIPageViewController's controller list is deferred until it settles.
-                refreshHosts(using: value)
+                // Replacing the hosting root can remove the view receiving an
+                // edge swipe. Keep that view until lift-off. Vertical boundary
+                // drags still refresh their waiting canvas under the finger.
+                if !edgeDragActive { refreshHosts(using: value) }
                 schedulePendingApply()
                 return
             }
             cancelPendingApply()
             pending = nil
             apply(value)
+        }
+
+        private var isMediaEdgeDragActive: Bool {
+            controller?.viewControllers?.first?.viewIfLoaded?.gestureRecognizers?.contains {
+                ($0 as? MediaPagePanGestureRecognizer)?.isDraggingEdge == true
+            } ?? false
         }
 
         private var nativeScrollIsMoving: Bool {
@@ -172,7 +187,7 @@ private struct NativeMediaPagerController: UIViewControllerRepresentable {
                 guard !Task.isCancelled, let self else { return }
                 self.pendingApplyTask = nil
                 guard self.transition == nil, let latest = self.pending else { return }
-                if self.nativeScrollIsMoving { self.schedulePendingApply(); return }
+                if self.nativeScrollIsMoving || self.isMediaEdgeDragActive { self.schedulePendingApply(); return }
                 self.pending = nil
                 self.apply(latest)
             }
@@ -364,7 +379,7 @@ private struct NativeMediaPagerController: UIViewControllerRepresentable {
                 #endif
                 if installGate {
                     let gate = UIPanGestureRecognizer(target: self, action: #selector(boundaryGateEnded(_:)))
-                    gate.isEnabled = isVisible && transition == nil && currentID != nil && currentID == ids.last
+                    gate.isEnabled = isVisible && transition == nil && isAtPageBoundary
                     gate.delegate = self
                     gate.maximumNumberOfTouches = 1
                     gate.cancelsTouchesInView = false
@@ -375,7 +390,7 @@ private struct NativeMediaPagerController: UIViewControllerRepresentable {
                     boundaryGate = gate
                 }
             }
-            let gateEnabled = isVisible && transition == nil && currentID != nil && currentID == ids.last
+            let gateEnabled = isVisible && transition == nil && isAtPageBoundary
             if let boundaryGate, boundaryGate.isEnabled != gateEnabled { boundaryGate.isEnabled = gateEnabled }
             scroll.contentInsetAdjustmentBehavior = .never
             scroll.contentInset = .zero
@@ -421,16 +436,22 @@ private struct NativeMediaPagerController: UIViewControllerRepresentable {
         }
 
         func gestureRecognizerShouldBegin(_ recognizer: UIGestureRecognizer) -> Bool {
-            guard recognizer === boundaryGate, let pan = recognizer as? UIPanGestureRecognizer else { return false }
+            guard recognizer === boundaryGate, let pan = recognizer as? UIPanGestureRecognizer,
+                  isVisible, transition == nil, let currentID else { return false }
             let velocity = pan.velocity(in: pan.view)
-            return isVisible && transition == nil && currentID != nil && currentID == ids.last &&
-                (velocity.y < 0 || ((pending ?? configuration).boundaryWaiting && velocity.y > 0)) &&
-                abs(velocity.y) > abs(velocity.x)
+            guard abs(velocity.y) > abs(velocity.x) else { return false }
+            locksLeadingBoundary = false
+            if velocity.y > 0 {
+                if currentID == ids.last && (pending ?? configuration).boundaryWaiting { return true }
+                locksLeadingBoundary = currentID == ids.first
+                return locksLeadingBoundary
+            }
+            return currentID == ids.last
         }
 
         func gestureRecognizer(_ recognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
             guard recognizer === boundaryGate, isVisible, transition == nil,
-                  currentID != nil, currentID == ids.last else { return false }
+                  isAtPageBoundary else { return false }
             var target = touch.view
             while let view = target {
                 if view is UIControl { return false }
@@ -441,6 +462,18 @@ private struct NativeMediaPagerController: UIViewControllerRepresentable {
 
         @objc private func boundaryGateEnded(_ pan: UIPanGestureRecognizer) {
             guard pan === boundaryGate else { return }
+            // The leading boundary consumes the pan without translating the
+            // first page. Only the tail can offer resistance or request data.
+            if locksLeadingBoundary {
+                #if DEBUG && targetEnvironment(simulator)
+                touchTrace?.record("native.leadingBoundaryGate", ["state": pan.state.rawValue],
+                    sampleKey: pan.state == .changed ? "native.leadingBoundaryGate.changed" : nil)
+                #endif
+                if pan.state == .ended || pan.state == .cancelled || pan.state == .failed {
+                    locksLeadingBoundary = false
+                }
+                return
+            }
             switch pan.state {
             case .began, .changed:
                 let value = pending ?? configuration

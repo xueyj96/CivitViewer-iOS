@@ -87,6 +87,60 @@ import Foundation
         _ = await store.activate(session: site, filter: FeedFilter(kind: .image), source: .collection(44))
         check(site.requests.last?.collectionID == 44 && site.requests.last?.creatorID == nil && site.requests.last?.followed == false && site.requests.last?.allAccessibleLevels == false,
               "Collection source carries only the collection identifier")
+        do {
+            let folders = FakeFeedSource()
+            var now = fixtureNow
+            let merged = FeedStore(now: { now })
+            let selection: FeedSource = .collections([11, 22, 33])
+            let filter = FeedFilter(kind: .image, onlyPG: true)
+            func batch(_ ids: [Int], cursor: String? = nil) -> MediaPage {
+                .init(items: ids.flatMap { page($0).items }, metadata: .init(nextCursor: cursor))
+            }
+            var rateLimited = true
+            folders.fetch = { request in
+                switch (request.collectionID, request.cursor) {
+                case (11, nil): return batch([301, 302], cursor: "tail")
+                case (22, nil): return batch([303, 301], cursor: "tail")
+                case (33, nil):
+                    if rateLimited { throw ClientError.http(429) }
+                    return batch([304])
+                case (11, "tail"): return batch([305])
+                case (22, "tail"): return batch([306])
+                default: throw ClientError.invalidResponse
+                }
+            }
+            _ = await merged.activate(session: folders, filter: filter, source: selection)
+            check(folders.requests.compactMap(\.collectionID) == [11, 22], "The first batch reads at most two folders")
+            check(merged.items.map(\.id) == [301, 303, 302] && merged.duplicatesDiscarded == 1,
+                  "Merge interleaves folder pages and deduplicates the same work ID")
+            check(!merged.reachedEnd && merged.error == nil, "Identical cursor strings from separate folders are independent")
+
+            folders.siteRetryAvailableAt = now.addingTimeInterval(10)
+            _ = await merged.next(session: folders)
+            check(merged.items.map(\.id) == [301, 303, 302] && merged.retryAvailableAt == folders.siteRetryAvailableAt,
+                  "A shared rate limit preserves the loaded works and delays continuation")
+            let callsAfterFailure = folders.requests.count
+            _ = await merged.next(session: folders)
+            check(folders.requests.count == callsAfterFailure)
+            rateLimited = false; now.addTimeInterval(11)
+            _ = await merged.next(session: folders)
+            _ = await merged.next(session: folders)
+            check(folders.requests.compactMap(\.collectionID) == [11, 22, 33, 33, 11, 22],
+                  "Retry resumes the same folder and each folder advances only its own cursor")
+            check(merged.items.map(\.id) == [301, 303, 302, 304, 305, 306] && merged.reachedEnd)
+            check(folders.requests.allSatisfy { $0.filter == filter && $0.includeTags && !$0.allAccessibleLevels })
+
+            let restarting = await merged.restartFromStart(session: folders, filter: filter, source: selection)
+            check(restarting.status == .committed && folders.requests.suffix(2).allSatisfy { $0.cursor == nil },
+                  "Refresh restarts both selected folder cursors")
+
+            folders.fetch = { request in
+                batch([request.collectionID ?? 0], cursor: "repeat")
+            }
+            _ = await merged.activate(session: folders, filter: filter, source: .collections([11, 22]), force: true)
+            _ = await merged.next(session: folders)
+            check(merged.continuationState.requiresRestart, "A repeating upstream cursor stalls its own folder even if the composite state could rotate")
+        }
         site.requests = []
         _ = await store.activate(session: site, filter: FeedFilter(kind: .image), source: .search(.title("fixture")))
         check(site.requests.last?.searchID == "title:fixture" && site.requests.last?.collectionID == nil && site.requests.last?.creatorID == nil,

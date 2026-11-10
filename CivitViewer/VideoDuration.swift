@@ -2,7 +2,7 @@ import Foundation
 
 /// Finite endpoints are inclusive seconds. Only the separate lower terminal is
 /// exclusive (>120); only a nil upper endpoint means no maximum.
-struct VideoDurationRange: Codable, Equatable, Hashable {
+struct VideoDurationRange: Codable, Equatable, Hashable, Sendable {
     private(set) var minimumSeconds: Int
     private(set) var maximumSeconds: Int?
     private(set) var minimumIsExclusive: Bool
@@ -42,7 +42,6 @@ enum VideoDurationScale {
     /// A state index, never a duration in seconds: lower >120 or upper nil.
     static let terminalIndex = seconds.count
     static let unlimitedIndex = terminalIndex
-    static let tickSeconds = [30, 60, 90, 120]
     static func title(_ seconds: Int) -> String { String(format: "%02d:%02d", seconds / 60, seconds % 60) }
     static func index(for seconds: Int) -> Int { min(120, max(2, seconds)) - 2 }
     static func lowerIndex(_ range: VideoDurationRange) -> Int { range.minimumIsExclusive ? terminalIndex : index(for: range.minimumSeconds) }

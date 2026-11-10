@@ -8,13 +8,6 @@ enum ViewingOrientation: String, Codable, CaseIterable, Sendable {
     var toggled: ViewingOrientation { self == .portrait ? .landscapeRight : .portrait }
 }
 
-struct ViewingOrientationScope: Equatable, Sendable {
-    let id: UUID
-    let captured: ViewingOrientation
-    var manualTarget: ViewingOrientation?
-    var effectiveLock: ViewingOrientation { manualTarget ?? captured }
-}
-
 enum ViewingOrientationMask: Equatable, Sendable {
     case portrait
     case landscapeLeft
@@ -24,36 +17,27 @@ enum ViewingOrientationMask: Equatable, Sendable {
 
 struct ViewingOrientationPolicy: Equatable, Sendable {
     private(set) var automatic: Bool
-    private(set) var scopes: [ViewingOrientationScope] = []
+    private(set) var lockedOrientation: ViewingOrientation = .portrait
 
     init(automatic: Bool = false) { self.automatic = automatic }
 
     var supportedMask: ViewingOrientationMask {
         if automatic { return .allButUpsideDown }
-        switch scopes.last?.effectiveLock ?? .portrait {
+        switch lockedOrientation {
         case .portrait: return .portrait
         case .landscapeLeft: return .landscapeLeft
         case .landscapeRight: return .landscapeRight
         }
     }
 
-    var isViewerActive: Bool { !scopes.isEmpty }
-
-    mutating func setAutomatic(_ enabled: Bool) { automatic = enabled }
-
-    mutating func beginViewer(_ id: UUID, actual: ViewingOrientation) {
-        guard !scopes.contains(where: { $0.id == id }) else { return }
-        scopes.append(ViewingOrientationScope(id: id, captured: actual, manualTarget: nil))
+    mutating func setAutomatic(_ enabled: Bool, actual: ViewingOrientation) {
+        automatic = enabled
+        if !enabled { lockedOrientation = actual }
     }
 
-    mutating func endViewer(_ id: UUID) {
-        scopes.removeAll { $0.id == id }
-    }
-
-    mutating func toggleViewer(actual: ViewingOrientation) -> ViewingOrientation? {
-        guard let index = scopes.indices.last else { return nil }
+    mutating func toggle(actual: ViewingOrientation) -> ViewingOrientation {
         let target = actual.toggled
-        scopes[index].manualTarget = target
+        if !automatic { lockedOrientation = target }
         return target
     }
 }
@@ -67,8 +51,6 @@ struct ViewingOrientationRequestTracker {
         rollbackPolicy = rollbackOnFailure
         return revision
     }
-
-    mutating func invalidate() { _ = begin() }
 
     mutating func reject(_ request: Int, policy: inout ViewingOrientationPolicy) -> Bool {
         guard request == revision else { return false }
@@ -85,7 +67,7 @@ final class ViewingOrientationSettings {
     init(defaults: UserDefaults = .standard) { self.defaults = defaults }
 
     var automatic: Bool {
-        get { defaults.object(forKey: Self.storageKey) as? Bool ?? false }
+        get { defaults.object(forKey: Self.storageKey) == nil || defaults.bool(forKey: Self.storageKey) }
         set { defaults.set(newValue, forKey: Self.storageKey) }
     }
 }
@@ -93,6 +75,21 @@ final class ViewingOrientationSettings {
 #if canImport(UIKit)
 import UIKit
 import Combine
+
+struct PlaybackOrientationSession {
+    private var opening: ViewingOrientation?
+
+    @MainActor mutating func rotate() {
+        let previous = ViewingOrientationController.shared.toggleOrientation()
+        if opening == nil { opening = previous }
+    }
+
+    @MainActor mutating func restore() {
+        guard let opening else { return }
+        self.opening = nil
+        ViewingOrientationController.shared.restorePlaybackOrientation(opening)
+    }
+}
 
 @MainActor final class ViewingOrientationController: ObservableObject {
     static let shared = ViewingOrientationController()
@@ -123,38 +120,35 @@ import Combine
         guard automatic != enabled else { return }
         automatic = enabled
         settings.automatic = enabled
-        policy.setAutomatic(enabled)
+        policy.setAutomatic(enabled, actual: currentOrientation() ?? policy.lockedOrientation)
         message = nil
         applyPolicy(requestGeometry: !enabled)
     }
 
-    func beginViewer(_ id: UUID) {
-        let previous = policy
-        policy.beginViewer(id, actual: currentOrientation() ?? .portrait)
-        guard previous != policy else { return }
-        applyPolicy(requestGeometry: !automatic)
-    }
-
-    func endViewer(_ id: UUID) {
-        let previous = policy
-        policy.endViewer(id)
-        guard previous != policy else { return }
-        applyPolicy(requestGeometry: !automatic)
-    }
-
-    func toggleViewerOrientation() {
-        let previous = policy
-        guard let scene = activeScene(), let actual = orientation(scene.interfaceOrientation),
-              let target = policy.toggleViewer(actual: actual) else {
+    @discardableResult
+    func toggleOrientation() -> ViewingOrientation? {
+        guard let scene = activeScene(), let actual = orientation(scene.interfaceOrientation) else {
             message = "当前无法更改画面方向。"
-            return
+            return nil
         }
+        requestOrientation(actual.toggled, from: actual, scene: scene)
+        return actual
+    }
+
+    func restorePlaybackOrientation(_ entry: ViewingOrientation) {
+        guard let scene = activeScene(), let actual = orientation(scene.interfaceOrientation) else { return }
+        requestOrientation(entry, from: actual, scene: scene)
+    }
+
+    private func requestOrientation(_ target: ViewingOrientation, from actual: ViewingOrientation, scene: UIWindowScene) {
+        var fallback = policy
+        fallback.setAutomatic(automatic, actual: actual)
+        policy.setAutomatic(automatic, actual: target)
         message = nil
-        applyPolicy(requestGeometry: true, sceneOverride: scene, target: target, rollbackOnFailure: previous)
+        applyPolicy(requestGeometry: true, sceneOverride: scene, target: target, rollbackOnFailure: fallback)
     }
 
     func refreshSupportedOrientations() {
-        geometryRequests.invalidate()
         updateControllers()
     }
 

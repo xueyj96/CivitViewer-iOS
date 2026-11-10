@@ -91,30 +91,15 @@ import UIKit
 struct PlaybackLayoutQAView: View {
     @State private var focused: Int? = 900000001
     @State private var tab = 0
-    @State private var orientationScope = UUID()
     var body: some View {
-        TabView(selection: $tab) {
-            NavigationStack {
-                ZStack(alignment: .top) {
-                    MediaDeck(items: [PlaybackLayoutQA.item], focused: $focused, isVisible: true, showsLoadMore: false,
-                              onAuthor: { _ in }, resumePositions: [900000001: 7], loadMore: {}).playbackQAFrame("viewport")
-                    VStack(spacing: 18) {
-                        HStack(spacing: 28) { Text("关注").opacity(0.5); Text("推荐").bold() }.padding(.top, 7)
-                        HStack(spacing: 20) { Text("Images"); Text("全部"); Text("Videos").bold(); Image(systemName: "line.3.horizontal.decrease") }.font(.subheadline)
-                    }.foregroundStyle(.white).allowsHitTesting(false)
-                }.background(.black).toolbar(.hidden, for: .navigationBar)
-            }.tabItem { Label("时间线", systemImage: "rectangle.portrait.on.rectangle.portrait") }.tag(0)
-            Color.black.tabItem { Label("作品榜", systemImage: "square.grid.2x2") }.tag(1)
-            Color.black.tabItem { Label("作者榜", systemImage: "person.3") }.tag(2)
-            Color.black.tabItem { Label("搜索", systemImage: "magnifyingglass") }.tag(3)
-            Color.black.tabItem { Label("我", systemImage: "person.crop.circle") }.tag(4)
-        }.tint(.white).preferredColorScheme(.dark)
+        MainTabs(selectedTab: $tab, onTimelineTap: {}, onTimelineDoubleTap: {},
+                 timeline: player, authors: Color.black, search: Color.black, collections: Color.black)
+            .preferredColorScheme(.dark)
             .onPreferenceChange(PlaybackLayoutQAFrameKey.self) { PlaybackLayoutQA.frames = $0 }
             .task {
                 try? await Task.sleep(for: .milliseconds(300))
-                ViewingOrientationController.shared.beginViewer(orientationScope)
                 let actualLandscape = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first?.interfaceOrientation.isLandscape ?? false
-                if actualLandscape != PlaybackLayoutQA.landscape { ViewingOrientationController.shared.toggleViewerOrientation() }
+                if actualLandscape != PlaybackLayoutQA.landscape { ViewingOrientationController.shared.toggleOrientation() }
                 try? await Task.sleep(for: .seconds(2))
                 for _ in 0..<30 {
                     if PlaybackLayoutQA.geometryMatchesTarget || Task.isCancelled { break }
@@ -123,7 +108,14 @@ struct PlaybackLayoutQAView: View {
                 try? await Task.sleep(for: .milliseconds(200))
                 PlaybackLayoutQA.readback()
             }
-            .onDisappear { ViewingOrientationController.shared.endViewer(orientationScope) }
+    }
+
+    private var player: some View {
+        MediaDeck(items: [PlaybackLayoutQA.item], focused: $focused, isVisible: tab == 0, showsLoadMore: false,
+                  onAuthor: { _ in }, resumePositions: [900000001: 7], loadMore: {})
+            .playbackQAFrame("viewport")
+            .background(Color.black.ignoresSafeArea())
+            .toolbar(.hidden, for: .navigationBar)
     }
 }
 struct PlaybackLayoutQAFrameKey: PreferenceKey {

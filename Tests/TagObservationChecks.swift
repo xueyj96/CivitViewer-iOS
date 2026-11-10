@@ -248,8 +248,11 @@ import Foundation
         for scopeIndex in 0..<5 {
             bounded.recordEmpty(tagID: scopeIndex + 1, scope: "scope-\(scopeIndex)", policy: policy)
         }
-        check((0..<5).filter { bounded.estimate(tagID: $0 + 1, scope: "scope-\($0)", policy: policy) != nil }.count == 4,
-              "At most four contexts are retained")
+        let retainedContexts = (0..<5).filter { bounded.estimate(tagID: $0 + 1, scope: "scope-\($0)", policy: policy) != nil }
+        check(retainedContexts == Array(1..<5), "Four newest contexts survive even when their timestamps are equal")
+        let beforeUntagged = bounded.revision
+        bounded.observe(items: [item(10_000, tags: [])], scope: "no-tags", policy: policy)
+        check(bounded.revision == beforeUntagged, "A page with no tag evidence needs no update")
         let manyTags = (1...5_005).map { item(10_000 + $0, tags: [10_000 + $0]) }
         bounded.observe(items: manyTags, scope: "capacity", policy: policy)
         let retainedTagCount = (10_001...15_005).filter {

@@ -6,7 +6,7 @@ enum OfflineDiskSnapshotError: Error {
     case totalSizeOverflow
 }
 
-struct OfflineDiskSnapshot {
+struct OfflineDiskSnapshot: Sendable {
     let files: [URL]
     let sizes: [String: Int64]
     let created: [String: Date]

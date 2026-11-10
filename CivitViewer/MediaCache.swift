@@ -76,7 +76,7 @@ final class MediaCache: ObservableObject {
     var foregroundVideoDemands: AnyPublisher<ForegroundVideoDemand, Never> { playbackDemand.eraseToAnyPublisher() }
 
     /// In-memory demand only: foreground streaming owns its transfer. The
-    /// preloader yields while its first frame/rebuffer is pending.
+    /// preloader limits future video concurrency while the current video waits.
     func setForegroundVideoDemand(url: URL, owner: UUID, waiting: Bool) {
         guard !url.isFileURL else { removeForegroundVideoDemand(owner: owner); return }
         playbackOwners[owner] = .init(url: url, waiting: waiting)
@@ -102,6 +102,8 @@ final class MediaCache: ObservableObject {
     /// In-process invalidation only. Keys reuse the hashed disk identity; no URL
     /// manifest or event history is retained, and cache hits never publish.
     var posterUpdates: AnyPublisher<String, Never> { posterWrites.eraseToAnyPublisher() }
+    private let videoPreloadWrites = PassthroughSubject<URL, Never>()
+    var videoPreloadUpdates: AnyPublisher<URL, Never> { videoPreloadWrites.eraseToAnyPublisher() }
     private struct Flight {
         let id: UUID
         let task: Task<URL, Error>
@@ -163,6 +165,27 @@ final class MediaCache: ObservableObject {
 
     private func key(_ url: URL, video: Bool) -> String {
         SHA256.hash(data: Data(url.absoluteString.utf8)).map { String(format: "%02x", $0) }.joined() + (video ? ".mp4" : ".img")
+    }
+
+    func collectionPreviewKeys(for item: MediaItem) -> [String] {
+        guard let source = item.mediaURL, !source.isFileURL else { return [] }
+        guard item.isVideo else { return [key(source, video: false)] }
+        var keys: [String] = []
+        if let poster = item.posterURL, !poster.isFileURL { keys.append(key(poster, video: false)) }
+        keys.append(posterCacheKey(for: source))
+        return keys
+    }
+
+    func cachedCollectionPreview(keys: [String]) -> URL? {
+        for name in keys.prefix(2) {
+            let digest = name.dropLast(4)
+            guard (name.hasSuffix(".img") || name.hasSuffix(".jpg")), digest.utf8.count == 64,
+                  digest.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else { continue }
+            let file = directory.appendingPathComponent(name)
+            if let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+               values.isRegularFile == true, values.isSymbolicLink != true { return file }
+        }
+        return nil
     }
 
     func cached(_ url: URL, video: Bool) -> URL? {
@@ -400,10 +423,39 @@ final class MediaCache: ObservableObject {
         return image
     }
 
-    nonisolated private static func firstFrame(_ file: URL) async throws -> UIImage {
+    /// A transition frame comes only from a complete local video. This is
+    /// memory-only, leaving the site's cover and generated poster untouched.
+    func transitionFrame(for source: URL) async -> UIImage? {
+        let id = UUID()
+        do { try await posterJobs.acquire(id) } catch { return nil }
+        defer { posterJobs.release(id) }
+        guard !Task.isCancelled else { return nil }
+        let original = source.isFileURL ? source : cached(source, video: true)
+        let scope = source.isFileURL ? source.deletingLastPathComponent() : directory
+        guard let file = MediaRepairStore.cached(source, original: original, directory: scope)?.url ?? original,
+              FileManager.default.fileExists(atPath: file.path) else { return nil }
+        let generation = self.generation
+        if !source.isFileURL { pin(source) }
+        protectRepairFile(file)
+        defer {
+            if !source.isFileURL { unpin(source) }
+            unprotectRepairFile(file)
+        }
+        guard let frame = try? await Self.firstFrame(file, forTransition: true),
+              !Task.isCancelled, generation == self.generation else { return nil }
+        return frame
+    }
+
+    nonisolated private static func firstFrame(_ file: URL, forTransition: Bool = false) async throws -> UIImage {
         let asset = AVURLAsset(url: file)
         let generator = AVAssetImageGenerator(asset: asset)
-        generator.appliesPreferredTrackTransform = true; generator.maximumSize = CGSize(width: 512, height: 512)
+        let edge: CGFloat = forTransition ? 960 : 512
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: edge, height: edge)
+        if forTransition {
+            generator.requestedTimeToleranceBefore = .zero
+            generator.requestedTimeToleranceAfter = CMTime(seconds: 0.08, preferredTimescale: 600)
+        }
         return try await withTaskCancellationHandler {
             try await withThrowingTaskGroup(of: UIImage.self) { tasks in
                 tasks.addTask { let frame = try await generator.image(at: .zero); return UIImage(cgImage: frame.image) }
@@ -426,7 +478,9 @@ final class MediaCache: ObservableObject {
     /// Images share one bounded 64 MiB limit. Long-video preloading has its own
     /// bounded budget; an admitted preload can use up to 512 MiB when it fits.
     func preloadFile(_ url: URL, video: Bool) async throws -> URL {
-        try await fetchFile(url, video: video, videoMaximum: video ? 512 * 1024 * 1024 : Self.imageDownloadMaximum, prefetching: true)
+        let file = try await fetchFile(url, video: video, videoMaximum: video ? 512 * 1024 * 1024 : Self.imageDownloadMaximum, prefetching: true)
+        if video && !url.isFileURL && !Task.isCancelled { videoPreloadWrites.send(url) }
+        return file
     }
     func recordPreloadFailure(_ error: Error) -> DiagnosticCode {
         let code: DiagnosticCode

@@ -8,6 +8,9 @@ import CryptoKit
     static var enabled: Bool {
         CollectionPagingQA.enabled && ProcessInfo.processInfo.arguments.contains("--qa-height-audit")
     }
+    static var downloadTasksEnabled: Bool {
+        enabled && ProcessInfo.processInfo.arguments.contains("--qa-download-tasks")
+    }
     static let root = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("CivitViewportAuditQA", isDirectory: true)
     static var historyRoot: URL { root.appendingPathComponent("History", isDirectory: true) }
@@ -53,6 +56,14 @@ import CryptoKit
             }
             records.append(record)
         }
+        if downloadTasksEnabled {
+            records.append(.init(id: 28_037_601, video: true, username: "QueueFixture", browsingLevel: 1,
+                                 collectionIDs: [CollectionPagingQA.collection.id], cloudState: .saved, tagNames: []))
+            records.append(.init(id: 28_037_602, video: false, username: "QueueFixture", browsingLevel: 1,
+                                 collectionIDs: [CollectionPagingQA.collection.id], cloudState: .saved, fileState: .failed, tagNames: []))
+            records.append(.init(id: 28_037_603, video: false, username: "QueueFixture", browsingLevel: 1,
+                                 collectionIDs: [CollectionPagingQA.collection.id], cloudState: .saved, tagNames: []))
+        }
         let manifest = OfflineManifest(accountID: owner, records: records, lastScan: now)
         try JSONEncoder().encode(manifest).write(to: folder.appendingPathComponent("index.json"), options: .atomic)
 
@@ -66,16 +77,18 @@ import CryptoKit
                                                  creatorID: item.creatorID, viewedAt: now.addingTimeInterval(-Double(index + 1) * 60),
                                                  positionSeconds: item.isVideo ? 2 : nil, durationSeconds: item.isVideo ? max(3, item.durationSeconds ?? 30) : nil))
         }
-        _ = try await db.checkpoint(.init(lane: .recommendation, filter: FeedFilter(), ids: items.map(\.id),
+        _ = try await db.checkpoint(.init(lane: .recommendation, filter: FeedFilter(kind: .video), ids: items.filter(\.isVideo).map(\.id),
                                           focusedID: items[2].id, updatedAt: now,
                                           continuation: TimelineContinuation(cursor: nil, capturedAt: now, reachedEnd: true)))
         try Task.checkCancellation()
         await BrowsingHistory.shared.bind(ownerID: owner, identity: session.tagLibraryIdentity)
         guard BrowsingHistory.shared.ready, BrowsingHistory.shared.records.count == 6 else { throw ClientError.invalidResponse }
         OfflineLibrary.shared.setActive(false)
-        OfflineLibrary.shared.bind(accountID: owner, session: session)
+        await OfflineLibrary.shared.bind(accountID: nil, session: session)
+        await OfflineLibrary.shared.bind(accountID: owner, session: session)
         OfflineLibrary.shared.setActive(false)
         guard OfflineLibrary.shared.readyCount == 6 else { throw ClientError.invalidResponse }
+        if downloadTasksEnabled { OfflineLibrary.shared.seedDownloadProgressForQA(28_037_601) }
     }
 
     private static func copyLocalFixture(_ source: URL, to destination: URL) throws -> Int64 {

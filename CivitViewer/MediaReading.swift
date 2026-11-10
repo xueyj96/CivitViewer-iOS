@@ -10,6 +10,52 @@ import Foundation
     func searchMediaPage(target: MediaSearchTarget, filter: FeedFilter, cursor: String?, includeTags: Bool) async throws -> MediaPage
 }
 
+/// Rotates through selected folders in small batches. Each folder keeps its own
+/// upstream cursor and order while the feed handles deduplication and retries.
+@MainActor enum CollectionSelectionPager {
+    private struct Lane: Codable {
+        let id: Int
+        let cursor: String?
+    }
+
+    static func page(ids: Set<Int>, cursor: String?, read: (Int, String?) async throws -> MediaPage) async throws -> MediaPage {
+        let lanes: [Lane]
+        if let cursor {
+            guard let data = Data(base64Encoded: cursor),
+                  let decoded = try? JSONDecoder().decode([Lane].self, from: data),
+                  !decoded.isEmpty else { throw ClientError.invalidResponse }
+            let activeIDs = Set(decoded.map(\.id))
+            guard activeIDs.count == decoded.count, activeIDs.isSubset(of: ids) else { throw ClientError.invalidResponse }
+            lanes = decoded
+        } else {
+            lanes = ids.sorted().map { Lane(id: $0, cursor: nil) }
+        }
+
+        let batch = lanes.prefix(2)
+        var next = Array(lanes.dropFirst(batch.count))
+        var pages: [[MediaItem]] = []
+        var cursorKeys: [String] = []
+        for lane in batch {
+            try Task.checkCancellation()
+            let page = try await read(lane.id, lane.cursor)
+            try Task.checkCancellation()
+            if page.durationEnrichmentFailed { return page }
+            pages.append(page.items)
+            if let cursor = page.metadata.nextCursor {
+                next.append(Lane(id: lane.id, cursor: cursor))
+                cursorKeys.append("\(lane.id):\(cursor)")
+            }
+        }
+
+        var items: [MediaItem] = []
+        for offset in 0..<(pages.map(\.count).max() ?? 0) {
+            for page in pages where offset < page.count { items.append(page[offset]) }
+        }
+        let token = next.isEmpty ? nil : try JSONEncoder().encode(next).base64EncodedString()
+        return MediaPage(items: items, metadata: .init(nextCursor: token), collectionCursorKeys: cursorKeys)
+    }
+}
+
 @MainActor protocol HistoryMediaReading: AnyObject {
     var feedIdentity: String { get }
     var followingMemberIDs: Set<Int> { get }

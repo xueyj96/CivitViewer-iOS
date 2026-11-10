@@ -48,7 +48,7 @@ else:
 container = Path(run(['get_app_container', sim, info['CFBundleIdentifier'], 'data']).stdout.strip())
 cache = container / 'Library/Caches/CivitPlaybackLayoutQA'
 cache.mkdir(parents=True, exist_ok=True)
-shutil.copy2(root / 'build/playback-layout-fixture.mp4', cache / 'fixture.mp4')
+shutil.copy2(root / 'Tests/Fixtures/playback-layout-fixture.mp4', cache / 'fixture.mp4')
 report = cache / 'layout-readback.json'
 cases = [('portrait-seeking', 'seeking', False), ('landscape-seeking', 'seeking', True)] if size == 'main' else [('landscape-buffering', 'buffering', True)]
 if options.case:

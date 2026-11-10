@@ -3,9 +3,10 @@ import assert from 'node:assert/strict';
 
 // Execute the actual embedded request script against an in-memory fetch double.
 // No browser session, cookies, credentials, or real HTTP requests are used.
-const source = readFileSync(new URL('../CivitViewer/SiteSession.swift', import.meta.url), 'utf8');
-const request = source.slice(source.indexOf('private func request<T: Decodable>'));
-const script = request.match(/let script = """\n([\s\S]*?)\n        """/)[1];
+const source = readFileSync(new URL('../CivitViewer/SiteRequestClient.swift', import.meta.url), 'utf8');
+const embedded = source.match(/let script = """\n([\s\S]*?)\n        """/);
+assert.ok(embedded, 'Expected the embedded site request script');
+const script = embedded[1];
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 const run = new AsyncFunction('fetch', 'location', 'origin', 'path', 'method', 'body', 'rpc', 'identity', script);
 let checks = 0, calls = 0;

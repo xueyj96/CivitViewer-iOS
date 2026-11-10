@@ -334,7 +334,7 @@ final class FeedStore: ObservableObject {
                 hiddenByTags = accumulator.blockedCount; unverifiedTags = accumulator.unverifiedCount
                 hiddenByAuthors = accumulator.blockedAuthorCount
                 duplicatesDiscarded = accumulator.duplicateCount
-                if let cursor = accumulator.cursor, !seenCursors.insert(cursor).inserted {
+                if page.continuationKeys.contains(where: { !seenCursors.insert($0).inserted }) {
                     let message = "加载停滞：站点重复返回分页位置，请从头刷新。"
                     error = message; loadState = .failed; continuationState = .failed(.stalled(message: message))
                     return FeedCommit(status: .committed, key: activeKey, revision: requestGeneration, state: .failed)
@@ -389,12 +389,21 @@ final class FeedStore: ObservableObject {
     }
 
     private func fetchPage(session: any FeedPageReading, key: FeedStoreRequestKey, cursor: String?) async throws -> MediaPage {
+        func isCurrent() -> Bool {
+            key.identity == session.feedIdentity && (key == requestKey || key == restartKey)
+        }
         let page: MediaPage
         switch key.source {
         case .search(let target):
             page = try await session.searchMediaPage(target: target, filter: key.filter, cursor: cursor, includeTags: true)
         case .collection(let id):
             page = try await session.collectionPage(id: id, filter: key.filter, cursor: cursor, allAccessibleLevels: false, includeTags: true)
+        case .collections(let ids):
+            return try await CollectionSelectionPager.page(ids: ids, cursor: cursor) { id, cursor in
+                let page = try await session.collectionPage(id: id, filter: key.filter, cursor: cursor, allAccessibleLevels: false, includeTags: true)
+                guard isCurrent() else { throw CancellationError() }
+                return try await session.enrichVideoDurations(in: page, filter: key.filter, isCurrent: isCurrent)
+            }
         case .following:
             page = try await session.mediaPage(filter: key.filter, cursor: cursor, creator: nil, followed: true, includeTags: true)
         case .creator(let creator):
@@ -402,9 +411,7 @@ final class FeedStore: ObservableObject {
         case .discovery:
             page = try await session.mediaPage(filter: key.filter, cursor: cursor, creator: nil, followed: false, includeTags: true)
         }
-        return try await session.enrichVideoDurations(in: page, filter: key.filter) {
-            key.identity == session.feedIdentity && (key == self.requestKey || key == self.restartKey)
-        }
+        return try await session.enrichVideoDurations(in: page, filter: key.filter, isCurrent: isCurrent)
     }
 
     /// Rebuilds the feed from cursor nil off to the side, replacing the current
@@ -507,7 +514,7 @@ final class FeedStore: ObservableObject {
                 let previousCount = staged.items.count
                 staged.append(page, kind: key.filter.effectiveKind)
                 noteTagResult(page: page, key: key, visible: staged.items.count)
-                if let cursor = staged.cursor, !stagedCursors.insert(cursor).inserted {
+                if page.continuationKeys.contains(where: { !stagedCursors.insert($0).inserted }) {
                     return finish(.failedRetainingPrevious, error: "加载停滞：站点重复返回分页位置，请重试从头刷新。")
                 }
                 if staged.items.count > previousCount || staged.reachedEnd { break }

@@ -74,13 +74,15 @@ import Foundation
             if post==10 {return .init(items:(c==nil ? Array(101...108):Array(109...112)).map{item($0,post:post)},metadata:.init(nextCursor:c==nil ? "media:2":nil))}
             return .init(items:[item(post==11 ? 201:301,post:post)],metadata:.init(nextCursor:nil))
         }
-        var state:String?,all:[Int]=[],pages=0,emptyContinuation=false
+        var state:String?,all:[Int]=[],titles:[String?]=[],pages=0,emptyContinuation=false
         repeat {
             let page=try await TitleMediaPager.page(keyword:" City ",filter:filter,cursor:state,includeTags:true,source:source)
             all += page.items.map(\.id);emptyContinuation = emptyContinuation || (page.items.isEmpty && page.metadata.nextCursor != nil)
+            titles += page.items.map(\.postTitle)
             state=page.metadata.nextCursor;pages += 1;precondition(pages<=8)
         } while state != nil
         check(all==Array(101...112)+[201,301],"Title search expands all post media, including beyond preview cover cap")
+        check(titles==Array(repeating:"City lights",count:12)+["City sunset","City rain"],"Each work keeps its verified post title across media and post cursors")
         check(source.requests.map(\.post)==[10,10,11,12] && source.requests[1].cursor=="media:2","Each post media cursor finishes before advancing to next matched post")
         check(emptyContinuation && source.postReads==3,"Permission-filtered empty post page keeps opaque continuation")
         check(source.requests.allSatisfy({$0.filter==filter && $0.tags}),"Media type, range, content filter and actual tag reads propagate through title expansion")

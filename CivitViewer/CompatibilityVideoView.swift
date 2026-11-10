@@ -4,6 +4,7 @@ import UIKit
 
 struct CompatibilityVideoView: View {
     let url: URL
+    let workID: Int?
     var initialPosition: Double? = nil
     let onProgress: (Double, Double, Bool) -> Void
     let onPlaying: () -> Void
@@ -11,16 +12,20 @@ struct CompatibilityVideoView: View {
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.mediaTabs) private var tabs
+    @Environment(\.exitMediaCoverToTab) private var exitToTab
     @StateObject private var controller: CompatibilityVideoController
 
     init(
         url: URL,
+        workID: Int?,
         initialPosition: Double? = nil,
         onProgress: @escaping (Double, Double, Bool) -> Void,
         onPlaying: @escaping () -> Void,
         onFailure: @escaping (Int) -> Void
     ) {
         self.url = url
+        self.workID = workID
         self.initialPosition = initialPosition
         self.onProgress = onProgress
         self.onPlaying = onPlaying
@@ -34,29 +39,16 @@ struct CompatibilityVideoView: View {
         ))
     }
 
+    private var tabBarHeight: CGFloat { exitToTab == nil ? 0 : (tabs?.height ?? 0) }
+
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
             CompatibilityWebView(controller: controller)
-                .ignoresSafeArea(edges: .bottom)
+                .padding(.bottom, tabBarHeight)
+                .ignoresSafeArea(edges: exitToTab == nil ? .bottom : [])
             VideoWaitingIndicator(visible: controller.isLoading && controller.errorCode == nil && scenePhase == .active)
             VStack(spacing: 0) {
-                HStack {
-                    Text("兼容播放")
-                        .font(.headline)
-                        .foregroundStyle(.white)
-                    Spacer()
-                    Button("关闭") {
-                        controller.close()
-                        dismiss()
-                    }
-                    .accessibilityIdentifier("compatibility.close")
-                    .foregroundStyle(.white)
-                }
-                .padding(.horizontal, 16)
-                .padding(.top, 10)
-                .padding(.bottom, 12)
-                .background(.black.opacity(0.78))
                 Spacer()
                 if let error = controller.errorCode {
                     Text("兼容播放暂不可用（错误\(error)）")
@@ -64,16 +56,17 @@ struct CompatibilityVideoView: View {
                         .foregroundStyle(.white)
                         .padding(12)
                         .background(.black.opacity(0.78), in: Capsule())
-                        .padding(.bottom, 24)
+                        .padding(.bottom, 24 + tabBarHeight)
                 }
             }
             #if DEBUG && targetEnvironment(simulator)
             CompatibilityQAValue(controller: controller)
             #endif
         }
+        .playbackTitleBar("兼容播放", workID: workID, closeIdentifier: "compatibility.close", onClose: { dismiss() })
+        .overlay(alignment: .bottom) { PlaybackTabsBar(identifier: "compatibility.tabs") }
         .preferredColorScheme(.dark)
         .onChange(of: scenePhase) { _, phase in if phase != .active { controller.pauseAndFlush() } }
-        .onDisappear { controller.destroy() }
     }
 }
 
@@ -96,7 +89,6 @@ private final class CompatibilityVideoController: NSObject, ObservableObject, WK
     private var lastProgressCallback = 0.0
     private var didReportPlaying = false
     private var didReportFailure = false
-    private var didClose = false
     private var didDestroy = false
     private var hasLoadedDocument = false
     private var permittedDocumentURL: URL?
@@ -186,7 +178,7 @@ private final class CompatibilityVideoController: NSObject, ObservableObject, WK
     }
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard !didDestroy, !didClose, message.frameInfo.isMainFrame,
+        guard !didDestroy, message.frameInfo.isMainFrame,
               let body = message.body as? [String: Any],
               let kind = body["kind"] as? String,
               ["progress", "playing", "failure"].contains(kind) else { return }
@@ -259,29 +251,22 @@ private final class CompatibilityVideoController: NSObject, ObservableObject, WK
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? { nil }
 
-    func close() {
-        guard !didClose else { return }
-        didClose = true
-        if let (position, duration) = latestProgress { onProgress(position, duration, true) }
-        teardownWebView()
-    }
-
     func pauseAndFlush() {
-        guard !didClose, !didDestroy else { return }
+        guard !didDestroy else { return }
         webView?.evaluateJavaScript("document.querySelector('video')?.pause()")
         if let (position, duration) = latestProgress { onProgress(position, duration, true) }
     }
 
     func destroy() {
         guard !didDestroy else { return }
-        close()
+        pauseAndFlush()
         didDestroy = true
-        teardownWebView()
+        detachWebView()
         removeTemporaryDirectory()
     }
 
     private func fail(_ code: Int) {
-        guard !didReportFailure, !didClose, !didDestroy else { return }
+        guard !didReportFailure, !didDestroy else { return }
         didReportFailure = true
         errorCode = code
         isLoading = false
@@ -292,9 +277,10 @@ private final class CompatibilityVideoController: NSObject, ObservableObject, WK
         onFailure(code)
     }
 
-    private func teardownWebView() {
+    private func detachWebView() {
         guard let webView else { return }
-        webView.evaluateJavaScript("document.querySelectorAll('video').forEach(v => { v.pause(); v.removeAttribute('src'); v.load(); });")
+        // UIKit may still composite the outgoing view during dismantle.
+        // Leave its paused frame intact until the view is released.
         webView.stopLoading()
         webView.navigationDelegate = nil
         webView.uiDelegate = nil

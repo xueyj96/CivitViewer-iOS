@@ -52,6 +52,7 @@ struct FilterPresetSnapshot: Codable, Equatable {
 
     init(filter: FeedFilter, criteria: MediaSearchCriteria? = nil) {
         var normalized = filter
+        normalized.kind = normalized.kind.browsingSelection
         if normalized.videoDurationRange != nil { normalized.kind = .video }
         self.filter = normalized
         self.search = criteria.map(PresetSearchSnapshot.init)

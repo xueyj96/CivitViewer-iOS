@@ -6,95 +6,316 @@ private struct CompactBarHeightKey: PreferenceKey {
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
 }
 
+struct MediaTabExit {
+    let id: Int
+    let fromMedia: Bool
+}
+
+struct MediaTabs {
+    let height: CGFloat
+    let render: (_ overMedia: Bool, _ identifier: String, _ selection: FavoriteSelectionBar.Entry?, _ tone: PageToneTransition?, _ onSelect: @escaping (Int) -> Void) -> AnyView
+    let select: (MediaTabExit) -> Void
+}
+
+extension EnvironmentValues {
+    @Entry var mediaTabs: MediaTabs? = nil
+    @Entry var exitMediaCoverToTab: ((MediaTabExit) -> Void)? = nil
+    @Entry var rotatePlayback: (() -> Void)? = nil
+}
+
+private struct MediaCover<Item: Identifiable, Presented: View>: ViewModifier {
+    @Binding var item: Item?
+    var onDismiss: () -> Void
+    @ViewBuilder var presented: (Item) -> Presented
+    @Environment(\.mediaTabs) private var tabs
+    @Environment(\.exitMediaCoverToTab) private var parentExit
+    @State private var playbackOrientation = PlaybackOrientationSession()
+    @State private var exitsToTab = false
+
+    func body(content: Content) -> some View {
+        content.fullScreenCover(item: $item, onDismiss: {
+            exitsToTab = false
+            playbackOrientation.restore()
+            onDismiss()
+        }) { opening in
+            presented(opening)
+                .environment(\.rotatePlayback, { playbackOrientation.rotate() })
+                .environment(\.exitMediaCoverToTab, tabs.map { _ in
+                    { exit in
+                        guard item != nil else { return }
+                        // Waiting for dismissal before selecting the tab
+                        // exposes the old grid between presentations.
+                        withoutPageAnimation {
+                            exitsToTab = true
+                            playbackOrientation.restore()
+                            item = nil
+                            (parentExit ?? tabs?.select)?(exit)
+                        }
+                    }
+                })
+        }
+        .transaction {
+            // A native pager hosts its media page in a separate SwiftUI root.
+            // Keep the exit policy attached until that cover has dismissed.
+            if exitsToTab, item == nil {
+                $0.animation = nil
+                $0.disablesAnimations = true
+            }
+        }
+    }
+}
+
+extension View {
+    func mediaCover<Item: Identifiable, Presented: View>(
+        item: Binding<Item?>, onDismiss: @escaping () -> Void = {},
+        @ViewBuilder content: @escaping (Item) -> Presented
+    ) -> some View {
+        modifier(MediaCover(item: item, onDismiss: onDismiss, presented: content))
+    }
+}
+
 /// The production and UI-test roots use the same tab ownership, navigation
 /// containers, labels and observation point. Content dependencies stay outside.
-struct MainTabs<Timeline: View, Authors: View, Search: View, Settings: View>: View {
+struct MainTabs<Timeline: View, Authors: View, Search: View, Collections: View>: View {
     @Binding var selectedTab: Int
     var onTimelineTap: () -> Void
     var onTimelineDoubleTap: () -> Void
     let timeline: Timeline
     let authors: Authors
     let search: Search
-    let settings: Settings
+    let collections: Collections
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.ordinaryColorScheme) private var ordinaryScheme
+    @State private var pageMotion = TabPageMotion()
+    private struct CanvasHandoff {
+        let tone: PageToneTransition
+        // A playback change has a direction. A system appearance change does not.
+        let destinationIsMedia: Bool?
+    }
+
+    @State private var canvasHandoff: CanvasHandoff?
+    @State private var lastTimelineWasMedia: Bool?
+    @State private var skipHiddenInlineExitBlend = false
+    @AppStorage("timeline.presentation") private var timelinePresentation = TimelinePresentation.stream.rawValue
     @ObservedObject private var chrome = ViewingChromeController.shared
+    @StateObject private var favoriteSelectionBar = FavoriteSelectionBar()
     @State private var previousTimelineTap: CFTimeInterval?
     @State private var lastTimelineRefresh = -Double.infinity
     @State private var compactBarHeight: CGFloat = 48
+    // A navigation push in the timeline ends playback, but must not resize its
+    // underlying viewport while the next screen covers or reveals it.
+    private var overlaysBottomBar: Bool { selectedTab == 0 }
+    private var barOverMedia: Bool { overlaysBottomBar && chrome.hasInlinePlayer }
     private let destinations: [(Int, String, String)] = [
         (0, "时间线", "rectangle.portrait.on.rectangle.portrait"),
-        (2, "作者榜", "person.3"), (4, "搜索", "magnifyingglass"), (3, "我", "person.crop.circle")
+        (2, "作者榜", "person.3"), (4, "搜索", "magnifyingglass"), (3, "收藏", "bookmark")
     ]
 
     var body: some View {
-        VStack(spacing: 0) {
         TabView(selection: $selectedTab) {
             NavigationStack { timeline }
+                .environment(\.motionTab, 0)
                 .toolbar(.hidden, for: .tabBar)
                 .tabItem { Label("时间线", systemImage: "rectangle.portrait.on.rectangle.portrait").accessibilityIdentifier("main.tab.timeline") }.tag(0)
             NavigationStack { authors }
+                .environment(\.motionTab, 2)
                 .toolbar(.hidden, for: .tabBar)
                 .tabItem { Label("作者榜", systemImage: "person.3") }.tag(2)
             NavigationStack { search }
+                .environment(\.motionTab, 4)
                 .toolbar(.hidden, for: .tabBar)
                 .tabItem { Label("搜索", systemImage: "magnifyingglass") }.tag(4)
-            NavigationStack { settings }
+            NavigationStack { collections }
+                .environment(\.motionTab, 3)
                 .toolbar(.hidden, for: .tabBar)
-                .tabItem { Label("我", systemImage: "person.crop.circle") }.tag(3)
+                .tabItem { Label("收藏", systemImage: "bookmark") }.tag(3)
         }
+        .background(barOverMedia ? Color.black : AppTheme.pageBackground(for: ordinaryScheme))
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .environment(\.viewingBottomBarHeight, chrome.hasViewer ? compactBarHeight : 0)
+        .environment(\.tabPageMotion, pageMotion)
+        .environment(\.overlaidTabBarHeight, overlaysBottomBar ? compactBarHeight : 0)
         .environment(\.viewingControlsReferenceInset, compactBarHeight)
-        if !chrome.hasViewer { measuredBar }
+        .environment(\.favoriteSelectionBar, favoriteSelectionBar)
+        .environment(\.mediaTabs, MediaTabs(height: compactBarHeight, render: { overMedia, identifier, selection, tone, onSelect in
+            AnyView(compactBar(selected: selectedTab, overMedia: overMedia, showsBatchActions: false,
+                               identifier: identifier, selection: selection, tone: tone, onSelect: onSelect))
+        }, select: selectFromPlayback))
+        .safeAreaPadding(.bottom, overlaysBottomBar ? 0 : compactBarHeight)
+        .overlay(alignment: .top) {
+            if barOverMedia { PlaybackStatusBarScrim() }
+        }
+        .overlay {
+            if let canvasHandoff {
+                let tone = canvasHandoff.tone
+                PageToneBlend(source: tone.source, initialOpacity: tone.initialOpacity) {
+                    if self.canvasHandoff?.tone.id == tone.id { self.canvasHandoff = nil }
+                }
+                .id(tone.id)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+            }
+        }
+        .overlay(alignment: .topLeading) {
+            if let handoff = pageMotion.handoff {
+                GeometryReader { geometry in
+                    let origin = geometry.frame(in: .global).origin
+                    HeaderHandoffView(handoff: handoff)
+                        .offset(x: handoff.source.frame.minX - origin.x,
+                                y: handoff.source.frame.minY - origin.y)
+                }
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+            }
         }
         .overlay(alignment: .bottom) {
-            if chrome.hasViewer { measuredBar.viewingChromeHidden(chrome.hidden) }
+            measuredBar.viewingChromeHidden(barOverMedia && chrome.hidden)
         }
         .onPreferenceChange(CompactBarHeightKey.self) { if $0 > 0 { compactBarHeight = $0 } }
         .tint(.blue)
-        .onChange(of: selectedTab) { _, _ in chrome.reveal() }
+        .onChange(of: selectedTab) { _, _ in chrome.reveal(); favoriteSelectionBar.clear() }
+        .onChange(of: barOverMedia) { wasOverMedia, isOverMedia in
+            if skipHiddenInlineExitBlend {
+                skipHiddenInlineExitBlend = false
+                return
+            }
+            guard canvasHandoff?.destinationIsMedia != isOverMedia else { return }
+            blendCanvas(fromMedia: wasOverMedia, toMedia: isOverMedia)
+        }
+        .onChange(of: ordinaryScheme) { previous, _ in
+            guard !barOverMedia, !reduceMotion else { return }
+            canvasHandoff = CanvasHandoff(tone: PageToneTransition(source: AppTheme.pageBackground(for: previous)),
+                                          destinationIsMedia: nil)
+        }
+        .onDisappear { pageMotion.cancel() }
     }
 
     private var measuredBar: some View {
-        compactBar.background(GeometryReader { geometry in
+        compactBar(selected: selectedTab, overMedia: barOverMedia, showsBatchActions: true, tone: canvasHandoff?.tone, onSelect: select).background(GeometryReader { geometry in
             Color.clear.preference(key: CompactBarHeightKey.self, value: geometry.size.height)
         })
     }
 
-    private var compactBar: some View {
-        HStack(spacing: 0) {
+    private func compactBar(selected: Int, overMedia: Bool, showsBatchActions: Bool, identifier: String = "main.tabs.compact",
+                            selection: FavoriteSelectionBar.Entry? = nil, tone: PageToneTransition?,
+                            onSelect: @escaping (Int) -> Void) -> some View {
+        let entry = showsBatchActions ? favoriteSelectionBar.entry : selection
+        let isBlending = showsBatchActions && tone != nil
+        let inactiveColor: Color = overMedia ? .white.opacity(0.88) : (isBlending ? .primary : .secondary)
+        return HStack(spacing: FloatingPageChrome.groupInset) {
             ForEach(destinations, id: \.0) { destination in
-                if destination.0 == 0 {
-                    tabButton(destination).accessibilityAction(named: Text("从头刷新时间线")) { refreshTimeline() }
-                } else { tabButton(destination) }
+                if destination.0 == 0 && showsBatchActions {
+                    tabButton(destination, selected: selected == destination.0, overMedia: overMedia, inactiveColor: inactiveColor, onSelect: onSelect)
+                        .accessibilityAction(named: Text("从头刷新时间线")) { refreshTimeline() }
+                } else { tabButton(destination, selected: selected == destination.0, overMedia: overMedia, inactiveColor: inactiveColor, onSelect: onSelect) }
             }
-        }.padding(.horizontal, 8).padding(.vertical, 2)
+        }
+            .opacity(entry == nil ? 1 : 0)
+            .allowsHitTesting(entry == nil)
+            .accessibilityHidden(entry != nil)
+            .overlay {
+                if let entry { FavoriteBatchBarButtons(entry: entry).id(entry.owner) }
+            }
+            .dynamicTypeSize(...DynamicTypeSize.xLarge)
+            .padding(.horizontal, FloatingPageChrome.groupInset).padding(.vertical, 2)
             .background {
-                if chrome.hasViewer {
-                    RoundedRectangle(cornerRadius: 16).fill(.black.opacity(0.35))
-                } else {
-                    RoundedRectangle(cornerRadius: 16).fill(.ultraThinMaterial)
+                Group {
+                    if overMedia { PlaybackChromeSurface() }
+                    else {
+                        let shape = FloatingPageChrome.controlShape
+                        shape.fill(Color(uiColor: .systemBackground).opacity(reduceTransparency ? 1 : 0.68))
+                            .overlay { shape.strokeBorder(Color.primary.opacity(0.06), lineWidth: 0.5) }
+                    }
+                }
+                .frame(height: FloatingPageChrome.surfaceHeight)
+                .overlay {
+                    if let tone {
+                        PageToneBlend(source: tone.source, coversSafeArea: false, initialOpacity: 0.48)
+                            .clipShape(FloatingPageChrome.controlShape)
+                            .id(tone.id)
+                    }
                 }
             }
-            .overlay(RoundedRectangle(cornerRadius: 16).stroke(chrome.hasViewer ? Color.white.opacity(0.12) : Color.primary.opacity(0.06), lineWidth: 0.5))
-            .padding(.horizontal, 12)
+            .padding(.horizontal, PlaybackChrome.horizontalInset)
             .accessibilityElement(children: .contain).accessibilityAddTraits(.isTabBar)
-            .accessibilityIdentifier("main.tabs.compact")
+            .accessibilityIdentifier(identifier)
+            .environment(\.colorScheme, overMedia ? .dark : ordinaryScheme)
     }
-    private func tabButton(_ destination: (Int, String, String)) -> some View {
-        Button { select(destination.0) } label: {
-                    VStack(spacing: 3) {
-                        Image(systemName: destination.2).font(.system(size: 19, weight: .medium)).frame(height: 20)
-                        Text(destination.1).font(.caption2.weight(selectedTab == destination.0 ? .semibold : .regular))
-                            .lineLimit(1).minimumScaleFactor(0.65).padding(.horizontal, 4)
-                    }.frame(minWidth: 0, maxWidth: .infinity, minHeight: 44)
-                        .foregroundStyle(selectedTab == destination.0 ? Color.accentColor : (chrome.hasViewer ? Color.white.opacity(0.88) : Color.secondary))
-                        .shadow(color: .black.opacity(chrome.hasViewer ? 0.7 : 0), radius: 2, y: 1)
-                        .contentShape(Rectangle())
-                }.buttonStyle(.plain).frame(minWidth: 0, maxWidth: .infinity).accessibilityLabel(destination.1)
-                    .accessibilityIdentifier(destination.0 == 0 ? "main.tab.timeline" : "main.tab.\(destination.0)")
-                    .accessibilityAddTraits(selectedTab == destination.0 ? .isSelected : [])
+    private func tabButton(_ destination: (Int, String, String), selected: Bool, overMedia: Bool, inactiveColor: Color,
+                           onSelect: @escaping (Int) -> Void) -> some View {
+        Button { onSelect(destination.0) } label: {
+            VStack(spacing: 2) {
+                Image(systemName: destination.2)
+                    .font(.system(size: 13, weight: .medium))
+                    .frame(height: 14)
+                Text(destination.1)
+                    .font(.system(size: 10, weight: selected ? .semibold : .regular))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.65)
+                    .padding(.horizontal, 4)
+            }
+            .frame(height: FloatingPageChrome.visibleHeight(nested: true))
+            .frame(minWidth: 0, maxWidth: .infinity, minHeight: FloatingPageChrome.controlHeight)
+            .foregroundStyle(selected ? Color.accentColor : inactiveColor)
+            .shadow(color: .black.opacity(overMedia ? 0.7 : 0), radius: 2, y: 1)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .frame(minWidth: 0, maxWidth: .infinity)
+        .accessibilityLabel(destination.1)
+        .accessibilityIdentifier(destination.0 == 0 ? "main.tab.timeline" : "main.tab.\(destination.0)")
+        .accessibilityAddTraits(selected ? [.isSelected] : [])
     }
     private func select(_ id: Int) {
+        if id != selectedTab, !reduceMotion,
+           destinations.contains(where: { $0.0 == selectedTab }),
+           destinations.contains(where: { $0.0 == id }) {
+            pageMotion.switchPage(from: selectedTab, to: id,
+                                  leavesInlinePlayback: barOverMedia && !chrome.hidden) {
+                applySelection(id)
+            }
+        } else {
+            pageMotion.cancel()
+            if id != selectedTab { pageMotion.takeHeaderOwnership(from: selectedTab) }
+            applySelection(id)
+        }
+    }
+
+    private func selectFromPlayback(_ exit: MediaTabExit) {
+        if exit.id == selectedTab {
+            blendCanvas(fromMedia: exit.fromMedia, toMedia: barOverMedia)
+            return
+        }
+        pageMotion.cancel()
+        pageMotion.takeHeaderOwnership(from: selectedTab)
+        withoutPageAnimation { applySelection(exit.id, visibleSourceIsMedia: exit.fromMedia) }
+    }
+
+    private func blendCanvas(fromMedia: Bool, toMedia: Bool) {
+        guard fromMedia != toMedia, ordinaryScheme == .light, !reduceMotion else { return }
+        let source: Color = fromMedia ? .black : AppTheme.pageBackground(for: ordinaryScheme)
+        // A quick reversal starts from the shade the outgoing blend has reached.
+        let tone: PageToneTransition
+        if let active = canvasHandoff, active.destinationIsMedia == fromMedia {
+            tone = active.tone.reversed(from: source)
+        } else {
+            tone = PageToneTransition(source: source)
+        }
+        canvasHandoff = CanvasHandoff(tone: tone, destinationIsMedia: toMedia)
+    }
+
+    private func applySelection(_ id: Int, visibleSourceIsMedia: Bool? = nil) {
+        if id != selectedTab {
+            if selectedTab == 0 { lastTimelineWasMedia = barOverMedia }
+            // On first entry, wait for the player to appear before starting the blend.
+            let destinationIsMedia = id == 0 && timelinePresentation == TimelinePresentation.stream.rawValue
+                && lastTimelineWasMedia == true
+            // A light Details or Author page can cover the dark inline player.
+            // Ending the hidden player does not change the visible source tone.
+            skipHiddenInlineExitBlend = visibleSourceIsMedia == false && barOverMedia && !destinationIsMedia
+            blendCanvas(fromMedia: visibleSourceIsMedia ?? barOverMedia, toMedia: destinationIsMedia)
+        }
+        if id != 0 { chrome.endInlinePlayer() }
         selectedTab = id
         guard id == 0 else { previousTimelineTap = nil; return }
         let now = CACurrentMediaTime()

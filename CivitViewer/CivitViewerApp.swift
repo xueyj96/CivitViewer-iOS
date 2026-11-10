@@ -99,7 +99,7 @@ struct RootView: View {
                  onTimelineTap: { selectedTab = 0; timelineTopRequest &+= 1 },
                  onTimelineDoubleTap: { selectedTab = 0; timelineRestartRequest &+= 1 },
                  timeline: TimelineView(isVisible: selectedTab == 0, restartRequest: timelineRestartRequest, topRequest: timelineTopRequest),
-                 authors: LeaderboardView(), search: SearchView(), settings: SettingsView())
+                 authors: LeaderboardView(), search: SearchView(), collections: CollectionsView())
         #if DEBUG && targetEnvironment(simulator)
         .fullScreenCover(isPresented: $qaOfflineScreen) {
             NavigationStack { OfflineStorageView() }.ordinaryAppearance()
@@ -135,10 +135,11 @@ struct RootView: View {
                 do { try await Task.sleep(for: .seconds(30)) } catch { return }
             }
         }
-        .task(id: offlineAccount) {
+        .task(id: session.tagLibraryIdentity) {
             offline.setActive(scenePhase == .active && !diagnostics)
-            offline.bind(accountID: offlineAccount, session: session)
-            offline.setActive(scenePhase == .active && !diagnostics)
+            await offline.bind(accountID: offlineAccount, session: session)
+            guard !Task.isCancelled else { return }
+            if !diagnostics { offline.requestSync(session: session) }
         }
         .task {
             while !Task.isCancelled {
@@ -183,57 +184,100 @@ struct LoginView: View {
     private var collectionLogin: Bool { forCollections || session.loginForCollections }
     var body: some View {
         NavigationStack {
-            Form {
-                Section {
-                    Label(collectionLogin ? "启用账号收藏" : "登录 Civitai", systemImage: collectionLogin ? "bookmark" : "person.crop.circle").font(.title2.bold())
-                    Text("在系统浏览器窗口选择 Google，完成 Civitai 官方授权后会自动返回。").font(.subheadline)
-                    if collectionLogin { Text("新增读取收藏夹与管理收藏权限，用于保存、移除和查看作品。原有浏览与关注权限保留。").font(.subheadline) }
-                    Button { Task { await oauth.start(includeCollections: collectionLogin) } } label: {
-                        HStack { if oauth.busy { ProgressView() }; Text(oauth.busy ? "正在等待授权…" : (collectionLogin ? "继续前往 Civitai 授权" : "使用 Google 登录 Civitai")) }
-                    }.disabled(oauth.busy)
-                    if let error = oauth.error { Text(error).font(.caption).foregroundStyle(.red) }
+            ScrollView {
+                VStack(alignment: .leading, spacing: FloatingPageChrome.spacing) {
+                    PageContentCard {
+                        VStack(alignment: .leading, spacing: FloatingPageChrome.spacing) {
+                            Text("在系统浏览器选择 Google，完成 Civitai 授权后会自动返回。")
+                            if collectionLogin {
+                                Text("收藏授权用于查看、保存和移除收藏作品。")
+                            }
+                            if let error = oauth.error { Text(error).font(.caption).foregroundStyle(.red) }
+                        }
+                        .font(.subheadline)
+                        .padding(.vertical, FloatingPageChrome.cardInset)
+                    }
+                    Button {
+                        Task { await oauth.start(includeCollections: collectionLogin) }
+                    } label: {
+                        HStack(spacing: FloatingPageChrome.groupInset) {
+                            if oauth.busy { ProgressView().controlSize(.small) }
+                            Text(oauth.busy ? "等待授权…" : (collectionLogin ? "前往 Civitai 授权" : "使用 Google 登录"))
+                        }
+                    }
+                    .buttonStyle(AppActionButtonStyle(tone: .accent))
+                    .disabled(oauth.busy)
+                    Text("Google 密码和验证码只在官方页面输入。登录凭据保存在本机 Keychain。")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .padding(.horizontal, FloatingPageChrome.cardInset)
                 }
-                Section {
-                    Text("Google 密码和验证码只在官方页面输入。客户端接收 Civitai 授权，登录凭据保存在本机 Keychain。").font(.caption).foregroundStyle(.secondary)
-                }
-            }.navigationTitle("账号登录").navigationBarTitleDisplayMode(.inline)
-                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("关闭") { if let onClose { onClose() } else { session.showLogin = false } } } }
+                .padding(.horizontal, FloatingPageChrome.pageInset)
+                .padding(.bottom, FloatingPageChrome.pageInset)
+            }
+            .floatingTitleBar(collectionLogin ? "启用账号收藏" : "账号登录", leading: {
+                Button {
+                    if let onClose { onClose() } else { session.showLogin = false }
+                } label: { FloatingPageIcon(symbol: "xmark") }
+                .buttonStyle(FloatingPageButtonStyle(iconOnly: true))
+                .accessibilityLabel("关闭")
+            }, actions: { EmptyView() })
                 .fullScreenCover(item: $oauth.browserPage) { page in
                     SystemAuthBrowser(url: page.url) { oauth.cancel() }.ignoresSafeArea()
                 }
-        }.ordinaryAppearance()
+        }.ordinaryPresentationAppearance()
     }
 }
 
 struct FollowButton: View {
     let creator: Creator
+    var onSignIn: (() -> Void)? = nil
     var mediaItemID: Int? = nil
     @EnvironmentObject private var session: SiteSession
     private var following: Bool { session.following.contains(creator.id) }
-    @ViewBuilder var body: some View {
-        if let mediaItemID {
-            button.buttonStyle(MediaActionButtonStyle(prominent: true, following: following, qaKey: "control.\(mediaItemID).follow"))
-                .accessibilityLabel(session.unknownUsers.contains(creator.id) ? "关注结果待确认" : (following ? "已关注" : "关注"))
-        } else {
-            button.font(.caption.weight(.semibold)).buttonStyle(AppActionButtonStyle(tone: following ? .neutral : .accent))
-        }
-    }
-    private var button: some View {
+
+    var body: some View {
         Button {
-            if session.account == nil { session.openLogin() }
-            else { Task { await session.setFollowing(!following, creator: creator) } }
+            if session.account == nil {
+                if let onSignIn { onSignIn() } else { session.openLogin() }
+            } else { Task { await session.setFollowing(!following, creator: creator) } }
         } label: {
-            if let mediaItemID {
-                MediaActionLabel(title: session.unknownUsers.contains(creator.id) ? "待确认" : (following ? "已关注" : "关注"),
-                                 symbol: session.unknownUsers.contains(creator.id) ? "arrow.clockwise" : (following ? "checkmark" : "plus"),
-                                 busy: session.pendingUsers.contains(creator.id), qaKey: "control.\(mediaItemID).follow")
+            ZStack {
+                Label("待确认", systemImage: "arrow.clockwise").hidden().accessibilityHidden(true)
+                Label("已关注", systemImage: "checkmark").hidden().accessibilityHidden(true)
+                followLabel
             }
-            else if session.pendingUsers.contains(creator.id) { ProgressView().controlSize(.small) }
-            else if session.unknownUsers.contains(creator.id) { Label("待确认", systemImage: "arrow.clockwise") }
-            else { Text(following ? "已关注" : "＋ 关注") }
         }
+        .buttonStyle(FollowButtonStyle(following: following, overMedia: mediaItemID != nil))
         .disabled(!session.pendingUsers.isEmpty || session.account?.id == creator.id)
-        .accessibilityIdentifier("follow-\(creator.id)")
+        .accessibilityLabel(session.unknownUsers.contains(creator.id) ? "关注结果待确认" : (following ? "已关注" : "关注"))
+        .accessibilityIdentifier(mediaItemID.map { "media.follow.\($0)" } ?? "follow-\(creator.id)")
+    }
+
+    @ViewBuilder private var followLabel: some View {
+        if session.pendingUsers.contains(creator.id) { ProgressView().controlSize(.small) }
+        else if session.unknownUsers.contains(creator.id) { Label("待确认", systemImage: "arrow.clockwise") }
+        else { Label(following ? "已关注" : "关注", systemImage: following ? "checkmark" : "plus") }
+    }
+}
+
+private struct FollowButtonStyle: ButtonStyle {
+    let following: Bool
+    let overMedia: Bool
+    @Environment(\.isEnabled) private var enabled
+
+    private var ink: Color { overMedia ? .white : (following ? .secondary : .accentColor) }
+    private var fill: Color { overMedia ? .black.opacity(0.55) : Color.primary.opacity(0.065) }
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.caption.weight(.semibold)).lineLimit(1)
+            .foregroundStyle(ink).tint(ink)
+            .padding(.horizontal, FloatingPageChrome.spacing)
+            .padding(.vertical, FloatingPageChrome.groupInset)
+            .background(fill, in: Capsule())
+            .frame(minWidth: FloatingPageChrome.controlHeight, minHeight: FloatingPageChrome.controlHeight)
+            .contentShape(Rectangle())
+            .opacity(enabled ? (configuration.isPressed ? 0.65 : 1) : 0.55)
     }
 }
 
@@ -243,6 +287,6 @@ struct FailureView: View {
     var body: some View {
         ContentUnavailableView {
             Label("暂时无法加载", systemImage: "wifi.exclamationmark")
-        } description: { Text(message) } actions: { Button("重试", action: retry).buttonStyle(AppActionButtonStyle()) }
+        } description: { Text(message) } actions: { StatusReloadButton(action: retry) }
     }
 }

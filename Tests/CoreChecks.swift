@@ -19,7 +19,7 @@ struct CoreChecks {
         precondition(reconstructed.queryItems?.first(where: { $0.name == "cursor" })?.value == opaque)
         precondition(reconstructed.queryItems?.first(where: { $0.name == "username" })?.value == "A&B")
         precondition(reconstructed.queryItems?.first(where: { $0.name == "type" })?.value == "video")
-        precondition(!FeedFilter().query().contains(where: { $0.name == "type" }), "Mixed feed omits type=all")
+        precondition(FeedFilter().query().contains(.init(name: "type", value: "image")), "New browsing defaults request images explicitly")
         let authorDefault = FeedFilter.defaults(for: .creator, kind: .video)
         let authorQuery = authorDefault.query(creator: .init(id: 12, username: "MixFixer", image: nil))
         precondition(authorQuery.contains(.init(name: "period", value: "AllTime")) && authorQuery.contains(.init(name: "sort", value: "Newest")) && authorQuery.contains(.init(name: "type", value: "video")), "Creator landing must query all-time newest in the incoming work's media type")

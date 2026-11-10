@@ -36,7 +36,7 @@ import Foundation
         check(TagPolicy.verdict(names: [], blocked: ["futa"]) == .allowed, "Explicit empty tag response is known")
         check(TagPolicy.verdict(names: ["futa"], blocked: ["futa"]) == .blocked, "Actual exact tag blocks")
         check(TagPolicy.verdict(names: ["futanari"], blocked: ["futa"]) == .allowed, "No invented synonyms")
-        for kind in MediaKind.allCases {
+        for kind in MediaKind.browsingCases {
             for context in [FilterContext.discovery, .following, .creator] {
                 let reset = FeedFilter(kind: kind, sort: "Most Comments", period: "Day", baseModel: "SDXL 1.0", onlyPG: true).resetting(in: context)
                 check(reset == FeedFilter.defaults(for: context, kind: kind), "Reset preserves current media type and uses the correct browsing context")

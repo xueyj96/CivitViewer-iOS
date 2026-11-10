@@ -5,8 +5,8 @@ import Foundation
     func tagCandidates(tagID: Int, author: Creator?, filter: FeedFilter, cursor: String?, limit: Int) async throws -> MediaPage
 }
 
-/// The public API's multi-tag input is OR. Preserve AND by checking every
-/// returned tag ID; probe bounded first pages to choose a useful candidate lane.
+/// Legacy public API paths can match any tag. Check every selected ID on a
+/// single-tag lane, whose complete results already cover the intersection.
 @MainActor enum TagConjunctionPager {
     static let pageSize = 100
     private struct Position: Codable {
@@ -26,6 +26,7 @@ import Foundation
         try Task.checkCancellation()
         var position: Position
         let raw: MediaPage
+        let matches: [MediaItem]
         if let cursor {
             guard cursor.hasPrefix("tags1."), cursor.utf8.count <= 65_536,
                   let data = Data(base64Encoded: String(cursor.dropFirst(6))),
@@ -39,11 +40,12 @@ import Foundation
             guard position.identity == source.feedIdentity else { throw ClientError.accountChanged }
             try validate(raw, anchor: position.anchor, author: criteria.author)
             if let next = raw.metadata.nextCursor, position.visited.contains(next) { throw ClientError.format("标签搜索的候选游标重复，请重新搜索。") }
+            matches = try raw.items.filter { try criteria.matches($0) }
             position.pages += 1
             position.candidates += raw.items.count
         } else {
             let identity = source.feedIdentity
-            var selected: (id: Int, page: MediaPage, matches: Int)?
+            var selected: (id: Int, page: MediaPage, matches: [MediaItem])?
             var probedPages = 0
             for tag in criteria.tags {
                 try Task.checkCancellation()
@@ -52,22 +54,24 @@ import Foundation
                 guard identity == source.feedIdentity else { throw ClientError.accountChanged }
                 try validate(page, anchor: tag.id, author: criteria.author)
                 probedPages += 1
-                let matches = try page.items.filter { try criteria.matches($0) }.count
+                let candidate = (id: tag.id, page: page, matches: try page.items.filter { try criteria.matches($0) })
+                if page.metadata.nextCursor == nil {
+                    // Every AND match is in this exhausted lane, so other lanes cannot add a result.
+                    selected = candidate
+                    break
+                }
                 if let old = selected {
-                    let ended = page.metadata.nextCursor == nil, oldEnded = old.page.metadata.nextCursor == nil
-                    // An exhausted lane contains the complete intersection. Otherwise
-                    // prefer observed matching density, never tag-ID-derived rarity.
-                    if (ended && !oldEnded) || (ended && oldEnded && page.items.count < old.page.items.count)
-                        || (!ended && !oldEnded && matches * max(1, old.page.items.count) > old.matches * max(1, page.items.count)) { selected = (tag.id, page, matches) }
-                } else { selected = (tag.id, page, matches) }
-                if page.items.isEmpty && page.metadata.nextCursor == nil { break }
+                    if candidate.matches.count * max(1, old.page.items.count) > old.matches.count * max(1, page.items.count) {
+                        selected = candidate
+                    }
+                } else { selected = candidate }
             }
             guard let selected else { throw ClientError.invalidResponse }
             raw = selected.page
+            matches = selected.matches
             position = .init(identity: identity, criteriaID: criteria.id, filter: filter, anchor: selected.id,
                              upstream: raw.metadata.nextCursor, pages: probedPages, candidates: raw.items.count, matches: 0)
         }
-        let matches = try raw.items.filter { try criteria.matches($0) }
         position.matches += matches.count
         position.upstream = raw.metadata.nextCursor
         let next: String?

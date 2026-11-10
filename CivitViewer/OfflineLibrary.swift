@@ -1,34 +1,65 @@
 import Foundation
 import Combine
-import CryptoKit
-import Network
+
+struct OfflineRepairAccess: Sendable {
+    let id = UUID()
+    let binding: UUID
+    let source: URL
+    let permit = OfflineWritePermit()
+}
 
 /// Durable, account-scoped files. Browsing-cache eviction never touches this directory.
 @MainActor final class OfflineLibrary: ObservableObject {
+    private enum Activity {
+        case normal(String)
+        case attention(String)
+        case waitingForNetwork(String)
+
+        var message: String {
+            switch self {
+            case .normal(let message), .attention(let message), .waitingForNetwork(let message): message
+            }
+        }
+    }
+
     static let shared = OfflineLibrary()
     @Published private(set) var accountID: Int?
+    @Published private(set) var bindingID = UUID()
     @Published private(set) var records: [OfflineRecord] = []
     @Published private(set) var diskBytes: Int64 = 0
     @Published private(set) var diskUsageKnown = false
     @Published private(set) var busy = false
-    @Published private(set) var status = "等待账号"
+    @Published private var activity = Activity.normal("等待账号")
     @Published private(set) var currentID: Int?
+    @Published private(set) var pausedTaskID: Int?
     @Published private(set) var progress: Double?
+    @Published private(set) var downloadedBytes: Int64 = 0
+    @Published private(set) var pausedByUser = false
     @Published private(set) var lastScan: Date?
+    @Published private(set) var posterIDs = Set<Int>()
     private var omittedIDs = Set<Int>()
     private var worker: Task<Void, Never>?
     private var generation = 0
+    private var bindingIdentity: String?
+    private var bindingPermit = OfflineWritePermit()
+    private var downloadPermit = OfflineWritePermit()
+    private(set) var loading = false
+    private var cleaning = false
+    private var needsStageRecovery = true
+    private var membershipVersions: [Int: Int] = [:]
+    private var conditionalRemoval: (ids: Set<Int>, permit: OfflineWritePermit)?
     private var active = true
-    private var connected = false
-    private var unmetered = false
+    private var network = BackgroundNetworkState.offline
+    private var networkObservation: AnyCancellable?
     private var rescanRequested = false
     private var healthy = true
     private var lastPersisted = Date.distantPast
     private var indexBytes: Int64 = 0
-    private var repairReserved: Int64 = 0
+    private var repairs: [UUID: OfflineRepairAccess] = [:]
+    private var repairReservations: [UUID: Int64] = [:]
     private var repairFamilyBytes: [String: Int64] = [:]
     private weak var session: SiteSession?
-    private let monitor = NWPathMonitor()
+    private let files = OfflineFileStore()
     private let root: URL
     private(set) var directory: URL?
     var autoEnabled: Bool { UserDefaults.standard.object(forKey: "offlineAutoSave") as? Bool ?? true }
@@ -38,12 +69,28 @@ import Network
         return Int64([1,5,10,20,50].contains(value) ? value : 10) * 1_000_000_000
     }
     var readyCount: Int { records.filter { $0.fileState == .ready }.count }
-    var canNetwork: Bool { connected && (!wifiOnly || unmetered) }
-    var metadataNetworkConnected: Bool { connected }
-    var unmeteredMetadataNetwork: Bool { connected && unmetered }
+    private(set) var status: String {
+        get { activity.message }
+        set { activity = .normal(newValue) }
+    }
+    var queueNotice: String? {
+        switch activity {
+        case .normal: nil
+        case .attention(let message), .waitingForNetwork(let message): message
+        }
+    }
+    var networkWaitNotice: String? {
+        guard case .waitingForNetwork = activity else { return nil }
+        return network.connected ? "连接非计费 Wi-Fi 后可下载" : "联网后可下载"
+    }
+    var canNetwork: Bool { network.allowsSync(wifiOnly: wifiOnly) }
+    var canPauseWork: Bool { worker != nil && !cleaning }
+    var downloadRecords: [OfflineRecord] {
+        records.filter { $0.fileState != .ready && $0.cloudState == .saved && !omittedIDs.contains($0.id) }
+    }
     var mediaItems: [MediaItem] {
         guard let directory else { return [] }
-        return records.filter { $0.fileState == .ready && FileManager.default.fileExists(atPath: directory.appendingPathComponent($0.fileName).path) }.map { $0.media(in: directory) }
+        return records.filter { $0.fileState == .ready }.map { $0.media(in: directory, hasPoster: posterIDs.contains($0.id)) }
     }
 
     private init() {
@@ -55,42 +102,74 @@ import Network
         }
         #endif
         root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("CivitOffline", isDirectory: true)
-        monitor.pathUpdateHandler = { [weak self] path in
-            let connected = path.status == .satisfied
-            let wifi = connected && (path.usesInterfaceType(.wifi) || path.usesInterfaceType(.wiredEthernet)) && !path.isExpensive && !path.isConstrained
-            Task { @MainActor in
-                guard let self else { return }
-                let wasAllowed = self.canNetwork
-                self.connected = connected; self.unmetered = wifi
-                if wasAllowed && !self.canNetwork && self.busy { self.pause(reason: connected ? "等待 Wi-Fi" : "离线，可浏览已保存作品") }
-                if !wasAllowed && self.canNetwork && self.active && self.autoEnabled, let session = self.session { self.requestSync(session: session) }
-            }
+        networkObservation = BackgroundNetworkMonitor.shared.observe { [weak self] in
+            self?.networkChanged(to: $0)
         }
-        monitor.start(queue: DispatchQueue(label: "CivitViewer.offline-network"))
     }
 
-    func bind(accountID: Int?, session: SiteSession) {
+    private func networkChanged(to state: BackgroundNetworkState) {
+        let wasAllowed = canNetwork
+        network = state
+        if wasAllowed && !canNetwork && busy {
+            pause(with: .waitingForNetwork(networkWaitMessage))
+        } else if case .waitingForNetwork = activity {
+            activity = canNetwork ? .normal("网络已恢复") : .waitingForNetwork(networkWaitMessage)
+        }
+        if !wasAllowed && canNetwork && active && autoEnabled, let session {
+            requestSync(session: session)
+        }
+    }
+
+    private var networkWaitMessage: String { network.connected ? "等待 Wi-Fi" : "离线，可浏览已保存作品" }
+
+    func bind(accountID: Int?, session: SiteSession) async {
+        guard !Task.isCancelled else { return }
         self.session = session
-        guard self.accountID != accountID else { return }
+        let identity = session.tagLibraryIdentity
+        guard self.accountID != accountID || bindingIdentity != identity else { return }
+        bindingPermit.invalidate()
+        bindingPermit = OfflineWritePermit()
+        repairs.values.forEach { $0.permit.invalidate() }
+        bindingID = UUID()
+        bindingIdentity = identity
+        let scope = bindingID
+        let permit = bindingPermit
+        loading = accountID != nil
+        cleaning = false
+        membershipVersions = [:]
+        conditionalRemoval = nil
+        pausedByUser = false
+        rescanRequested = false
         pause(reason: "切换账号")
+        pausedTaskID = nil
         self.accountID = accountID; records = []; omittedIDs = []; lastScan = nil; diskBytes = 0; indexBytes = 0; directory = nil; healthy = true; lastPersisted = .distantPast
-        diskUsageKnown = false; repairFamilyBytes = [:]
+        diskUsageKnown = false; repairFamilyBytes = [:]; posterIDs = []
         guard let accountID else { status = "登录后可管理当前账号的离线收藏"; return }
-        let key = SHA256.hash(data: Data(String(accountID).utf8)).map { String(format: "%02x", $0) }.joined()
-        let folder = root.appendingPathComponent(key, isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication])
-            var values = URLResourceValues(); values.isExcludedFromBackup = true
-            var target = folder; try target.setResourceValues(values)
-            directory = folder
-            let index = folder.appendingPathComponent("index.json")
-            if FileManager.default.fileExists(atPath: index.path) {
-                let manifest = try JSONDecoder().decode(OfflineManifest.self, from: Data(contentsOf: index))
-                guard manifest.version == 1 && manifest.accountID == accountID else { throw ClientError.invalidResponse }
-                records = manifest.records.filter { $0.id > 0 }; omittedIDs = manifest.omittedIDs; lastScan = manifest.lastScan
+        status = "正在读取离线收藏…"
+        let folder = OfflineFileStore.directory(root: root, owner: accountID)
+        let recoveryRoot = needsStageRecovery ? root : nil
+        needsStageRecovery = false
+        let load = files.enqueue({
+            if let recoveryRoot { OfflineFileStore.recoverStaging(in: recoveryRoot) }
+            try permit.check()
+            return try OfflineFileStore.load(directory: folder, owner: accountID)
+        }, completed: { [weak self] result in
+            guard let self, self.acceptsBinding(scope) else { return }
+            self.loading = false
+            self.directory = folder
+            switch result {
+            case .success(let value):
+                self.records = value.manifest.records.filter { $0.id > 0 }
+                self.omittedIDs = value.manifest.omittedIDs
+                self.lastScan = value.manifest.lastScan
+                if let snapshot = value.snapshot { self.apply(snapshot, directory: folder) }
+                self.activity = self.diskUsageKnown ? .normal("已读取本地收藏") : .attention("离线空间暂时无法统计，已暂停写入")
+            case .failure:
+                self.healthy = false
+                self.activity = .attention("本地收藏目录读取失败，已停止自动写入")
             }
-            status = reconcileFiles() ? "已读取本地收藏" : "离线空间暂时无法统计，已暂停写入"
-        } catch { healthy = false; status = "本地收藏目录读取失败，已停止自动写入" }
+        })
+        _ = await load.result
     }
 
     func setActive(_ value: Bool) {
@@ -106,48 +185,100 @@ import Network
         else if autoEnabled, let session { requestSync(session: session) }
     }
     func pause(reason: String = "已暂停") {
-        generation += 1; worker?.cancel(); worker = nil; busy = false; currentID = nil; progress = nil; status = reason
+        pause(with: .normal(reason))
+    }
+    private func pause(with activity: Activity) {
+        if let currentID { pausedTaskID = currentID }
+        generation += 1
+        downloadPermit.invalidate()
+        downloadPermit = OfflineWritePermit()
+        worker?.cancel(); worker = nil; currentID = nil; progress = nil; downloadedBytes = 0
+        if !cleaning { busy = false; self.activity = activity }
+    }
+    func pauseDownloads() {
+        pausedByUser = true
+        pause()
     }
     func resumeAll(session: SiteSession, includeRemovedCopies: Bool = false) {
-        if includeRemovedCopies { omittedIDs = []; try? persist(force: true) }
+        guard !loading, !cleaning else { return }
+        pausedByUser = false
+        if includeRemovedCopies { omittedIDs = []; schedulePersist(force: true) }
         requestSync(session: session, manual: true)
     }
 
-    func requestSync(session: SiteSession, manual: Bool = false) {
+    func download(_ id: Int, session: SiteSession) {
+        guard !busy, downloadRecords.contains(where: { $0.id == id }) else { return }
+        requestSync(session: session, manual: true, only: id)
+    }
+
+    func requestSync(session: SiteSession, manual: Bool = false, only targetID: Int? = nil) {
         #if DEBUG && targetEnvironment(simulator)
-        if ViewportAuditQA.enabled { return }
+        if ViewportAuditQA.enabled {
+            if ViewportAuditQA.downloadTasksEnabled, manual, !busy, targetID == nil, let pausedTaskID {
+                seedDownloadProgressForQA(pausedTaskID)
+            }
+            return
+        }
         #endif
         self.session = session
-        guard repairReserved == 0 else { return }
-        guard manual || autoEnabled else { return }
-        guard active, healthy, let owner = accountID, session.account?.id == owner, session.hasCollectionAccess else { return }
-        guard canNetwork else { status = connected ? "等待 Wi-Fi" : "离线，可浏览已保存作品"; return }
+        guard !loading, !cleaning, repairs.isEmpty else { return }
+        guard manual || (autoEnabled && !pausedByUser) else { return }
+        guard active, healthy, acceptsBinding(bindingID), let owner = accountID,
+              session.account?.id == owner, session.hasCollectionAccess else { return }
+        guard canNetwork else { activity = .waitingForNetwork(networkWaitMessage); return }
         if busy { rescanRequested = true; return }
-        guard reconcileFiles() else { status = "离线空间暂时无法统计，已暂停下载和转换"; return }
         let revision = generation
-        busy = true; status = "正在扫描全部收藏…"
+        let permit = downloadPermit
+        let resumedID = targetID == nil ? pausedTaskID : nil
+        if targetID == nil { pausedTaskID = nil }
+        busy = true; status = "正在核对本地空间…"
         worker = Task { [weak self] in
             guard let self else { return }
             defer {
                 if revision == self.generation {
-                    self.busy = false; self.currentID = nil; self.progress = nil; self.worker = nil
+                    self.busy = false; self.currentID = nil; self.progress = nil; self.downloadedBytes = 0; self.worker = nil
                     if self.rescanRequested { self.rescanRequested = false; self.requestSync(session: session) }
                 }
             }
-            do { try await self.sync(session: session, owner: owner, revision: revision) }
-            catch is CancellationError { if revision == self.generation { self.status = "已暂停" } }
-            catch { if revision == self.generation { self.status = "同步未完成，已保存文件保留，可稍后重试"; try? self.persist(force: true) } }
+            do {
+                let known = await self.reconcileFiles()
+                try self.check(owner, revision)
+                guard known else { self.activity = .attention("离线空间暂时无法统计，已暂停下载和转换"); return }
+                self.status = "正在扫描全部收藏…"
+                try await self.sync(session: session, owner: owner, revision: revision, permit: permit, targetID: targetID, resumedID: resumedID)
+            } catch is CancellationError {
+                if revision == self.generation { self.status = "已暂停" }
+            } catch {
+                guard (try? self.check(owner, revision)) != nil else { return }
+                self.activity = .attention("同步未完成，已保存文件保留，可稍后重试")
+                try? await self.persist(force: true)
+            }
         }
+    }
+
+    #if DEBUG && targetEnvironment(simulator)
+    /// Drive the real card controls with a cancellable local fixture, without fetching media.
+    func seedDownloadProgressForQA(_ id: Int) {
+        guard ViewportAuditQA.downloadTasksEnabled, worker == nil, downloadRecords.contains(where: { $0.id == id }) else { return }
+        pausedTaskID = nil; currentID = id; progress = 0.42; busy = true
+        worker = Task { _ = try? await Task.sleep(for: .seconds(600)) }
+    }
+    #endif
+
+    private func acceptsBinding(_ scope: UUID) -> Bool {
+        bindingID == scope && bindingIdentity == session?.tagLibraryIdentity
     }
 
     private func check(_ owner: Int, _ revision: Int) throws {
         try Task.checkCancellation()
-        guard accountID == owner, generation == revision, active else { throw CancellationError() }
+        guard accountID == owner, session?.account?.id == owner, generation == revision, acceptsBinding(bindingID), active else {
+            throw CancellationError()
+        }
         guard canNetwork else { throw CancellationError() }
     }
 
     func refreshTags(session: SiteSession) async {
-        guard !busy, active, canNetwork, let owner = accountID, session.account?.id == owner else { return }
+        guard !busy, !loading, acceptsBinding(bindingID), active, canNetwork, let owner = accountID, session.account?.id == owner else { return }
         let ids = records.filter { $0.tagNames == nil }.map(\.id)
         guard !ids.isEmpty else { return }
         busy = true; let revision = generation
@@ -166,13 +297,13 @@ import Network
                 for item in items {
                     if let names = item.tagNames, let index = records.firstIndex(where: { $0.id == item.id }) { records[index].tagNames = names }
                 }
-                try persist(force: true)
+                try await persist(force: true)
             } catch { break }
         }
         if revision == generation { status = "收藏标签已更新；仍有 \(records.filter { $0.tagNames == nil }.count) 项待核实" }
     }
 
-    private func sync(session: SiteSession, owner: Int, revision: Int) async throws {
+    private func sync(session: SiteSession, owner: Int, revision: Int, permit: OfflineWritePermit, targetID: Int?, resumedID: Int?) async throws {
         try await session.refreshCollections(); try check(owner, revision)
         var sources: [Int: MediaItem] = [:], membership: [Int: Set<Int>] = [:]
         for collection in session.collections {
@@ -193,7 +324,7 @@ import Network
                     }
                 }
                 status = "已扫描 \(sources.count) 项可访问收藏"
-                try persist()
+                try await persist()
                 cursor = page.metadata.nextCursor
                 if let cursor, !cursors.insert(cursor).inserted { throw ClientError.invalidResponse }
             } while cursor != nil
@@ -213,230 +344,489 @@ import Network
                         records[index].collectionIDs = folders; records[index].cloudState = folders.isEmpty ? .localOnly : .saved; records[index].checkedAt = Date()
                     }
                 } catch is CancellationError { throw CancellationError() }
-                catch { if let index = records.firstIndex(where: { $0.id == id }) { records[index].cloudState = .unknown } }
+                catch {
+                    try check(owner, revision)
+                    if let index = records.firstIndex(where: { $0.id == id }) { records[index].cloudState = .unknown }
+                }
             }
         }
-        lastScan = Date(); try persist(force: true)
-        for id in sources.keys.sorted(by: >) {
+        lastScan = Date(); try await persist(force: true)
+        var downloadIDs = targetID.map { [$0] } ?? sources.keys.sorted(by: >)
+        if let resumedID, let index = downloadIDs.firstIndex(of: resumedID) {
+            downloadIDs.remove(at: index)
+            downloadIDs.insert(resumedID, at: 0)
+        }
+        for id in downloadIDs {
             try check(owner, revision)
             guard !omittedIDs.contains(id), let item = sources[id], let index = records.firstIndex(where: { $0.id == id }), records[index].fileState != .ready else { continue }
-            let budget = downloadBudget()
-            guard budget > 1024 else { status = "离线空间已满或可用空间不足，整理后继续"; try persist(force: true); return }
-            currentID = id; progress = nil; status = "正在保存 \(item.isVideo ? "视频" : "图片") #\(id)…"
-            do { try await save(item, owner: owner, revision: revision, budget: budget) }
+            let budget = await downloadBudget()
+            try check(owner, revision)
+            guard budget > 1024 else {
+                activity = .attention("离线空间已满或可用空间不足，整理后继续")
+                try await persist(force: true)
+                return
+            }
+            currentID = id; progress = nil; downloadedBytes = 0; status = "正在保存 \(item.isVideo ? "视频" : "图片") #\(id)…"
+            do { try await save(item, owner: owner, revision: revision, budget: budget, permit: permit) }
             catch is CancellationError { throw CancellationError() }
-            catch MediaDownloadError.limitExceeded { status = "当前作品超过剩余离线空间，扩大上限或整理后继续"; try persist(force: true); return }
-            catch { if let index = records.firstIndex(where: { $0.id == id }) { records[index].fileState = .failed }; try persist() }
+            catch MediaDownloadError.limitExceeded, OfflineFileStoreError.limitExceeded {
+                try check(owner, revision)
+                activity = .attention("当前作品超过剩余离线空间，扩大上限或整理后继续")
+                try await persist(force: true)
+                return
+            }
+            catch {
+                try check(owner, revision)
+                if let index = records.firstIndex(where: { $0.id == id }), records[index].fileState != .ready {
+                    records[index].fileState = .failed
+                }
+                try await persist()
+            }
         }
-        reconcileFiles(); try persist(force: true)
+        let known = await reconcileFiles()
+        try check(owner, revision)
+        guard known else { activity = .attention("离线空间暂时无法统计，已暂停写入"); return }
+        try await persist(force: true)
+        try check(owner, revision)
+        if let targetID {
+            if records.first(where: { $0.id == targetID })?.fileState == .ready { status = "已下载作品 #\(targetID)" }
+            else { status = "作品 #\(targetID) 暂未下载，可稍后重试" }
+            return
+        }
         let failed = records.filter { $0.fileState == .failed }.count
         let skipped = Set(sources.keys).intersection(omittedIDs).count
         status = failed == 0 ? (skipped == 0 ? "已保存全部可访问收藏" : "已保存 \(readyCount) 项，按你的设置跳过 \(skipped) 项") : "已保存 \(readyCount) 项，\(failed) 项失败，可重试"
     }
 
-    private func save(_ item: MediaItem, owner: Int, revision: Int, budget: Int64) async throws {
+    private func save(_ item: MediaItem, owner: Int, revision: Int, budget: Int64, permit: OfflineWritePermit) async throws {
         guard diskUsageKnown else { throw MediaRepairError.storageUnknown }
         guard let directory, let source = item.mediaURL, source.scheme == "https", source.pathExtension.lowercased() != "m3u8",
               let record = records.first(where: { $0.id == item.id }) else { throw ClientError.invalidResponse }
         let target = directory.appendingPathComponent(record.fileName)
         var copied = false
-        if let cached = MediaCache.shared.cached(source, video: item.isVideo), let size = try? cached.resourceValues(forKeys: [.fileSizeKey]).fileSize, size > 0 {
-            guard Int64(size) <= budget else { throw MediaDownloadError.limitExceeded }
-            copied = (try? FileManager.default.copyItem(at: cached, to: target)) != nil
-            if !copied { try? FileManager.default.removeItem(at: target) }
+        if let cached = MediaCache.shared.cached(source, video: item.isVideo) {
+            if item.isVideo { MediaCache.shared.pin(source) }
+            defer { if item.isVideo { MediaCache.shared.unpin(source) } }
+            do {
+                _ = try await files.enqueue {
+                    try OfflineFileStore.install(cached, at: target, copying: true, limit: budget, permit: permit)
+                }.value
+                copied = true
+            } catch is CancellationError { throw CancellationError() }
+            catch OfflineFileStoreError.limitExceeded { throw OfflineFileStoreError.limitExceeded }
+            catch {
+                // The browsing cache may evict the file between lookup and
+                // copy. Retry from the source without touching the destination.
+                try check(owner, revision)
+            }
         }
         if !copied {
             let temporary = try await BoundedDownload.fetch(source, maxBytes: budget, reserveBytes: 1_000_000_000) { [weak self] bytes, total in
                 Task { @MainActor in
                     guard let self, self.generation == revision, self.currentID == item.id else { return }
+                    self.downloadedBytes = max(0, bytes)
                     self.progress = total > 0 ? min(1, Double(bytes) / Double(total)) : nil
                 }
             }
-            defer { try? FileManager.default.removeItem(at: temporary) }
+            defer { discardTemporary(temporary) }
             try check(owner, revision)
-            let size = Int64(try temporary.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0)
-            // The temporary file already consumes free space; only the logical
-            // quota needs adding again before an atomic same-volume move.
-            guard size > 0, size <= max(0, capacity - diskBytes) else { throw MediaDownloadError.limitExceeded }
-            try? FileManager.default.removeItem(at: target)
-            try FileManager.default.moveItem(at: temporary, to: target)
+            let limit = min(budget, max(0, capacity - diskBytes))
+            _ = try await files.enqueue {
+                try OfflineFileStore.install(temporary, at: target, copying: false, limit: limit, permit: permit)
+            }.value
         }
         try check(owner, revision)
-        try FileManager.default.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: target.path)
         if let index = records.firstIndex(where: { $0.id == item.id }) {
             records[index].fileState = .ready; records[index].savedAt = Date()
         }
-        refreshFileSize(item.id); try persist()
-        if item.isVideo, let poster = item.posterURL, downloadBudget() > 1024 {
+        await refreshFileSize(item.id)
+        try check(owner, revision)
+        try await persist()
+        try check(owner, revision)
+        if item.isVideo, let poster = item.posterURL, !posterIDs.contains(item.id) {
             let posterTarget = directory.appendingPathComponent(record.posterName)
-            if !FileManager.default.fileExists(atPath: posterTarget.path) {
-                if let file = try? await BoundedDownload.fetch(poster, maxBytes: min(downloadBudget(), 16 * 1024 * 1024), reserveBytes: 1_000_000_000) {
-                    defer { try? FileManager.default.removeItem(at: file) }
-                    try check(owner, revision)
-                    try? FileManager.default.moveItem(at: file, to: posterTarget)
-                    try? FileManager.default.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: posterTarget.path)
-                }
+            let limit = min(await downloadBudget(), 16 * 1024 * 1024)
+            try check(owner, revision)
+            if limit > 1024, let file = try? await BoundedDownload.fetch(poster, maxBytes: limit, reserveBytes: 1_000_000_000) {
+                defer { discardTemporary(file) }
+                try check(owner, revision)
+                let remaining = min(limit, max(0, capacity - diskBytes))
+                _ = try? await files.enqueue {
+                    try OfflineFileStore.install(file, at: posterTarget, copying: false, limit: remaining, permit: permit)
+                }.value
             }
         }
-        refreshFileSize(item.id); try persist()
+        try check(owner, revision)
+        await refreshFileSize(item.id)
+        try check(owner, revision)
+        try await persist()
     }
 
     func accept(_ update: SavedMembershipUpdate) {
-        guard update.accountID == accountID, let index = records.firstIndex(where: { $0.id == update.imageID }) else { return }
+        guard acceptsBinding(bindingID), update.accountID == accountID,
+              let index = records.firstIndex(where: { $0.id == update.imageID }) else { return }
         records[index].collectionIDs = update.collectionIDs
         records[index].cloudState = update.collectionIDs.isEmpty ? .unknown : .saved
-        records[index].checkedAt = Date(); try? persist(force: true)
-    }
-    func opened(_ id: Int) {
-        if let index = records.firstIndex(where: { $0.id == id }) { records[index].lastOpenedAt = Date(); try? persist() }
+        records[index].checkedAt = Date()
+        membershipVersions[update.imageID, default: 0] += 1
+        if let conditionalRemoval, conditionalRemoval.ids.contains(update.imageID) {
+            conditionalRemoval.permit.invalidate()
+        }
+        schedulePersist(force: true)
     }
 
-    func removeLocal(_ ids: Set<Int>) {
+    func opened(_ id: Int, binding scope: UUID) {
+        guard acceptsBinding(scope), let index = records.firstIndex(where: { $0.id == id }) else { return }
+        records[index].lastOpenedAt = Date()
+        schedulePersist()
+    }
+
+    func removeLocal(_ ids: Set<Int>, ifUnfavorited: Bool = false) {
+        guard acceptsBinding(bindingID), !loading, !cleaning, healthy, let directory, let accountID else { return }
         pause(reason: "正在清理本地副本…")
-        guard let directory, healthy else { return }
-        omittedIDs.formUnion(ids)
-        do {
-            try persist(force: true) // Persist exclusions before removing any bytes.
-            var removed = Set<Int>()
-            let snapshot = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
-            let repairFiles = MediaRepairStore.familySnapshot(snapshot).files
-            for record in records where ids.contains(record.id) {
-                do {
-                    let stem = MediaRepairStore.stem(directory.appendingPathComponent(record.fileName))
-                    for file in repairFiles[stem] ?? [] { try FileManager.default.removeItem(at: file) }
-                    for name in [record.fileName, record.posterName] {
-                        let file = directory.appendingPathComponent(name)
-                        if FileManager.default.fileExists(atPath: file.path) { try FileManager.default.removeItem(at: file) }
-                    }
-                    removed.insert(record.id)
-                } catch { /* Retain the record if a file could not be removed. */ }
+        if let pausedTaskID, ids.contains(pausedTaskID) { self.pausedTaskID = nil }
+        cleaning = true
+        busy = true
+        invalidateRepairs(for: ids)
+        let scope = bindingID
+        let permit = bindingPermit
+        let exclusions = omittedIDs.union(ids)
+        let intent = OfflineManifest(accountID: accountID, records: records, omittedIDs: exclusions, lastScan: lastScan)
+        let targets = records.filter { ids.contains($0.id) }
+        let membership = ifUnfavorited ? OfflineWritePermit() : nil
+        if let membership { conditionalRemoval = (ids, membership) }
+        files.enqueue({
+            try OfflineFileStore.removeAfterExcluding(targets, manifest: intent, in: directory,
+                                                      binding: permit, membership: membership)
+        }, completed: { [weak self] result in
+            guard let self, self.acceptsBinding(scope) else { return }
+            self.cleaning = false
+            self.busy = false
+            self.conditionalRemoval = nil
+            switch result {
+            case .success(let value):
+                self.omittedIDs = exclusions
+                self.applyIndexSize(value.indexSize)
+                if let removed = value.removed { self.records.removeAll { removed.contains($0.id) } }
+                if let snapshot = value.snapshot { self.apply(snapshot, directory: directory) }
+                else { self.diskUsageKnown = false }
+                self.status = value.removed?.count == ids.count
+                    ? "已清理 \(ids.count) 项本地副本，云端收藏保留"
+                    : "部分文件暂时无法清理，请稍后重试"
+            case .failure(let error):
+                self.status = error is CancellationError ? "收藏状态已更新，请重新核对" : "本地目录未能保存，清理已停止"
             }
-            records.removeAll { removed.contains($0.id) }; reconcileFiles(); try persist(force: true)
-            status = removed.count == ids.count ? "已清理 \(removed.count) 项本地副本，云端收藏保留" : "部分文件暂时无法清理，请稍后重试"
-        } catch { status = "本地目录未能保存，清理已停止" }
+            self.schedulePersist(force: true)
+        })
     }
 
     func cleanUnfavorited(session: SiteSession, ids: Set<Int>? = nil) {
-        guard !busy, canNetwork, let owner = accountID, session.account?.id == owner, session.hasCollectionAccess else { status = "请联网后核对并清理"; return }
+        guard !busy, !loading, !cleaning, acceptsBinding(bindingID), canNetwork,
+              let owner = accountID, session.account?.id == owner, session.hasCollectionAccess else {
+            status = "请联网后核对并清理"
+            return
+        }
         let candidates = records.filter { ids?.contains($0.id) ?? true }.map(\.id)
-        let revision = generation; busy = true
+        let revision = generation
+        busy = true
         worker = Task {
             var confirmed = Set<Int>()
             defer { if generation == revision { busy = false; worker = nil } }
             for (offset, id) in candidates.enumerated() {
+                let membershipVersion = membershipVersions[id, default: 0]
                 do {
-                    try check(owner, revision); status = "正在核对 \(offset + 1) / \(candidates.count)…"
+                    try check(owner, revision)
+                    status = "正在核对 \(offset + 1) / \(candidates.count)…"
                     let folders = try await session.allSavedMembership(id)
                     try check(owner, revision)
+                    guard membershipVersions[id, default: 0] == membershipVersion else { continue }
                     if folders.isEmpty { confirmed.insert(id) }
-                    if let index = records.firstIndex(where: { $0.id == id }) { records[index].collectionIDs = folders; records[index].cloudState = folders.isEmpty ? .localOnly : .saved; records[index].checkedAt = Date() }
-                } catch is CancellationError { return }
-                catch { if let index = records.firstIndex(where: { $0.id == id }) { records[index].cloudState = .unknown } }
+                    if let index = records.firstIndex(where: { $0.id == id }) {
+                        records[index].collectionIDs = folders
+                        records[index].cloudState = folders.isEmpty ? .localOnly : .saved
+                        records[index].checkedAt = Date()
+                    }
+                } catch {
+                    guard (try? check(owner, revision)) != nil else { return }
+                    if error is CancellationError { return }
+                    guard membershipVersions[id, default: 0] == membershipVersion else { continue }
+                    if let index = records.firstIndex(where: { $0.id == id }) { records[index].cloudState = .unknown }
+                }
             }
-            guard generation == revision else { return }
-            try? persist(force: true)
-            if !confirmed.isEmpty { removeLocal(confirmed) }
-            else { status = "没有确认可清理的已取消收藏；待核对文件保留" }
+            guard (try? check(owner, revision)) != nil else { return }
+            if confirmed.isEmpty {
+                schedulePersist(force: true)
+                status = "没有确认可清理的已取消收藏；待核对文件保留"
+            } else {
+                // A membership event can supersede a prior successful check.
+                let stillConfirmed = Set(records.filter { $0.cloudState == .localOnly }.map(\.id))
+                let removable = confirmed.intersection(stillConfirmed)
+                if removable.isEmpty {
+                    schedulePersist(force: true)
+                    status = "没有确认可清理的已取消收藏；待核对文件保留"
+                } else { removeLocal(removable, ifUnfavorited: true) }
+            }
         }
     }
 
     func clearAll() {
+        guard acceptsBinding(bindingID), !loading, !cleaning, let directory, let accountID else { return }
         UserDefaults.standard.set(false, forKey: "offlineAutoSave")
-        if !healthy, let directory {
-            pause(reason: "正在清理离线目录…")
-            do {
-                for file in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) { try FileManager.default.removeItem(at: file) }
-                records = []; omittedIDs = []; lastScan = nil; diskBytes = 0; indexBytes = 0; healthy = true
-                _ = reconcileFiles()
-                try persist(force: true); status = "离线目录已清理，自动保存已关闭"
-            } catch { status = "部分本地文件无法清理，请稍后重试" }
+        if healthy {
+            removeLocal(Set(records.map(\.id)))
             return
         }
-        removeLocal(Set(records.map(\.id)))
+        pause(reason: "正在清理离线目录…")
+        pausedTaskID = nil
+        cleaning = true
+        busy = true
+        invalidateRepairs()
+        let scope = bindingID
+        let permit = bindingPermit
+        files.enqueue({
+            try permit.check()
+            try OfflineFileStore.empty(directory: directory)
+            return try OfflineFileStore.load(directory: directory, owner: accountID)
+        }, completed: { [weak self] result in
+            guard let self, self.acceptsBinding(scope) else { return }
+            self.cleaning = false
+            self.busy = false
+            switch result {
+            case .success(let value):
+                self.records = []
+                self.omittedIDs = []
+                self.lastScan = nil
+                self.diskBytes = 0
+                self.indexBytes = 0
+                self.posterIDs = []
+                self.repairFamilyBytes = [:]
+                self.healthy = true
+                self.diskUsageKnown = false
+                if let snapshot = value.snapshot { self.apply(snapshot, directory: directory) }
+                self.schedulePersist(force: true)
+                self.status = "离线目录已清理，自动保存已关闭"
+            case .failure:
+                self.diskUsageKnown = false
+                self.status = "部分本地文件无法清理，请稍后重试"
+            }
+        })
     }
 
-    private func downloadBudget() -> Int64 {
+    private func downloadBudget() async -> Int64 {
         guard diskUsageKnown, let directory else { return 0 }
-        let values = try? directory.resourceValues(forKeys: [.volumeAvailableCapacityKey])
-        return OfflineQuota.downloadBudget(used: diskBytes + repairReserved, limit: capacity, free: values?.volumeAvailableCapacity.map(Int64.init))
+        let scope = bindingID
+        let free = try? await files.enqueue { OfflineFileStore.freeBytes(in: directory) }.value
+        guard acceptsBinding(scope), diskUsageKnown else { return 0 }
+        let reserved = repairReservations.values.reduce(0, +)
+        return OfflineQuota.downloadBudget(used: diskBytes + reserved, limit: capacity, free: free)
     }
+
     func ownsRepairSource(_ source: URL) -> Bool {
-        guard healthy, let directory, source.isFileURL,
+        guard acceptsBinding(bindingID), healthy, !loading, !cleaning, let directory, source.isFileURL,
               source.deletingLastPathComponent().standardizedFileURL == directory.standardizedFileURL else { return false }
         return records.contains { $0.fileName == source.lastPathComponent && $0.fileState == .ready }
     }
-    func reserveRepairBudget() -> Int64 {
-        // Stop a previously admitted download before reserving output bytes.
-        // Its old generation cannot commit after pause returns.
+
+    func beginRepair(_ source: URL) -> OfflineRepairAccess? {
+        guard ownsRepairSource(source) else { return nil }
+        let access = OfflineRepairAccess(binding: bindingID, source: source)
+        repairs[access.id] = access
+        return access
+    }
+
+    func acceptsRepair(_ access: OfflineRepairAccess) -> Bool {
+        acceptsBinding(access.binding) && repairs[access.id] != nil
+            && (try? access.permit.check()) != nil && ownsRepairSource(access.source)
+    }
+
+    func repairIdentity(_ access: OfflineRepairAccess) async throws -> MediaRepairStore.Identity {
+        guard acceptsRepair(access) else { throw CancellationError() }
+        let identity = try await files.enqueue {
+            try access.permit.check()
+            guard let identity = MediaRepairStore.identity(access.source) else { throw MediaRepairError.unavailable }
+            return identity
+        }.value
+        guard acceptsRepair(access) else { throw CancellationError() }
+        return identity
+    }
+
+    func reserveRepairBudget(_ access: OfflineRepairAccess) async throws -> Int64 {
+        guard acceptsRepair(access) else { throw CancellationError() }
         if busy { pause(reason: "正在修复离线视频，收藏下载稍后继续") }
-        guard reconcileFiles() else { return 0 }
-        let budget = min(536_870_912, downloadBudget())
-        repairReserved += budget
+        let known = await reconcileFiles()
+        guard acceptsRepair(access) else { throw CancellationError() }
+        guard known else { throw MediaRepairError.storageUnknown }
+        let budget = min(536_870_912, await downloadBudget())
+        guard acceptsRepair(access) else { throw CancellationError() }
+        repairReservations[access.id] = budget
         return budget
     }
-    func releaseRepairBudget(_ bytes: Int64) {
-        repairReserved = max(0, repairReserved - bytes)
-        guard reconcileFiles() else { return }
-        if repairReserved == 0, autoEnabled, active, let session { requestSync(session: session) }
+
+    func releaseRepairBudget(_ access: OfflineRepairAccess) {
+        repairReservations[access.id] = nil
     }
-    func refreshRepairSizes() { if reconcileFiles() { try? persist(force: true) } }
-    @discardableResult private func reconcileFiles() -> Bool {
-        guard let directory, let snapshot = try? OfflineDiskSnapshot.read(directory: directory) else {
-            diskUsageKnown = false; return false // Keep prior bytes and ready states on UNKNOWN.
-        }
-        let files = snapshot.files
-        let repairBytes = MediaRepairStore.familySnapshot(files, sizes: snapshot.sizes).bytes
-        var known = Set(records.map(\.id))
-        // Recover files left by an interrupted index write into the "待核对" group.
-        for file in files where ["img", "mp4"].contains(file.pathExtension) && !file.lastPathComponent.contains(".poster.") {
-            guard let id = Int(file.deletingPathExtension().lastPathComponent), id > 0, !known.contains(id) else { continue }
-            known.insert(id)
-            let date = snapshot.created[file.standardizedFileURL.path]
-            var record = OfflineRecord(id: id, video: file.pathExtension == "mp4", username: nil, creatorID: nil, browsingLevel: nil, collectionIDs: [], cloudState: .unknown)
-            record.savedAt = date; records.append(record)
-        }
-        for index in records.indices {
-            let file = directory.appendingPathComponent(records[index].fileName)
-            let size = snapshot.sizes[file.standardizedFileURL.path] ?? 0 // Searched and absent in a complete snapshot.
-            let poster = snapshot.sizes[directory.appendingPathComponent(records[index].posterName).standardizedFileURL.path] ?? 0
-            records[index].bytes = size + poster + (repairBytes[MediaRepairStore.stem(file)] ?? 0)
-            if size > 0 { records[index].fileState = .ready }
-            else if records[index].fileState == .ready { records[index].fileState = .pending }
-        }
-        records.removeAll { omittedIDs.contains($0.id) && $0.bytes == 0 }
-        diskBytes = snapshot.totalBytes
-        indexBytes = snapshot.sizes[directory.appendingPathComponent("index.json").standardizedFileURL.path] ?? 0
-        repairFamilyBytes = repairBytes; diskUsageKnown = true
-        return true
+
+    func makeRepairStaging(_ access: OfflineRepairAccess) async throws -> URL {
+        guard acceptsRepair(access) else { throw CancellationError() }
+        let root = self.root
+        return try await files.enqueue {
+            try access.permit.check()
+            let temporary = root.appendingPathComponent(".repair-" + UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: false)
+            return temporary
+        }.value
     }
-    private func refreshFileSize(_ id: Int) {
-        guard let directory, let index = records.firstIndex(where: { $0.id == id }) else { return }
-        let prior = records[index].bytes
-        func sizeOrAbsent(_ file: URL) throws -> Int64 {
-            do {
-                let attributes = try FileManager.default.attributesOfItem(atPath: file.path)
-                guard attributes[.type] as? FileAttributeType == .typeRegular, let size = attributes[.size] as? NSNumber, size.int64Value >= 0 else { throw ClientError.invalidResponse }
-                return size.int64Value
-            } catch {
-                let value = error as NSError
-                if value.domain == NSCocoaErrorDomain && [NSFileNoSuchFileError, NSFileReadNoSuchFileError].contains(value.code) { return 0 }
-                throw error
+
+    func discardRepairStaging(_ directory: URL) {
+        discardTemporary(directory)
+    }
+
+    func commitRepair(_ access: OfflineRepairAccess, staged: URL, identity: MediaRepairStore.Identity,
+                      content: String, transcoded: Bool) async throws -> URL {
+        guard acceptsRepair(access), let directory, let reservation = repairReservations[access.id] else {
+            throw CancellationError()
+        }
+        let final = directory.appendingPathComponent(MediaRepairStore.outputName(access.source, content: content, transcoded: transcoded))
+        let stageDirectory = staged.deletingLastPathComponent()
+        let receipt = MediaRepairStore.receiptURL(access.source, directory: directory)
+        let stageReceipt = MediaRepairStore.receiptURL(access.source, directory: stageDirectory)
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            let job = files.enqueue {
+                try access.permit.check()
+                guard MediaRepairStore.identity(access.source) == identity else { throw CancellationError() }
+                let outputSize = try OfflineFileStore.sizeOrAbsent(staged)
+                guard outputSize > 0, outputSize <= max(0, reservation - 4096) else { throw MediaRepairError.output }
+                try MediaRepairStore.commit(access.source, original: access.source, content: content, transcoded: transcoded,
+                                            output: staged, directory: stageDirectory)
+                for url in [staged, stageReceipt] {
+                    try FileManager.default.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: url.path)
+                }
+                try access.permit.check()
+                try OfflineFileStore.replace(staged, at: final)
+                try OfflineFileStore.replace(stageReceipt, at: receipt)
             }
-        }
-        let file = directory.appendingPathComponent(records[index].fileName)
-        guard let media = try? sizeOrAbsent(file), let poster = try? sizeOrAbsent(directory.appendingPathComponent(records[index].posterName)) else { diskUsageKnown = false; return }
-        records[index].bytes = media + poster + (repairFamilyBytes[MediaRepairStore.stem(file)] ?? 0)
-        diskBytes += records[index].bytes - prior
+            try await job.value
+            try Task.checkCancellation()
+        } onCancel: { access.permit.invalidate() }
+        guard acceptsRepair(access) else { throw CancellationError() }
+        return final
     }
-    private func persist(force: Bool = false) throws {
-        guard healthy, let directory, let accountID else { return }
-        guard force || Date().timeIntervalSince(lastPersisted) > 2 else { return }
+
+    func finishRepair(_ access: OfflineRepairAccess) {
+        access.permit.invalidate()
+        repairs[access.id] = nil
+        repairReservations[access.id] = nil
+        if acceptsBinding(access.binding) {
+            Task { [weak self] in
+                guard let self, self.acceptsBinding(access.binding), !self.cleaning else { return }
+                if await self.reconcileFiles(), self.acceptsBinding(access.binding) {
+                    self.schedulePersist(force: true)
+                    if self.active, self.autoEnabled, let session = self.session { self.requestSync(session: session) }
+                }
+            }
+        } else if active, autoEnabled, let session { requestSync(session: session) }
+    }
+
+    private func invalidateRepairs(for ids: Set<Int>? = nil) {
+        let targetNames = ids.map { ids in Set(records.filter { ids.contains($0.id) }.map(\.fileName)) }
+        for access in repairs.values where targetNames?.contains(access.source.lastPathComponent) ?? true {
+            access.permit.invalidate()
+        }
+    }
+
+    private func reconcileFiles() async -> Bool {
+        guard acceptsBinding(bindingID), let directory else { return false }
+        let scope = bindingID
+        let job = files.enqueue({
+            try OfflineFileStore.scan(directory: directory)
+        }, completed: { [weak self] result in
+            guard let self, self.acceptsBinding(scope) else { return }
+            if case .success(let snapshot) = result { self.apply(snapshot, directory: directory) }
+            else { self.diskUsageKnown = false }
+        })
+        _ = await job.result
+        return acceptsBinding(scope) && diskUsageKnown
+    }
+
+    private func apply(_ snapshot: OfflineFileStore.Snapshot, directory: URL) {
+        let disk = snapshot.disk
+        let repairBytes = snapshot.repairBytes
+        var updated = records
+        var known = Set(updated.map(\.id))
+        // Recover the durable media left by an interrupted index write.
+        for file in disk.files where ["img", "mp4"].contains(file.pathExtension) && !file.lastPathComponent.contains(".poster.") {
+            guard let id = Int(file.deletingPathExtension().lastPathComponent), id > 0, known.insert(id).inserted else { continue }
+            var record = OfflineRecord(id: id, video: file.pathExtension == "mp4", username: nil, creatorID: nil,
+                                       browsingLevel: nil, collectionIDs: [], cloudState: .unknown)
+            record.savedAt = disk.created[file.standardizedFileURL.path]
+            updated.append(record)
+        }
+        var posters = Set<Int>()
+        for index in updated.indices {
+            let file = directory.appendingPathComponent(updated[index].fileName)
+            let size = disk.sizes[file.standardizedFileURL.path] ?? 0
+            let poster = disk.sizes[directory.appendingPathComponent(updated[index].posterName).standardizedFileURL.path] ?? 0
+            if poster > 0 { posters.insert(updated[index].id) }
+            updated[index].bytes = size + poster + (repairBytes[MediaRepairStore.stem(file)] ?? 0)
+            if size > 0 { updated[index].fileState = .ready }
+            else if updated[index].fileState == .ready { updated[index].fileState = .pending }
+        }
+        records = updated.filter { !omittedIDs.contains($0.id) || $0.bytes > 0 }
+        posterIDs = posters
+        diskBytes = disk.totalBytes
+        indexBytes = disk.sizes[directory.appendingPathComponent("index.json").standardizedFileURL.path] ?? 0
+        repairFamilyBytes = repairBytes
+        diskUsageKnown = true
+    }
+
+    private func refreshFileSize(_ id: Int) async {
+        guard acceptsBinding(bindingID), let directory, let record = records.first(where: { $0.id == id }) else { return }
+        let scope = bindingID
+        let file = directory.appendingPathComponent(record.fileName)
+        let poster = directory.appendingPathComponent(record.posterName)
+        let job = files.enqueue({
+            try (OfflineFileStore.sizeOrAbsent(file), OfflineFileStore.sizeOrAbsent(poster))
+        }, completed: { [weak self] result in
+            guard let self, self.acceptsBinding(scope), let index = self.records.firstIndex(where: { $0.id == id }) else { return }
+            guard case .success(let sizes) = result else { self.diskUsageKnown = false; return }
+            let prior = self.records[index].bytes
+            let size = sizes.0 + sizes.1 + (self.repairFamilyBytes[MediaRepairStore.stem(file)] ?? 0)
+            self.records[index].bytes = size
+            if sizes.1 > 0 { self.posterIDs.insert(id) } else { self.posterIDs.remove(id) }
+            self.diskBytes += size - prior
+        })
+        _ = await job.result
+    }
+
+    private func discardTemporary(_ url: URL) {
+        files.enqueue { try? FileManager.default.removeItem(at: url) }
+    }
+
+    @discardableResult private func schedulePersist(force: Bool = false) -> Task<Int64, Error>? {
+        guard acceptsBinding(bindingID), healthy, !loading, !cleaning, let directory, let accountID else { return nil }
+        let stamp = Date()
+        guard force || stamp.timeIntervalSince(lastPersisted) > 2 else { return nil }
+        lastPersisted = stamp
+        let scope = bindingID
         let manifest = OfflineManifest(accountID: accountID, records: records, omittedIDs: omittedIDs, lastScan: lastScan)
-        let file = directory.appendingPathComponent("index.json")
-        try JSONEncoder().encode(manifest).write(to: file, options: .atomic)
-        try FileManager.default.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: file.path)
-        let size = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? indexBytes
-        diskBytes += size - indexBytes; indexBytes = size
-        lastPersisted = Date()
+        // Capture before returning to the caller. Even a synchronous UI
+        // update followed by a rebind is ordered before reopening its index.
+        return files.enqueue({
+            try OfflineFileStore.persist(manifest, in: directory)
+        }, completed: { [weak self] result in
+            guard let self, self.acceptsBinding(scope) else { return }
+            if case .success(let size) = result { self.applyIndexSize(size) }
+            else if self.lastPersisted == stamp { self.lastPersisted = .distantPast }
+        })
+    }
+
+    private func persist(force: Bool = false) async throws {
+        if let job = schedulePersist(force: force) { _ = try await job.value }
+    }
+
+    private func applyIndexSize(_ size: Int64) {
+        diskBytes += size - indexBytes
+        indexBytes = size
     }
 }

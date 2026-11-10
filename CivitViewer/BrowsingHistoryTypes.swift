@@ -72,6 +72,28 @@ struct HistoryArchive: Codable, Equatable {
     var recordingEnabled = true
 }
 
+extension HistoryArchive {
+    private enum CodingKeys: String, CodingKey { case records, checkpoints, recordingEnabled }
+    private struct StoredCheckpointKind: Decodable {
+        struct Filter: Decodable { let kind: String }
+        let filter: Filter
+    }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        records = try values.decode([HistoryRecord].self, forKey: .records)
+        checkpoints = try values.decode([TimelineCheckpoint].self, forKey: .checkpoints)
+        recordingEnabled = try values.decode(Bool.self, forKey: .recordingEnabled)
+        let stored = try values.decode([StoredCheckpointKind].self, forKey: .checkpoints)
+        for index in checkpoints.indices where stored[index].filter.kind == "all" && checkpoints[index].filter.videoDurationRange == nil {
+            // Preserve the original focus when a trusted visit records its actual type.
+            // A cursor captured without a type cannot be reused under the new typed query.
+            let focus = checkpoints[index].focusedID
+            checkpoints[index].filter.kind = records.first(where: { $0.id == focus })?.kind.browsingSelection ?? .image
+            checkpoints[index].continuation = nil
+        }
+    }
+}
+
 enum BrowsingHistoryError: LocalizedError {
     case invalidOwner, ownerMismatch, incompatibleSchema, corrupted, invalidRecord, invalidProgress, invalidCheckpoint, writeFailed
     var errorDescription: String? {
@@ -110,12 +132,21 @@ struct PlaybackResumeCursor {
     func requested(initial: Double?, recovery: Double?) -> Double? {
         recovery ?? (hasRetained ? retained : initial)
     }
-    mutating func capture(position: Double, duration: Double, enabled: Bool) {
+    func target(initial: Double?, recovery: Double?, duration: Double) -> Double? {
+        if recovery == nil, let interruptionPosition, interruptionPosition < duration {
+            return interruptionPosition
+        }
+        return PlaybackResumePolicy.position(position: requested(initial: initial, recovery: recovery), duration: duration)
+    }
+    private var interruptionPosition: Double?
+
+    mutating func capture(position: Double, duration: Double, enabled: Bool, interrupted: Bool = false) {
         guard enabled || hasRetained, position.isFinite, position >= 0, duration.isFinite, duration > 0 else { return }
         hasRetained = true
-        retained = PlaybackResumePolicy.position(position: position, duration: duration)
+        interruptionPosition = interrupted && position < duration ? position : nil
+        retained = interruptionPosition ?? PlaybackResumePolicy.position(position: position, duration: duration)
     }
-    mutating func reset() { hasRetained = false; retained = nil }
+    mutating func reset() { self = Self() }
 }
 
 enum HistoryProgressPolicy {

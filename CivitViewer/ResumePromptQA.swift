@@ -16,7 +16,7 @@ import AVFoundation
     static var filter: FeedFilter {
         scenario.contains("following")
             ? FeedFilter(kind: .video, sort: "Most Comments", period: "Month", onlyPG: true)
-            : FeedFilter(kind: .all, sort: "Most Reactions", period: "Week", onlyPG: true)
+            : FeedFilter(kind: scenario.contains("video") ? .video : .image, sort: "Most Reactions", period: "Week", onlyPG: true)
     }
     static var defaultsSuite: String { "com.xueyj.civitviewer.native-resume-qa.\(runID)" }
     static let defaultsKey = "resumePromptDismissals.v2"
@@ -450,7 +450,7 @@ struct ResumePromptQAView: View {
                          } else {
                              ProgressView().tint(.white).frame(maxWidth: .infinity, maxHeight: .infinity).background(.black)
                          }
-                     }, authors: Color.black, search: Color.black, settings: Color.black)
+                     }, authors: Color.black, search: Color.black, collections: Color.black)
         } else {
             TabView(selection: $selectedTab) {
                 NavigationStack {

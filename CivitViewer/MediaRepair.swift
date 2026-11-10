@@ -46,25 +46,34 @@ private final class MediaRepairValidation: @unchecked Sendable {
 
     struct Result { let url: URL; let transcoded: Bool; let reused: Bool }
     func cached(_ address: URL, offline isOffline: Bool) -> Result? {
+        let offlineScope = isOffline && address.isFileURL
+        guard !offlineScope || offline.ownsRepairSource(address) else { return nil }
         let original = address.isFileURL ? address : cache.cached(address, video: true)
-        let directory = isOffline && address.isFileURL ? address.deletingLastPathComponent() : cache.repairDirectory
-        guard let match = MediaRepairStore.cached(address, original: original, directory: directory) else { return nil }
+        let directory = offlineScope ? address.deletingLastPathComponent() : cache.repairDirectory
+        guard let match = MediaRepairStore.cached(address, original: original, directory: directory, touch: !offlineScope) else { return nil }
         return .init(url: match.url, transcoded: match.transcoded, reused: true)
     }
 
     func repair(_ address: URL, offline isOffline: Bool, forceTranscode: Bool = false, diagnosticWorkID: Int? = nil,
                 progress: @escaping (MediaRepairStage, Double?) -> Void) async throws -> Result {
+        let offlineScope = isOffline && address.isFileURL
+        let requestedBinding = offlineScope ? offline.bindingID : nil
         let id = UUID(); progress(.waiting, nil)
         try await queue.acquire(id); defer { queue.release(id) }
         try Task.checkCancellation()
+        if let requestedBinding, requestedBinding != offline.bindingID { throw CancellationError() }
         if !forceTranscode, let existing = cached(address, offline: isOffline) { return existing }
         if ProcessInfo.processInfo.isLowPowerModeEnabled || ProcessInfo.processInfo.thermalState.rawValue >= ProcessInfo.ThermalState.serious.rawValue { throw MediaRepairError.paused }
         let cacheGeneration = cache.repairGeneration
-        let scope = isOffline && address.isFileURL ? address.deletingLastPathComponent() : cache.repairDirectory
-        let offlineScope = isOffline && address.isFileURL
-        guard !offlineScope || offline.ownsRepairSource(address) else { throw MediaRepairError.unavailable }
+        let scope = offlineScope ? address.deletingLastPathComponent() : cache.repairDirectory
+        let access = offlineScope ? offline.beginRepair(address) : nil
+        guard !offlineScope || access != nil else { throw MediaRepairError.unavailable }
         if !address.isFileURL { cache.pin(address) }
-        defer { if !address.isFileURL { cache.unpin(address) }; cache.trim(); if offlineScope { offline.refreshRepairSizes() } }
+        defer {
+            if !address.isFileURL { cache.unpin(address) }
+            cache.trim()
+            if let access { offline.finishRepair(access) }
+        }
 
         let original: URL
         if address.isFileURL { original = address }
@@ -74,12 +83,17 @@ private final class MediaRepairValidation: @unchecked Sendable {
                 Task { @MainActor in progress(.downloading, total > 0 ? min(1, Double(written) / Double(total)) : nil) }
             }
         }
-        let sourceIdentity = MediaRepairStore.identity(original)
-        guard sourceIdentity != nil else { throw MediaRepairError.unavailable }
+        let sourceIdentity: MediaRepairStore.Identity
+        if let access { sourceIdentity = try await offline.repairIdentity(access) }
+        else if let identity = MediaRepairStore.identity(original) { sourceIdentity = identity }
+        else { throw MediaRepairError.unavailable }
         func check() throws {
             try Task.checkCancellation()
-            guard MediaRepairStore.identity(original) == sourceIdentity,
-                  offlineScope ? offline.ownsRepairSource(address) : cache.repairGeneration == cacheGeneration else { throw CancellationError() }
+            if let access {
+                guard offline.acceptsRepair(access) else { throw CancellationError() }
+            } else {
+                guard MediaRepairStore.identity(original) == sourceIdentity, cache.repairGeneration == cacheGeneration else { throw CancellationError() }
+            }
         }
         try check(); progress(.inspecting, nil)
         let fingerprintTask = Task.detached(priority: .userInitiated) { try MediaRepairStore.contentHash(original) }
@@ -96,18 +110,27 @@ private final class MediaRepairValidation: @unchecked Sendable {
         for transcode in forceTranscode ? [true] : [false, true] {
             try check()
             if transcode && info.hdr != 0 { throw MediaRepairError.hdr }
-            let reservation = offlineScope ? offline.reserveRepairBudget() : cache.reserveRepairBudget()
-            defer { if offlineScope { offline.releaseRepairBudget(reservation) } else { cache.releaseRepairBudget(reservation) } }
+            let reservation: Int64
+            if let access { reservation = try await offline.reserveRepairBudget(access) }
+            else { reservation = cache.reserveRepairBudget() }
+            defer {
+                if let access { offline.releaseRepairBudget(access) } else { cache.releaseRepairBudget(reservation) }
+            }
             guard offlineScope ? offline.diskUsageKnown : cache.diskUsageKnown else { throw MediaRepairError.storageUnknown }
             let limit = max(0, reservation - 4096) // Include the bounded receipt in the same quota.
             guard limit >= 8 * 1024 * 1024 else { throw MediaRepairError.lowSpace }
-            let final = scope.appendingPathComponent(MediaRepairStore.outputName(address, content: content, transcoded: transcode))
-            // A real MP4 still needs its container hint for native inspection.
-            let partial = scope.appendingPathComponent(MediaRepairStore.stem(address) + "-" + UUID().uuidString + ".partial.mp4")
-            if !offlineScope { cache.protectRepairFile(partial); cache.protectRepairFile(final) }
+            let target = scope.appendingPathComponent(MediaRepairStore.outputName(address, content: content, transcoded: transcode))
+            let stage: URL?
+            if let access { stage = try await offline.makeRepairStaging(access) } else { stage = nil }
+            let partial = (stage ?? scope).appendingPathComponent(MediaRepairStore.stem(address) + "-" + UUID().uuidString + ".partial.mp4")
+            if !offlineScope { cache.protectRepairFile(partial); cache.protectRepairFile(target) }
             defer {
-                try? FileManager.default.removeItem(at: partial)
-                if !offlineScope { cache.unprotectRepairFile(partial); cache.unprotectRepairFile(final) }
+                if let stage { offline.discardRepairStaging(stage) }
+                else {
+                    try? FileManager.default.removeItem(at: partial)
+                    cache.unprotectRepairFile(partial)
+                    cache.unprotectRepairFile(target)
+                }
             }
             progress(transcode ? .transcoding : .remuxing, nil)
             do {
@@ -119,12 +142,16 @@ private final class MediaRepairValidation: @unchecked Sendable {
                     if transcode { throw MediaRepairError.validation }; continue
                 }
                 try check()
-                // The destination belongs to this exact source content/profile.
-                // An old failed derivative is replaceable; the original is not.
-                if FileManager.default.fileExists(atPath: final.path) { try FileManager.default.removeItem(at: final) }
-                try FileManager.default.moveItem(at: partial, to: final)
-                try FileManager.default.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: final.path)
-                try MediaRepairStore.commit(address, original: original, content: content, transcoded: transcode, output: final, directory: scope)
+                let final: URL
+                if let access {
+                    final = try await offline.commitRepair(access, staged: partial, identity: sourceIdentity, content: content, transcoded: transcode)
+                } else {
+                    if FileManager.default.fileExists(atPath: target.path) { try FileManager.default.removeItem(at: target) }
+                    try FileManager.default.moveItem(at: partial, to: target)
+                    try FileManager.default.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: target.path)
+                    try MediaRepairStore.commit(address, original: original, content: content, transcoded: transcode, output: target, directory: scope)
+                    final = target
+                }
                 let completed = PlaybackFailureDiagnostic(workID: diagnosticWorkID, source: sourceKind,
                     requestedURL: address, sourceURL: final, recoveryAttempted: true, error: nil, eventStatusCodes: [],
                     repairMode: transcode ? .transcode : .remux,

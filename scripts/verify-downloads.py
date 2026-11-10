@@ -15,7 +15,9 @@ extracted.parent.mkdir(exist_ok=True)
 extracted.write_text(actual)
 env = {**os.environ, 'DEVELOPER_DIR': '/Applications/Xcode.app/Contents/Developer'}
 binary = root / 'build/download-checks'
-subprocess.run(['xcrun', 'swiftc', str(root / 'CivitViewer/VideoDuration.swift'), str(root / 'CivitViewer/Models.swift'), str(extracted), str(root / 'Tests/DownloadChecks.swift'), '-o', str(binary)], check=True, env=env)
+sources = ['VideoDuration.swift', 'Models.swift', 'MediaLoadQueue.swift']
+subprocess.run(['xcrun', 'swiftc', *(str(root / 'CivitViewer' / name) for name in sources),
+                str(extracted), str(root / 'Tests/DownloadChecks.swift'), '-o', str(binary)], check=True, env=env)
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):

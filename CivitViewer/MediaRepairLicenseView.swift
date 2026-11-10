@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct MediaRepairLicenseView: View {
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
@@ -11,7 +12,9 @@ struct MediaRepairLicenseView: View {
                 if let url = Bundle.main.url(forResource: "FFmpeg-LGPL", withExtension: "txt"), let text = try? String(contentsOf: url, encoding: .utf8) {
                     Text(text).font(.caption).textSelection(.enabled)
                 }
-            }.padding(20).frame(maxWidth: .infinity, alignment: .leading)
-        }.navigationTitle("开源组件").ordinaryAppearance()
+            }
+            .pageScrollContentInsets()
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }.floatingTitleBar("开源组件").ordinaryAppearance()
     }
 }

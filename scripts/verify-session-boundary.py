@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile the production SiteSession boundary methods into a credential-free fake harness."""
+"""Exercise the production request client with local OAuth, WebKit and public HTTP doubles."""
 from hashlib import sha256
 from pathlib import Path
 import os
@@ -58,27 +58,19 @@ def extract_braced(marker: str) -> str:
 
 
 identity_line = next(line.strip() for line in site.splitlines() if line.strip().startswith("var feedIdentity: String {"))
-ensure_origin = extract_braced("private func ensureOrigin() async throws")
 request = extract_braced("private func request<T: Decodable>(")
 request = request.replace("private func request<T:", "func request<T:", 1)
-decode = extract_braced("private func decode<T: Decodable>(")
+hydrate_media = extract_braced("private func hydrateMedia(").replace("private func ", "func ", 1)
 
 replacements = {
     "    // INSERT_EXTRACTED_FEED_IDENTITY": identity_line,
-    "    // INSERT_EXTRACTED_ENSURE_ORIGIN": ensure_origin,
     "    // INSERT_EXTRACTED_REQUEST": request,
-    "    // INSERT_EXTRACTED_DECODE": decode,
+    "    // INSERT_EXTRACTED_HYDRATE_MEDIA": hydrate_media,
 }
 for marker, implementation in replacements.items():
     if test.count(marker) != 1:
         raise ValueError(f"Expected one extraction marker: {marker}")
     test = test.replace(marker, implementation, 1)
-
-# Keep the production polling/qualification logic exact while shortening the
-# wait interval for this fake-only fixture. No transport or epoch checks change.
-test = test.replace("Task.sleep(for: .milliseconds(250))", "Task.sleep(for: .milliseconds(1))", 1)
-if "Task.sleep(for: .milliseconds(250))" in test:
-    raise ValueError("Unexpected additional production polling interval")
 
 generated = root / "build/SessionBoundaryUnderTest.swift"
 generated.parent.mkdir(exist_ok=True)
@@ -102,8 +94,11 @@ def run_logged(command, timeout=None):
 
 
 log_path.write_text("")
-run_logged(["xcrun", "swiftc", str(root / "CivitViewer/VideoDuration.swift"), str(root / "CivitViewer/Models.swift"), str(generated), "-o", str(binary)])
+sources = ["LocalDiagnostics.swift", "PlaybackDiagnostics.swift", "VideoDuration.swift", "Models.swift",
+           "BrowsingPreferences.swift", "MediaSearch.swift", "LocalTagTypes.swift", "SiteRequestClient.swift"]
+run_logged(["xcrun", "swiftc", *(str(root / "CivitViewer" / source) for source in sources), str(generated), "-o", str(binary)])
 run_logged([str(binary)], timeout=45)
 print("Source SiteSession.swift SHA-256:", sha256(site_path.read_bytes()).hexdigest())
-print("Extracted production members: feedIdentity, ensureOrigin, request<T>, decode<T>")
+print("Compiled production client: SiteRequestClient.swift")
+print("Extracted production session members: feedIdentity, request adapter, hydrateMedia")
 print("Build/test log:", log_path)

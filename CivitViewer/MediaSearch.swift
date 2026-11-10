@@ -104,6 +104,8 @@ struct SearchPostPage: Decodable {
         var postsRead = false
         var postCursor: PublicationCursor?
         var pendingPosts: [Int] = []
+        // Optional so a previously issued title.v1 cursor can still be read.
+        var pendingTitles: [Int: String]?
         var mediaCursor: String?
         var seenPostCursors = Set<PublicationCursor>()
         var seenPosts = Set<Int>()
@@ -131,14 +133,19 @@ struct SearchPostPage: Decodable {
             }
             position.postsRead = true; position.postCursor = page.nextCursor
             var matched: [Int] = []
+            var titles: [Int: String] = [:]
             for post in page.items {
                 if let author = criteria?.author {
                     guard let owner = post.user?.id else { throw ClientError.format("标题搜索作者信息待核实") }
                     if owner != author.id { continue }
                 }
-                if position.seenPosts.insert(post.id).inserted { matched.append(post.id) }
+                if position.seenPosts.insert(post.id).inserted {
+                    matched.append(post.id)
+                    titles[post.id] = post.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
             }
             position.pendingPosts = matched
+            position.pendingTitles = titles
         }
         var items: [MediaItem] = []
         if let postID = position.pendingPosts.first {
@@ -147,11 +154,15 @@ struct SearchPostPage: Decodable {
             guard position.identity == source.feedIdentity else { throw ClientError.accountChanged }
             guard page.items.allSatisfy({ $0.postID == postID }) else { throw ClientError.format("站点返回作品不属于匹配的帖子") }
             items = try page.items.filter { try criteria?.matches($0) ?? true }
+            if let title = position.pendingTitles?[postID] {
+                for index in items.indices { items[index].postTitle = title }
+            }
             if let next = page.metadata.nextCursor {
                 guard position.seenMediaCursors.insert(next).inserted else { throw ClientError.format("帖子作品分页重复") }
                 position.mediaCursor = next
             } else {
                 position.pendingPosts.removeFirst(); position.mediaCursor = nil; position.seenMediaCursors = []
+                position.pendingTitles?[postID] = nil
             }
         }
         var next: String?

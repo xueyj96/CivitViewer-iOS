@@ -36,7 +36,7 @@ enum MediaRepairError: LocalizedError {
 /// An alias binds one original cache identity to a content-addressed derivative.
 /// Only hashes and numeric file attributes are persisted, never media URLs.
 enum MediaRepairStore {
-    struct Identity: Codable, Equatable {
+    struct Identity: Codable, Equatable, Sendable {
         let size: Int64
         let inode: UInt64
         let created: TimeInterval
@@ -88,7 +88,7 @@ enum MediaRepairStore {
               record.content.count == 64, record.content.allSatisfy({ $0.isASCII && ($0.isNumber || ("a"..."f").contains(String($0))) }) else { return nil }
         return record
     }
-    static func cached(_ address: URL, original: URL?, directory: URL) -> (url: URL, transcoded: Bool)? {
+    static func cached(_ address: URL, original: URL?, directory: URL, touch: Bool = true) -> (url: URL, transcoded: Bool)? {
         guard let receipt = receipt(address, directory: directory) else { return nil }
         // Local/offline originals must still exist. A remote cache alias keeps
         // the same URL identity policy as the original browsing cache.
@@ -97,7 +97,7 @@ enum MediaRepairStore {
         }
         let output = directory.appendingPathComponent(outputName(address, content: receipt.content, transcoded: receipt.transcoded))
         guard identity(output)?.size == receipt.outputBytes else { return nil }
-        try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: output.path)
+        if touch { try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: output.path) }
         return (output, receipt.transcoded)
     }
     static func commit(_ address: URL, original: URL, content: String, transcoded: Bool, output: URL, directory: URL) throws {
