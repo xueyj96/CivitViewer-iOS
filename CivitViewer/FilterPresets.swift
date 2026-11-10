@@ -72,11 +72,6 @@ struct FilterPresetSnapshot: Codable, Equatable {
     }
 
     var criteria: MediaSearchCriteria? { search?.criteria }
-    func matches(_ other: FilterPresetSnapshot) -> Bool {
-        filter == other.filter && criteria?.id == other.criteria?.id &&
-            criteria?.author?.username.lowercased() == other.criteria?.author?.username.lowercased()
-    }
-
     func validated(for scope: FilterPresetScope) throws {
         guard FeedSort(rawValue: filter.sort) != nil,
               FeedPeriod(rawValue: filter.period) != nil,
@@ -97,8 +92,26 @@ struct FilterPreset: Codable, Equatable, Identifiable {
     var snapshot: FilterPresetSnapshot
     let createdAt: Date
     var updatedAt: Date
-    var summary: String {
-        ([snapshot.filter.summary] + (snapshot.criteria.map { [$0.summary] } ?? [])).joined(separator: " · ")
+
+    var searchPreview: (conditions: String, limits: String) {
+        guard let criteria = snapshot.criteria else { return ("", "") }
+        let title = criteria.normalizedText
+        let author = criteria.author.map { "@" + $0.username }
+        let terms = [title.isEmpty ? nil : title, author].compactMap { $0 }
+            + criteria.tags.map { "#" + $0.name }
+        var preview = Array(terms.prefix(2))
+        if terms.count > preview.count { preview.append("+\(terms.count - preview.count)") }
+
+        let filter = snapshot.filter
+        let defaults = FeedFilter.defaults(for: .creator)
+        let limits = [
+            filter.period == defaults.period ? nil : filter.periodTitle,
+            filter.sort == defaults.sort ? nil : filter.sortTitle,
+            filter.baseModel.isEmpty ? nil : filter.baseModel,
+            filter.onlyPG ? "仅看 PG" : nil,
+            filter.videoDurationRange?.summary,
+        ].compactMap { $0 }
+        return (preview.joined(separator: " · "), limits.joined(separator: " · "))
     }
 }
 

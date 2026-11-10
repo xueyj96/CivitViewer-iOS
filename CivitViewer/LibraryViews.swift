@@ -147,26 +147,14 @@ private struct LeaderboardList: View {
         let shape = FloatingPageChrome.controlShape
         return NavigationLink { CreatorView(creator: entry.user) } label: {
             HStack(spacing: 10) {
-                HStack(spacing: FloatingPageChrome.spacing + FloatingPageChrome.groupInset) {
-                    ZStack(alignment: .trailing) {
-                        Text("0000").hidden().accessibilityHidden(true)
-                        Text(String(format: "%02d", entry.position))
-                    }
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: true, vertical: false)
-                    AvatarView(name: entry.user.username, size: 28)
+                ZStack(alignment: .trailing) {
+                    Text("0000").hidden().accessibilityHidden(true)
+                    Text(String(format: "%02d", entry.position))
                 }
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(entry.user.username)
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.primary)
-                    if recent != .any, case .published(let date) = activity.result(for: entry.id) {
-                        Text(date.formatted(.dateTime.locale(Locale(identifier: "zh_Hans_CN")).year().month().day()))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: true, vertical: false)
+                AuthorRowIdentity(name: entry.user.username, detail: publicationDate(for: entry))
                 Spacer(minLength: 0)
                 if session.following.contains(entry.user.id) {
                     Image(systemName: "checkmark.circle.fill")
@@ -192,6 +180,11 @@ private struct LeaderboardList: View {
         .listRowSeparator(.hidden)
         .accessibilityIdentifier("leaderboard.author.\(entry.user.id)")
     }
+    private func publicationDate(for entry: LeaderboardEntry) -> String? {
+        guard recent != .any, case .published(let date) = activity.result(for: entry.id) else { return nil }
+        return date.formatted(.dateTime.locale(Locale(identifier: "zh_Hans_CN")).year().month().day())
+    }
+
     private func load(replacing: Bool = false) async {
         guard replacing || !loading else { return }
         let request = UUID()
@@ -224,6 +217,42 @@ struct AvatarView: View {
     }
 }
 
+struct AuthorRowIdentity: View {
+    let name: String
+    var showsHandle = false
+    var detail: String? = nil
+
+    var body: some View {
+        HStack(spacing: FloatingPageChrome.spacing) {
+            AvatarView(name: name, size: 28).accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(showsHandle ? "@" + name : name)
+                    .font(FloatingPageChrome.controlFont)
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                if let detail {
+                    Text(detail).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+}
+
+struct CreatorIdentityCard: View {
+    let creator: Creator
+
+    var body: some View {
+        HStack(spacing: FloatingPageChrome.spacing) {
+            AuthorRowIdentity(name: creator.username, showsHandle: true)
+            Spacer(minLength: 6)
+            FollowButton(creator: creator)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 3)
+        .background(AppTheme.secondarySurface, in: FloatingPageChrome.controlShape)
+    }
+}
+
 struct CreatorView: View {
     let creator: Creator
     @EnvironmentObject private var session: SiteSession
@@ -232,6 +261,7 @@ struct CreatorView: View {
     @StateObject private var feed = FeedStore(diagnostics: .shared, observations: .shared, authorBlocks: AuthorBlocklist.shared)
     @State private var filter: FeedFilter
     @State private var showFilter = false
+    @State private var showWorkSearch = false
     @State private var focused: Int?
     @State private var viewerItem: MediaItem?
     @State private var authorBlockError: String?
@@ -239,23 +269,10 @@ struct CreatorView: View {
     @State private var gridWidth: CGFloat = 0
     private var requestKey: FeedStoreRequestKey { .init(identity: session.feedIdentity, filter: filter, source: .creator(creator)) }
     private var creatorBlocked: Bool { authorBlocklist.contains(id: creator.id) }
-    private let profileAvatarSize: CGFloat = 34
-    private let profileCardInset: CGFloat = 10
-    private var creatorIdentityHeader: some View {
-        HStack(spacing: FloatingPageChrome.spacing) {
-            AvatarView(name: creator.username, size: profileAvatarSize)
-            Text("@" + creator.username).font(.subheadline.weight(.semibold)).lineLimit(1)
-            Spacer(minLength: 6)
-            FollowButton(creator: creator)
-        }
-        .padding(.horizontal, profileCardInset)
-        .padding(.vertical, 3)
-        .background(AppTheme.secondarySurface, in: FloatingPageChrome.controlShape)
-        .padding(.horizontal, FloatingPageChrome.pageInset)
-    }
     private var creatorFeedHeader: some View {
         VStack(spacing: 0) {
-            creatorIdentityHeader
+            CreatorIdentityCard(creator: creator)
+                .padding(.horizontal, FloatingPageChrome.pageInset)
             if let authorBlockError { Text(authorBlockError).font(.caption).foregroundStyle(.red).padding(.horizontal, AppTheme.spacing) }
         }
         .padding(.bottom, 8)
@@ -276,6 +293,8 @@ struct CreatorView: View {
     private var creatorActions: some View {
         Menu {
             if !creatorBlocked {
+                Button("搜索作品", systemImage: "magnifyingglass") { showWorkSearch = true }
+                    .accessibilityIdentifier("creator.search")
                 Button("筛选作品", systemImage: FloatingPageChrome.filterSymbol) { showFilter = true }
                     .accessibilityIdentifier("creator.filter")
             }
@@ -315,12 +334,13 @@ struct CreatorView: View {
     }
     init(creator: Creator, initialKind: MediaKind = .image) {
         self.creator = creator
-        _filter = State(initialValue: .defaults(for: .creator, kind: initialKind == .video ? .video : .image))
+        _filter = State(initialValue: .defaults(for: .creator, kind: initialKind))
     }
     var body: some View {
         VStack(spacing: 0) {
             if creatorBlocked {
-                creatorIdentityHeader
+                CreatorIdentityCard(creator: creator)
+                    .padding(.horizontal, FloatingPageChrome.pageInset)
                 ContentUnavailableView {
                     Label("该作者已在本机屏蔽", systemImage: "person.crop.circle.badge.xmark")
                 } description: {
@@ -347,6 +367,9 @@ struct CreatorView: View {
         .avoidOverlaidTabBar()
         .floatingPageBar("creator.top-bar") { floatingBar }
         .navigationDestination(isPresented: $showFilter) { FilterView(filter: $filter, context: .creator) }
+        .navigationDestination(isPresented: $showWorkSearch) {
+            SearchView(initialCriteria: .init(author: creator), initialFilter: filter, showsBack: true)
+        }
         .favoriteBatchBottomBar($favoriteBatch, canManage: !creatorBlocked && feed.requestKey == requestKey)
         .favoriteBatchEditor($favoriteBatch)
         .mediaCover(item: $viewerItem) { opening in
@@ -696,7 +719,7 @@ struct FollowingView: View {
                         if current, store.complete {
                             Section("已关注 \(store.creators.count) 位") {
                                 ForEach(store.ordered(sort, reverse: reverse)) { creator in
-                                NavigationLink { CreatorView(creator: creator) } label: { HStack(spacing: 12) { AvatarView(name: creator.username); Text(creator.username) }.padding(.vertical, 5) }
+                                NavigationLink { CreatorView(creator: creator) } label: { AuthorRowIdentity(name: creator.username).padding(.vertical, 5) }
                                 }
                                 if store.creators.isEmpty { Text("你还没有关注作者").foregroundStyle(.secondary) }
                             }

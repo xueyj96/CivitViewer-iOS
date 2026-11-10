@@ -66,6 +66,10 @@ enum MediaSearchTarget: Hashable, Identifiable {
 
 enum MediaSearchText {
     static func normalized(_ raw: String) -> String { raw.trimmingCharacters(in: .whitespacesAndNewlines) }
+    static func authorKeyword(_ raw: String) -> String {
+        let name = normalized(raw)
+        return name.hasPrefix("@") ? String(name.dropFirst()) : name
+    }
     static func valid(_ raw: String, mode: MediaSearchMode) -> Bool {
         let value = normalized(raw)
         return !value.isEmpty && value.count <= 80 && !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)

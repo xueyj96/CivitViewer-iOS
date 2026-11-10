@@ -286,10 +286,11 @@ final class ResumePromptUITests: XCTestCase {
 
     func testPresets59SearchRestoresTagsTextAndRangeWithoutAutoSearch() {
         app = XCUIApplication()
-        app.launchArguments = ["--qa-collection-paging", "--qa-theme-ui", "--qa-style48", "-muted", "YES", "-app.appearance", "dark"]
+        app.launchArguments = ["--qa-collection-paging", "--qa-theme-ui", "--qa-style48", "--qa-visual-controls", "--qa-control-width=320", "-muted", "YES", "-app.appearance", "light"]
         app.launch(); mainTabButton("搜索").tap()
+        let longTitle = "City lights along the river after midnight in the spring"
         let title = app.textFields["search-title-input"]
-        XCTAssertTrue(title.waitForExistence(timeout: 6)); title.tap(); title.typeText("City")
+        XCTAssertTrue(title.waitForExistence(timeout: 6)); title.tap(); title.typeText(longTitle)
         app.buttons["search-tag-picker"].tap()
         let portrait = app.buttons["tag-directory.tag.42001"], night = app.buttons["tag-directory.tag.42002"]
         XCTAssertTrue(portrait.waitForExistence(timeout: 6)); portrait.tap(); night.tap(); app.buttons["完成"].tap()
@@ -310,25 +311,43 @@ final class ResumePromptUITests: XCTestCase {
         waitUntil("The search toolbar is interactive after closing the filter") { presets.isHittable }
         presets.tap()
         XCTAssertTrue(floatingPageTitle("已存条件 · 搜索").waitForExistence(timeout: 5))
-        let name = "Night-" + String(UUID().uuidString.prefix(6)); savePreset59(name)
+        let name = "Night-" + String(UUID().uuidString.prefix(6)) + " across a very long skyline"
+        savePreset59(name)
         app.buttons["preset.library.done"].tap()
         let clear = app.buttons["清空全部条件"]
         if !clear.isHittable { app.swipeDown() }; XCTAssertTrue(clear.isHittable); clear.tap()
         app.buttons["search.presets"].tap(); XCTAssertTrue(presetRow59(name).waitForExistence(timeout: 5)); presetRow59(name).tap()
-        XCTAssertEqual(title.value as? String, "City")
-        XCTAssertTrue(app.buttons["移除搜索标签 portrait"].exists); XCTAssertTrue(app.buttons["移除搜索标签 night"].exists)
+        XCTAssertEqual(title.value as? String, longTitle)
+        XCTAssertEqual(app.buttons["search-tag-picker"].valueDescription, "已选择 2 个标签")
         XCTAssertTrue(range.label.contains("视频") && range.label.contains("本月") && range.label.contains("热度"))
         XCTAssertFalse(app.descendants(matching: .any)["search.results"].exists, "Loading a saved search must leave explicit search under user control")
         attachScreenshot(named: "presets59-search-complete-conditions-restored")
         let submit = app.buttons["search-submit"]
-        if !submit.isHittable { app.swipeUp() }; XCTAssertTrue(submit.isEnabled); submit.tap()
+        waitUntil("The search control must be interactive after applying a saved search") {
+            submit.isHittable && submit.isEnabled
+        }
+        submit.tap()
         XCTAssertTrue(app.descendants(matching: .any)["search.results"].waitForExistence(timeout: 8))
         XCTAssertTrue(title.isHittable)
         attachScreenshot(named: "presets59-search-results-with-saved-range")
         app.buttons["search.presets"].tap()
         let presetHeader = floatingPageTitle("已存条件 · 搜索")
         XCTAssertTrue(presetHeader.waitForExistence(timeout: 5))
-        XCTAssertTrue(presetRow59(name).exists)
+        let saved = presetRow59(name)
+        XCTAssertEqual(saved.label, name)
+        XCTAssertEqual(saved.valueDescription, "应用方案")
+        XCTAssertFalse(app.staticTexts["当前条件"].exists)
+        attachScreenshot(named: "search-compact-saved-conditions")
+        saved.press(forDuration: 1)
+        let rename = app.buttons["重命名"]
+        XCTAssertTrue(rename.waitForExistence(timeout: 5))
+        attachScreenshot(named: "search-saved-context-menu")
+        rename.tap()
+        let editor = app.textFields["preset.name.input"]
+        XCTAssertTrue(editor.waitForExistence(timeout: 5))
+        XCTAssertEqual(editor.value as? String, name)
+        floatingPageTitle("重命名").buttons["navigation.back"].tap()
+        XCTAssertTrue(presetRow59(name).waitForExistence(timeout: 5))
         app.buttons["preset.library.done"].tap()
         XCTAssertTrue(app.buttons["search.presets"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.descendants(matching: .any)["search.results"].waitForExistence(timeout: 5))
@@ -472,10 +491,9 @@ final class ResumePromptUITests: XCTestCase {
         XCTAssertTrue(toggle.waitForExistence(timeout: 5))
         toggle.buttons["全部标签"].tap()
         XCTAssertTrue(sparse.waitForExistence(timeout: 5)); sparse.tap()
-        let selectedLabel = "移除搜索标签 " + sparse.label
+        let tagPicker = app.buttons["search-tag-picker"]
         back.tap()
-        XCTAssertTrue(app.buttons["search-tag-picker"].waitForExistence(timeout: 5))
-        XCTAssertFalse(app.buttons[selectedLabel].exists)
+        XCTAssertTrue(tagPicker.waitForValueToContain("未选择", timeout: 5))
         app.buttons["search-tag-picker"].tap()
         XCTAssertTrue(toggle.waitForExistence(timeout: 5))
         toggle.buttons["全部标签"].tap()
@@ -483,7 +501,7 @@ final class ResumePromptUITests: XCTestCase {
         XCTAssertFalse(sparse.valueDescription.contains("已选择"))
         sparse.tap()
         done.tap()
-        XCTAssertTrue(app.buttons[selectedLabel].waitForExistence(timeout: 5))
+        XCTAssertTrue(tagPicker.waitForValueToContain("已选择 1 个标签", timeout: 5))
     }
 
     func testTagDirectoryAutomaticallyPagesAndRetriesAtEnd() {
@@ -537,7 +555,7 @@ final class ResumePromptUITests: XCTestCase {
         reveal(firstTag, towardEnd: false)
         XCTAssertTrue(firstTag.valueDescription.contains("已选择"))
         app.buttons["完成"].tap()
-        XCTAssertTrue(app.buttons["移除搜索标签 paging fixture 01"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["search-tag-picker"].waitForValueToContain("已选择 1 个标签", timeout: 5))
     }
 
     func testTags70RequiresBothMediaToWithdrawLocalSuggestion() {
@@ -547,7 +565,7 @@ final class ResumePromptUITests: XCTestCase {
         mainTabButton("搜索").tap(); app.buttons["search-tag-picker"].tap()
         let tag = app.buttons["tag-directory.tag.42001"]
         XCTAssertTrue(tag.waitForExistence(timeout: 8)); tag.tap(); app.buttons["完成"].tap()
-        XCTAssertTrue(app.buttons["移除搜索标签 portrait"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["search-tag-picker"].waitForValueToContain("已选择 1 个标签", timeout: 5))
         let submit = app.buttons["search-submit"]
         waitUntil("The selected tag can be submitted after returning to Search") { submit.isHittable && submit.isEnabled }
         submit.tap()
@@ -558,18 +576,18 @@ final class ResumePromptUITests: XCTestCase {
         XCTAssertFalse(app.buttons["调整筛选"].exists)
         XCTAssertFalse(app.buttons["重置筛选"].exists)
         XCTAssertTrue(app.buttons["search.range"].isHittable)
-        app.buttons["移除搜索标签 portrait"].tap()
+        app.buttons["清空全部条件"].tap()
         app.buttons["search-tag-picker"].tap()
         XCTAssertTrue(tag.waitForExistence(timeout: 8), "An empty image search alone cannot rule out video matches")
         tag.tap(); app.buttons["完成"].tap()
-        XCTAssertTrue(app.buttons["移除搜索标签 portrait"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["search-tag-picker"].waitForValueToContain("已选择 1 个标签", timeout: 5))
         waitUntil("Search is ready for the second tag request") { submit.isHittable && submit.isEnabled }
         submit.tap()
         XCTAssertTrue(empty.waitForExistence(timeout: 8))
         chooseSearchMedia("视频")
         XCTAssertTrue(app.buttons["search.range"].label.contains("视频"))
         XCTAssertTrue(empty.waitForExistence(timeout: 8))
-        app.buttons["移除搜索标签 portrait"].tap()
+        app.buttons["清空全部条件"].tap()
         app.buttons["search-tag-picker"].tap()
         XCTAssertTrue(tag.waitForNonExistence(timeout: 8), "Two completed empty searches in the same scope withdraw the suggestion")
         app.otherElements["tag-directory.mode"].buttons["全部标签"].tap()
@@ -2399,7 +2417,7 @@ final class ResumePromptUITests: XCTestCase {
         XCTAssertTrue(addAuthor.waitForExistence(timeout: 5))
         addAuthor.tap()
         XCTAssertTrue(floatingPageTitle("添加屏蔽作者").waitForExistence(timeout: 5))
-        let authorField = app.textFields["输入作者昵称"]
+        let authorField = app.textFields["author-picker.input"]
         authorField.tap()
         authorField.typeText("PagingFixture")
         let result = app.buttons["author-picker.author.28037001"]
@@ -3748,12 +3766,13 @@ final class ResumePromptUITests: XCTestCase {
             XCTAssertEqual(author.frame.width, app.buttons["search-tag-picker"].frame.width, accuracy: 1)
             let range = app.buttons["search.range"]
             XCTAssertEqual(author.frame.width, range.frame.width, accuracy: 1)
-            XCTAssertEqual(app.buttons["search-submit"].frame.minX, range.frame.minX, accuracy: 1)
-            XCTAssertEqual(app.buttons["search.presets"].frame.maxX, range.frame.maxX, accuracy: 1)
+            XCTAssertEqual(app.buttons["search-submit"].frame.maxX, app.buttons["search.presets"].frame.maxX, accuracy: 1)
+            XCTAssertEqual(app.buttons["search.presets"].frame.midY, range.frame.midY, accuracy: 1)
+            XCTAssertLessThan(range.frame.minX, app.buttons["search.presets"].frame.minX)
             author.tap()
             let authorHeader = floatingPageTitle("选择作者")
             XCTAssertTrue(authorHeader.waitForExistence(timeout: 5))
-            XCTAssertTrue(app.textFields["输入作者昵称"].exists)
+            XCTAssertTrue(app.textFields["author-picker.input"].exists)
             let authorField = app.descendants(matching: .any).matching(identifier: "author-picker.field").firstMatch
             XCTAssertEqual(authorField.frame.minX, authorHeader.frame.minX, accuracy: 1)
             XCTAssertEqual(authorField.frame.maxX, authorHeader.frame.maxX, accuracy: 1)
@@ -3762,7 +3781,10 @@ final class ResumePromptUITests: XCTestCase {
             attachScreenshot(named: "style48-\(appearance)-author-picker")
             authorHeader.buttons["navigation.back"].tap()
             let picker = app.buttons["search-tag-picker"]
-            XCTAssertTrue(picker.isHittable); picker.tap()
+            waitUntil("The search toolbar must become interactive after returning from the author picker") {
+                picker.isHittable
+            }
+            picker.tap()
             XCTAssertTrue(app.textFields["tag-search-input"].waitForExistence(timeout: 5))
             let portrait = app.buttons["tag-directory.tag.42001"]
             let night = app.buttons["tag-directory.tag.42002"]
@@ -3783,8 +3805,7 @@ final class ResumePromptUITests: XCTestCase {
             portrait.tap()
             attachScreenshot(named: "style48-\(appearance)-tag-selection")
             app.buttons["完成"].tap()
-            XCTAssertTrue(app.buttons["移除搜索标签 portrait"].waitForExistence(timeout: 5))
-            XCTAssertTrue(app.buttons["移除搜索标签 night"].exists)
+            XCTAssertTrue(app.buttons["search-tag-picker"].waitForValueToContain("已选择 2 个标签", timeout: 5))
             XCTAssertTrue(app.buttons["search-submit"].isEnabled)
             attachScreenshot(named: "style48-\(appearance)-combined-selected")
 
@@ -3874,7 +3895,7 @@ final class ResumePromptUITests: XCTestCase {
         mainTabButton("搜索").tap()
         let picker = app.buttons["search-author-picker"]
         XCTAssertTrue(picker.waitForExistence(timeout: 5))
-        let field = app.textFields["输入作者昵称"]
+        let field = app.textFields["author-picker.input"]
         let result = app.buttons["author-picker.author.28037001"]
         let done = app.buttons["author-picker.done"]
 
@@ -3883,7 +3904,7 @@ final class ResumePromptUITests: XCTestCase {
             XCTAssertTrue(done.waitForExistence(timeout: 5))
             XCTAssertFalse(done.isEnabled)
             field.tap()
-            field.typeText("PagingFixture")
+            field.typeText("@Pagi")
             XCTAssertTrue(result.waitForExistence(timeout: 6))
             result.tap()
             XCTAssertTrue(done.isEnabled)
@@ -3897,6 +3918,130 @@ final class ResumePromptUITests: XCTestCase {
         done.tap()
         XCTAssertTrue(picker.waitForExistence(timeout: 5))
         XCTAssertEqual(picker.value as? String, "@PagingFixture")
+
+        let submit = app.buttons["search-submit"]
+        let creatorHeader = app.otherElements["creator.top-bar"]
+        chooseSearchMedia("视频")
+        XCTAssertEqual(submit.label, "搜索作品")
+        submit.tap()
+        let results = app.descendants(matching: .any)["search.results"]
+        XCTAssertTrue(results.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["@PagingFixture"].waitForExistence(timeout: 5))
+        XCTAssertFalse(creatorHeader.exists)
+        XCTAssertTrue(picker.isHittable)
+        let sort = app.buttons["search.results.sort"]
+        XCTAssertTrue(sort.waitForValueToContain("最新", timeout: 5))
+        XCTAssertLessThan(sort.frame.midX, app.frame.midX)
+        sort.tap()
+        app.buttons["热度"].tap()
+        XCTAssertTrue(sort.waitForValueToContain("热度", timeout: 5))
+        XCTAssertTrue(app.buttons["search.range"].label.contains("视频"))
+        XCTAssertTrue(results.exists)
+        attachScreenshot(named: "search-author-only-inline")
+
+        let title = app.textFields["search-title-input"]
+        title.tap()
+        title.typeText("Paging")
+        XCTAssertEqual(submit.label, "搜索作品")
+        submit.tap()
+        XCTAssertTrue(app.descendants(matching: .any)["search.results"].waitForExistence(timeout: 5))
+        XCTAssertFalse(creatorHeader.exists)
+        XCTAssertFalse(app.buttons["作者主页"].exists)
+        XCTAssertFalse(app.buttons["不限作者"].exists)
+        attachScreenshot(named: "search-author-and-title-inline")
+
+        let clear = app.buttons["author-picker.clear"]
+        picker.tap()
+        XCTAssertTrue(clear.waitForExistence(timeout: 5))
+        XCTAssertEqual(clear.frame.midY, field.frame.midY, accuracy: 2)
+        XCTAssertGreaterThan(clear.frame.minX, field.frame.minX)
+        attachScreenshot(named: "search-author-clear-row")
+        clear.tap()
+        floatingPageTitle("选择作者").buttons["navigation.back"].tap()
+        XCTAssertTrue(picker.waitForValueToContain("@PagingFixture", timeout: 5))
+        picker.tap()
+        XCTAssertTrue(clear.waitForExistence(timeout: 5))
+        clear.tap()
+        done.tap()
+        XCTAssertTrue(picker.waitForValueToContain("未选择", timeout: 5))
+        XCTAssertEqual(title.value as? String, "Paging")
+        XCTAssertFalse(app.descendants(matching: .any)["search.results"].exists)
+    }
+
+    func testGlobalAuthorSearchDoesNotChangeWorkCriteria() {
+        app = XCUIApplication()
+        app.launchArguments = ["--qa-collection-paging", "--qa-height-audit", "-app.appearance", "light", "-muted", "YES"]
+        XCUIDevice.shared.orientation = .portrait
+        app.launch()
+        mainTabButton("搜索").tap()
+        let mode = app.buttons["search.mode"]
+        XCTAssertTrue(mode.waitForValueToContain("作品", timeout: 5))
+        let title = app.textFields["search-title-input"]
+        title.tap()
+        title.typeText("Paging")
+        app.buttons["search-submit"].tap()
+        let results = app.descendants(matching: .any)["search.results"]
+        XCTAssertTrue(results.waitForExistence(timeout: 5))
+        attachScreenshot(named: "search-preview-works")
+
+        let workToggle = mode.frame
+        mode.tap()
+        XCTAssertTrue(mode.waitForValueToContain("作者", timeout: 5))
+        XCTAssertEqual(mode.frame, workToggle)
+        XCTAssertTrue(mainTabButton("搜索").isHittable)
+        let username = app.textFields["search-author-input"]
+        XCTAssertTrue(username.waitForExistence(timeout: 5))
+        XCTAssertFalse(app.buttons["search-author-picker"].exists)
+        XCTAssertFalse(app.buttons["search-tag-picker"].exists)
+        XCTAssertFalse(app.buttons["search.presets"].exists)
+        username.tap()
+        username.typeText("@Pagi")
+        app.buttons["search-authors-submit"].tap()
+        let candidate = app.buttons["search.author.28037001"]
+        XCTAssertTrue(candidate.waitForExistence(timeout: 5))
+        XCTAssertEqual(candidate.label, "@PagingFixture")
+        attachScreenshot(named: "search-preview-authors")
+        candidate.tap()
+        let creatorBar = app.otherElements["creator.top-bar"]
+        XCTAssertTrue(creatorBar.waitForExistence(timeout: 5))
+        let back = creatorBar.buttons["navigation.back"]
+        XCTAssertEqual(workToggle.width, back.frame.width, accuracy: 1)
+        heightTap(back)
+        XCTAssertTrue(candidate.waitForExistence(timeout: 5))
+        mode.tap()
+        XCTAssertTrue(mode.waitForValueToContain("作品", timeout: 5))
+        XCTAssertTrue(results.waitForExistence(timeout: 5))
+        XCTAssertTrue(mainTabButton("搜索").isHittable)
+        XCTAssertEqual(title.value as? String, "Paging")
+        XCTAssertEqual(app.buttons["search-author-picker"].valueDescription, "未选择")
+    }
+
+    func testAuthorPageSearchUsesTheSameInlineResults() {
+        app = XCUIApplication()
+        app.launchArguments = ["--qa-collection-paging", "--qa-height-audit", "-app.appearance", "light", "-muted", "YES"]
+        XCUIDevice.shared.orientation = .portrait
+        app.launch()
+        mainTabButton("作者榜").tap()
+        heightTap(app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Pattern Creator 1")).firstMatch)
+        let authorBar = app.otherElements["creator.top-bar"]
+        XCTAssertTrue(authorBar.waitForExistence(timeout: 5))
+        heightTap(app.otherElements["creator.media-kind"].buttons["视频"])
+        heightTap(authorBar.buttons["creator.actions"])
+        heightTap(app.buttons["creator.search"])
+        let searchBar = app.otherElements["search.top-bar"]
+        XCTAssertTrue(searchBar.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["search-author-picker"].valueDescription.contains("@Pattern Creator 1"))
+        XCTAssertTrue(app.buttons["search.range"].label.contains("视频"))
+        XCTAssertFalse(app.buttons["search.mode"].exists)
+        XCTAssertFalse(app.descendants(matching: .any)["search.results"].exists)
+        attachScreenshot(named: "search-preview-from-author")
+        let field = app.textFields["search-title-input"]
+        field.tap()
+        field.typeText("Paging")
+        app.buttons["search-submit"].tap()
+        XCTAssertTrue(app.descendants(matching: .any)["search.results"].waitForExistence(timeout: 5))
+        XCTAssertTrue(searchBar.isHittable)
+        attachScreenshot(named: "search-works-from-author")
     }
 
     func testDownloadsBackAndTabSwitchKeepTheirNavigationContexts() {
@@ -4463,8 +4608,8 @@ final class ResumePromptUITests: XCTestCase {
         attachScreenshot(named: "layout41-details-two-tags-selected")
         search.tap()
         XCTAssertTrue(app.descendants(matching: .any)["search.top-bar"].waitForExistence(timeout: 8))
-        XCTAssertEqual(app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "移除搜索标签 ")).count, 2,
-                       "Both selected real tags should navigate as initial AND criteria")
+        XCTAssertTrue(app.buttons["search-tag-picker"].waitForValueToContain("已选择 2 个标签", timeout: 5),
+                      "Both selected real tags should navigate as initial AND criteria")
         XCTAssertTrue(app.buttons["search-submit"].exists)
         attachScreenshot(named: "layout41-details-combined-search")
         authors.tap()

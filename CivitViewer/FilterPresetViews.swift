@@ -51,27 +51,32 @@ struct FilterPresetLibraryView: View {
     @State private var deleteTarget: FilterPreset?
     @State private var operationError: String?
     private var canSave: Bool { (try? current.validated(for: scope)) != nil }
+    private var showsSummary: Bool { scope != .search }
+    @ScaledMetric(relativeTo: .caption) private var searchLimitWidth: CGFloat = 108
 
     var body: some View {
         List {
             Group {
-                VStack(alignment: .leading, spacing: 5) {
-                    Text("当前条件").font(.caption).foregroundStyle(.secondary)
-                    Text(current.filter.summary).font(.subheadline.weight(.medium))
-                    if let criteria = current.criteria, !criteria.summary.isEmpty {
-                        Text(criteria.summary).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                if showsSummary {
+                    presetCard {
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text("当前条件").font(.caption).foregroundStyle(.secondary)
+                            Text(current.filter.summary).font(.subheadline.weight(.medium))
+                        }
                     }
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
                 if let loadError {
-                    Text(loadError).foregroundStyle(.red).accessibilityIdentifier("preset.library.error")
-                } else if presets.isEmpty {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("还没有保存的条件").font(.subheadline.weight(.semibold))
-                        Text(canSave ? "用右上角的加号保存当前条件。" : "填写搜索条件后即可保存。")
-                            .font(.footnote).foregroundStyle(.secondary)
+                    presetCard {
+                        Text(loadError).foregroundStyle(.red).accessibilityIdentifier("preset.library.error")
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                } else if presets.isEmpty {
+                    presetCard {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("还没有保存的条件").font(.subheadline.weight(.semibold))
+                            Text(canSave ? "用右上角的加号保存当前条件。" : "填写搜索条件后即可保存。")
+                                .font(.footnote).foregroundStyle(.secondary)
+                        }
+                    }
                     .accessibilityElement(children: .contain)
                     .accessibilityIdentifier("preset.library.empty")
                 } else {
@@ -81,35 +86,33 @@ struct FilterPresetLibraryView: View {
                             withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.16)) { onApply(preset.snapshot) }
                             dismiss()
                         } label: {
-                            HStack(alignment: .top, spacing: 12) {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(preset.name).font(.body.weight(.semibold)).foregroundStyle(.primary)
-                                    Text(preset.summary).font(.footnote).foregroundStyle(.secondary).lineLimit(2).fixedSize(horizontal: false, vertical: true)
-                                }.frame(maxWidth: .infinity, alignment: .leading)
-                                if preset.snapshot.matches(current) { Image(systemName: "checkmark").foregroundStyle(.blue).accessibilityLabel("当前筛选") }
-                            }.contentShape(Rectangle()).padding(.vertical, 5)
+                            presetCard {
+                                presetRow(preset)
+                            }
+                            .contentShape(.contextMenuPreview, FloatingPageChrome.controlShape)
+                            .contextMenu {
+                                Button("重命名") { beginRename(preset) }
+                                Button("删除", role: .destructive) { guard isCurrent() else { return }; deleteTarget = preset }
+                            }
                         }
-                        .buttonStyle(.plain).frame(minHeight: 44)
-                        .accessibilityValue(preset.snapshot.matches(current) ? "当前筛选" : "应用方案")
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(preset.name)
+                        .accessibilityHint(presetAccessibilityDetails(preset))
+                        .accessibilityValue("应用方案")
                         .accessibilityIdentifier("preset.library.apply.\(preset.id.uuidString.lowercased())")
                         .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                             Button("删除", role: .destructive) { guard isCurrent() else { return }; deleteTarget = preset }.accessibilityIdentifier("preset.library.delete.\(preset.id.uuidString.lowercased())")
                             Button("重命名") { beginRename(preset) }.tint(.blue).accessibilityIdentifier("preset.library.rename.\(preset.id.uuidString.lowercased())")
                         }
-                        .contextMenu {
-                            Button("重命名") { beginRename(preset) }
-                            Button("删除", role: .destructive) { guard isCurrent() else { return }; deleteTarget = preset }
-                        }
                     }
                 }
-                if let operationError { Text(operationError).font(.footnote).foregroundStyle(.red) }
+                if let operationError {
+                    presetCard { Text(operationError).font(.footnote).foregroundStyle(.red) }
+                }
             }
-            .listRowInsets(EdgeInsets(top: 10, leading: FloatingPageChrome.pageInset + 12,
-                                     bottom: 10, trailing: FloatingPageChrome.pageInset + 12))
-            .listRowBackground(
-                FloatingPageChrome.controlShape.fill(AppTheme.secondarySurface)
-                    .padding(.horizontal, FloatingPageChrome.pageInset)
-            )
+            .listRowInsets(EdgeInsets(top: 0, leading: FloatingPageChrome.pageInset,
+                                     bottom: 0, trailing: FloatingPageChrome.pageInset))
+            .listRowBackground(Color.clear)
             .listRowSeparator(.hidden)
         }
         .listStyle(.plain)
@@ -137,6 +140,68 @@ struct FilterPresetLibraryView: View {
             Button("取消", role: .cancel) { deleteTarget = nil }
         } message: { Text("只删除这组已存条件。") }
         .ordinaryAppearance()
+    }
+
+    private func presetCard<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        let shape = FloatingPageChrome.controlShape
+        return content()
+            .padding(.horizontal, 12)
+            .padding(.vertical, showsSummary ? 10 : 4)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(AppTheme.secondarySurface, in: shape)
+            .contentShape(shape)
+    }
+
+    private func presetRow(_ preset: FilterPreset) -> some View {
+        VStack(alignment: .leading, spacing: FloatingPageChrome.groupInset) {
+            HStack(spacing: FloatingPageChrome.spacing) {
+                Text(preset.name).font(.subheadline.weight(.semibold))
+                    .lineLimit(showsSummary ? nil : 1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if !showsSummary {
+                    Text(preset.snapshot.filter.effectiveKind.title)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.primary.opacity(0.07), in: FloatingPageChrome.controlShape)
+                        .fixedSize()
+                        .layoutPriority(1)
+                }
+            }
+            if showsSummary {
+                Text(preset.snapshot.filter.summary).font(.footnote)
+                    .foregroundStyle(.secondary).lineLimit(2)
+            } else {
+                let preview = preset.searchPreview
+                if !preview.conditions.isEmpty || !preview.limits.isEmpty {
+                    HStack(spacing: FloatingPageChrome.spacing) {
+                        if !preview.conditions.isEmpty {
+                            Text(preview.conditions)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        if !preview.limits.isEmpty {
+                            Text(preview.limits)
+                                .frame(maxWidth: searchLimitWidth, alignment: .trailing)
+                                .layoutPriority(1)
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                }
+            }
+        }
+        .foregroundStyle(.primary)
+        .frame(minHeight: 44)
+        .contentShape(Rectangle())
+    }
+
+    private func presetAccessibilityDetails(_ preset: FilterPreset) -> String {
+        [preset.snapshot.criteria?.summary, preset.snapshot.filter.summary]
+            .compactMap { $0 }.joined(separator: "，")
     }
 
     private func refresh() {

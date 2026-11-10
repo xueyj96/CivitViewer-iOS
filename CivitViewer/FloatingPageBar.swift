@@ -9,8 +9,9 @@ struct PageHeaderLayout {
 
     static let singleRow = Self(rowCount: 1, compactRows: false)
 
-    static func search(accessibility: Bool) -> Self {
-        Self(rowCount: accessibility ? 4 : 2, compactRows: !accessibility)
+    static func search(accessibility: Bool, includesFilters: Bool) -> Self {
+        let rows = includesFilters ? (accessibility ? 5 : 2) : 1
+        return Self(rowCount: rows, compactRows: !accessibility)
     }
 
     var rowHeight: CGFloat {

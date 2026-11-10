@@ -15,6 +15,18 @@ import Foundation
         let criteria = MediaSearchCriteria(text: "Portrait", author: Creator(id: 91, username: "ArtistA", image: nil), tags: [SearchTag(id: 7, name: "portrait", nsfwLevel: 1)])
         let snapshot = FilterPresetSnapshot(filter: FeedFilter(kind: .video, sort: "Newest", period: "Month", baseModel: "Flux.1 D", onlyPG: true, videoDurationRange: VideoDurationRange(minimumSeconds: 9, maximumSeconds: 45)), criteria: criteria)
         let saved = try store.save(ownerID: 17, scope: .search, name: "Portraits", snapshot: snapshot)
+        check(saved.searchPreview.conditions == "Portrait · @ArtistA · +1", "the row previews two terms and counts the rest")
+        check(saved.searchPreview.limits == "本月 · Flux.1 D · 仅看 PG · " + snapshot.filter.videoDurationRange!.summary,
+              "only nondefault filters appear in the row")
+        var namedAfterAuthor = saved
+        namedAfterAuthor.name = "@artista"
+        check(namedAfterAuthor.searchPreview.conditions == saved.searchPreview.conditions,
+              "renaming a preset does not change the query preview")
+        var tagOnly = saved
+        tagOnly.name = "portrait"
+        tagOnly.snapshot = FilterPresetSnapshot(filter: .defaults(for: .creator), criteria: MediaSearchCriteria(tags: criteria.tags))
+        check(tagOnly.searchPreview.conditions == "#portrait" && tagOnly.searchPreview.limits.isEmpty,
+              "tag-only queries remain visible and default filters stay hidden")
         let restarted = FilterPresetStore(root: base)
         let loaded = try restarted.list(ownerID: 17, scope: .search)
         check(loaded == [saved] && loaded[0].snapshot.criteria == criteria && loaded[0].snapshot.filter == snapshot.filter, "round trip preserves all filter and search DTO fields")

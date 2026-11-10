@@ -1,6 +1,15 @@
 import SwiftUI
 
 struct SearchView: View {
+    private enum Mode: String, CaseIterable {
+        case works = "作品"
+        case authors = "作者"
+    }
+
+    @State private var mode = Mode.works
+    @State private var authorText = ""
+    @State private var submittedAuthor = ""
+    @State private var openedAuthor: Creator?
     @EnvironmentObject private var session: SiteSession
     @StateObject private var directory = TagDirectoryStore(diagnostics: .shared)
     @State private var text = ""
@@ -13,30 +22,48 @@ struct SearchView: View {
         let criteria: MediaSearchCriteria
     }
     @State private var submission: Submission?
-    @State private var filter = FeedFilter(kind: .image, sort: "Newest", period: "AllTime")
+    @State private var filter: FeedFilter
     @State private var showFilter = false
     @State private var presetRequest: FilterPresetRequest?
     @FocusState private var titleFocused: Bool
     @Environment(\.dynamicTypeSize) private var typeSize
     private let showsBack: Bool
-    init(initialCriteria: MediaSearchCriteria = .init(), showsBack: Bool = false) {
+    init(initialCriteria: MediaSearchCriteria = .init(),
+         initialFilter: FeedFilter = .defaults(for: .creator), showsBack: Bool = false) {
         self.showsBack = showsBack
         _text = State(initialValue: initialCriteria.text)
         _author = State(initialValue: initialCriteria.author)
         _tags = State(initialValue: initialCriteria.tags)
+        _filter = State(initialValue: initialFilter)
     }
     private var criteria: MediaSearchCriteria { .init(text: text, author: author, tags: tags) }
     var body: some View {
-        Group {
-            if let submission {
-                SearchResultGrid(criteria: submission.criteria, filter: filter, queryHeader: AnyView(querySummary))
+        ZStack {
+            if mode == .authors {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: FloatingPageChrome.groupInset) {
+                        AuthorLookupResults(keyword: submittedAuthor, opensProfiles: true) { openedAuthor = $0 }
+                    }
+                    .padding(.horizontal, FloatingPageChrome.pageInset)
+                }
+                .avoidOverlaidTabBar()
+            } else if let submission {
+                SearchResultGrid(criteria: submission.criteria, filter: $filter)
                     .id(submission.id)
                     .accessibilityIdentifier("search.results")
             } else {
-                ScrollView { querySummary }
+                ScrollView {
+                    if !text.isEmpty && !MediaSearchText.valid(text, mode: .title) {
+                        Text(MediaSearchText.validationMessage).font(.caption).foregroundStyle(.secondary)
+                            .padding(.horizontal, AppTheme.spacing)
+                    }
+                }
             }
         }
         .scrollDismissesKeyboard(.interactively)
+        .onChange(of: authorText) { _, text in
+            if MediaSearchText.authorKeyword(text) != submittedAuthor { submittedAuthor = "" }
+        }
         .onChange(of: criteria.id) { _, id in
             if let submission, submission.criteria.id != id { self.submission = nil }
         }
@@ -51,199 +78,190 @@ struct SearchView: View {
         }
         .navigationDestination(isPresented: $showTags) { TagDirectoryView(selected: $tags, store: directory) }
         .navigationDestination(isPresented: $showAuthors) { AuthorSearchPicker(selected: $author) }
-    }
-
-    private var querySummary: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if author != nil || !tags.isEmpty { selectedConditions }
-            if !text.isEmpty && !MediaSearchText.valid(text, mode: .title) {
-                Text(MediaSearchText.validationMessage).font(.caption).foregroundStyle(.secondary)
-            }
-        }
-        .padding(.horizontal, AppTheme.spacing)
+        .navigationDestination(item: $openedAuthor) { CreatorView(creator: $0) }
     }
 
     private var hasConditions: Bool {
         submission != nil || !text.isEmpty || author != nil || !tags.isEmpty || filter != .defaults(for: .creator)
     }
 
-    private var searchHeaderLayout: PageHeaderLayout { .search(accessibility: typeSize.isAccessibilitySize) }
+    private var searchHeaderLayout: PageHeaderLayout {
+        .search(accessibility: typeSize.isAccessibilitySize, includesFilters: mode == .works)
+    }
 
     private var floatingBar: some View {
         VStack(spacing: 0) {
-            let queryLayout = typeSize.isAccessibilitySize
-                ? AnyLayout(HStackLayout(spacing: FloatingPageChrome.groupInset))
-                : AnyLayout(SearchQueryRowLayout())
-            queryLayout {
+            HStack(spacing: FloatingPageChrome.groupInset) {
+                if showsBack {
+                    FloatingPageBackButton()
+                } else {
+                    modeButton
+                }
                 queryField
-                queryActions
+                submitButton
             }
-            LazyVGrid(columns: FloatingPageChrome.equalColumns(typeSize.isAccessibilitySize ? 1 : 3, gap: FloatingPageChrome.groupInset), spacing: 0) {
-                Button { titleFocused = false; showAuthors = true } label: {
-                    AppFilterLabel(title: "作者", symbol: "person.crop.circle")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(FloatingPageButtonStyle(selected: author != nil))
-                .accessibilityLabel("选择作者")
-                .accessibilityValue(author.map { "@" + $0.username } ?? "未选择")
-                .accessibilityIdentifier("search-author-picker")
+            if mode == .works {
+                workFilters
+            }
+        }
+    }
 
-                Button(action: pickTags) {
-                    AppFilterLabel(title: tags.isEmpty ? "标签" : "标签 \(tags.count)", symbol: "tag")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(FloatingPageButtonStyle(selected: !tags.isEmpty))
-                .accessibilityLabel("选择标签")
-                .accessibilityValue(tags.isEmpty ? "未选择" : "已选择 \(tags.count) 个标签")
-                .accessibilityHint("作品须包含全部所选标签")
-                .accessibilityIdentifier("search-tag-picker")
+    private var modeButton: some View {
+        Button {
+            titleFocused = false
+            mode = mode == .works ? .authors : .works
+        } label: {
+            FloatingPageIcon(symbol: mode == .works ? "square.grid.2x2" : "person.crop.circle")
+        }
+        .buttonStyle(FloatingPageButtonStyle(iconOnly: true))
+        .accessibilityLabel("切换搜索类型")
+        .accessibilityValue(mode.rawValue)
+        .accessibilityHint("轻点切换作品或作者")
+        .accessibilityIdentifier("search.mode")
+    }
 
-                Button { titleFocused = false; showFilter = true } label: {
-                    ViewThatFits(in: .horizontal) {
-                        AppFilterLabel(title: filter.effectiveKind.title + " · " + filter.sortTitle, symbol: "slider.horizontal.3")
-                        AppFilterLabel(title: "筛选", symbol: "slider.horizontal.3")
-                    }
+    private var workFilters: some View {
+        let gap = FloatingPageChrome.groupInset
+        let columns = typeSize.isAccessibilitySize ? [GridItem(.flexible())] : [
+            GridItem(.flexible(), spacing: gap),
+            GridItem(.flexible(), spacing: gap),
+            GridItem(.flexible(), spacing: gap),
+            GridItem(.fixed(FloatingPageChrome.controlHeight)),
+        ]
+        return LazyVGrid(columns: columns, spacing: 0) {
+            Button { titleFocused = false; showAuthors = true } label: {
+                AppFilterLabel(title: author.map { "@" + $0.username } ?? "限作者", symbol: "person.crop.circle")
+                    .minimumScaleFactor(1)
                     .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(FloatingPageButtonStyle(selected: filter != .defaults(for: .creator)))
-                .accessibilityLabel("范围与排序，" + filter.summary)
-                .accessibilityIdentifier("search.range")
             }
-        }
-    }
+            .buttonStyle(FloatingPageButtonStyle(selected: author != nil))
+            .accessibilityLabel("选择作者")
+            .accessibilityValue(author.map { "@" + $0.username } ?? "未选择")
+            .accessibilityIdentifier("search-author-picker")
 
-    private var queryField: some View {
-        HStack(spacing: FloatingPageChrome.groupInset) {
-            if showsBack { FloatingPageBackButton() }
-            HStack(spacing: 0) {
-                FloatingPageIcon(symbol: "magnifyingglass")
-                    .foregroundStyle(.secondary)
-                    .padding(.trailing, 8)
-                    .accessibilityHidden(true)
-                SearchTitleField(text: $text, focused: $titleFocused, onSubmit: search)
-                if hasConditions {
-                    Button {
-                        text = ""; author = nil; tags = []; filter = .defaults(for: .creator); submission = nil
-                    } label: {
-                        Image(systemName: "arrow.counterclockwise")
-                            .foregroundStyle(.secondary)
-                            .frame(width: FloatingPageChrome.controlHeight, height: searchHeaderLayout.rowHeight)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("清空全部条件")
-                }
+            Button(action: pickTags) {
+                AppFilterLabel(title: tags.isEmpty ? "标签" : "标签 \(tags.count)", symbol: "tag")
+                    .frame(maxWidth: .infinity)
             }
-            .font(FloatingPageChrome.controlFont)
-            .padding(.leading, 8)
-            .padding(.trailing, hasConditions ? 0 : 8)
-            .frame(height: searchHeaderLayout.rowHeight)
-            .background { FloatingPageFieldSurface() }
-        }
-    }
+            .buttonStyle(FloatingPageButtonStyle(selected: !tags.isEmpty))
+            .accessibilityLabel("选择标签")
+            .accessibilityValue(tags.isEmpty ? "未选择" : "已选择 \(tags.count) 个标签")
+            .accessibilityHint("作品须包含全部所选标签")
+            .accessibilityIdentifier("search-tag-picker")
 
-    private var queryActions: some View {
-        HStack(spacing: FloatingPageChrome.groupInset) {
-            Button(action: search) {
-                FloatingPageIcon(symbol: "arrow.right")
-                    .foregroundStyle(criteria.valid ? Color.accentColor : Color.secondary.opacity(0.5))
-                    .frame(maxWidth: .infinity, minHeight: searchHeaderLayout.rowHeight)
-                    .background { FloatingPageFieldSurface() }
-                    .contentShape(Rectangle())
+            Button { titleFocused = false; showFilter = true } label: {
+                AppFilterLabel(title: filter.effectiveKind.title, symbol: "slider.horizontal.3")
+                    .frame(maxWidth: .infinity)
             }
-            .disabled(!criteria.valid)
-            .accessibilityLabel("搜索作品")
-            .accessibilityIdentifier("search-submit")
+            .buttonStyle(FloatingPageButtonStyle(selected: filter != .defaults(for: .creator)))
+            .accessibilityLabel("范围与排序，" + filter.summary)
+            .accessibilityIdentifier("search.range")
+
             Button {
                 titleFocused = false
                 presetRequest = .init(session: session, scope: .search, filter: filter, criteria: criteria)
             } label: {
                 FloatingPageIcon(symbol: "bookmark")
-                    .frame(maxWidth: .infinity, minHeight: searchHeaderLayout.rowHeight)
-                    .background { FloatingPageFieldSurface() }
-                    .contentShape(Rectangle())
+                    .frame(maxWidth: .infinity)
             }
+            .buttonStyle(FloatingPageButtonStyle(iconOnly: true))
             .accessibilityLabel("已保存的搜索条件")
             .accessibilityIdentifier("search.presets")
         }
-        .font(FloatingPageChrome.controlFont)
-        .buttonStyle(.plain)
     }
 
-    private var selectedConditions: some View {
-        ScrollView(.horizontal) {
-            HStack(spacing: 4) {
-                if let author {
-                    Button { self.author = nil } label: { selectedConditionLabel("@" + author.username) }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("不限作者")
+    private var queryField: some View {
+        HStack(spacing: 0) {
+            FloatingPageIcon(symbol: "magnifyingglass")
+                .foregroundStyle(.secondary)
+                .padding(.trailing, 6)
+                .accessibilityHidden(true)
+            if mode == .authors {
+                SearchTitleField(text: $authorText, prompt: "搜作者", identifier: "search-author-input",
+                                 focused: $titleFocused, onSubmit: searchAuthors)
+            } else {
+                SearchTitleField(text: $text, prompt: "搜标题",
+                                 identifier: "search-title-input", focused: $titleFocused, onSubmit: searchWorks)
+            }
+            if mode == .works && hasConditions {
+                Button {
+                    text = ""; author = nil; tags = []; filter = .defaults(for: .creator); submission = nil
+                } label: {
+                    Image(systemName: "arrow.counterclockwise")
+                        .foregroundStyle(.secondary)
+                        .frame(width: 28, height: searchHeaderLayout.rowHeight)
+                        .contentShape(Rectangle())
                 }
-                ForEach(tags) { tag in
-                    Button { tags.removeAll { $0.id == tag.id } } label: { selectedConditionLabel(tag.name) }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("移除搜索标签 " + tag.name)
-                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("清空全部条件")
             }
         }
-        .scrollIndicators(.hidden)
+        .font(FloatingPageChrome.controlFont)
+        .padding(.horizontal, FloatingPageChrome.groupInset * 2)
+        .frame(height: searchHeaderLayout.rowHeight)
+        .background { FloatingPageFieldSurface() }
     }
 
-    private func selectedConditionLabel(_ text: String) -> some View {
-        WorkTagLabel(title: text, selected: true, removable: true)
-            .frame(maxWidth: 150)
+    private var submitButton: some View {
+        let searchesAuthors = mode == .authors
+        let enabled = searchesAuthors ? MediaSearchText.valid(MediaSearchText.authorKeyword(authorText), mode: .author) : criteria.valid
+        return Button {
+            if searchesAuthors { searchAuthors() } else { searchWorks() }
+        } label: {
+            Text("搜索")
+                .font(FloatingPageChrome.controlFont)
+                .foregroundStyle(enabled ? Color.accentColor : Color.secondary.opacity(0.5))
+                .frame(width: FloatingPageChrome.controlHeight, height: searchHeaderLayout.rowHeight)
+                .background { FloatingPageFieldSurface() }
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .accessibilityLabel(searchesAuthors ? "搜索作者" : "搜索作品")
+        .accessibilityIdentifier(searchesAuthors ? "search-authors-submit" : "search-submit")
+    }
+
+    private func searchAuthors() {
+        let keyword = MediaSearchText.authorKeyword(authorText)
+        guard MediaSearchText.valid(keyword, mode: .author) else { return }
+        titleFocused = false
+        submittedAuthor = keyword
     }
 
     private func pickTags() { titleFocused = false; showTags = true }
-    private func search() { if criteria.valid { titleFocused = false; submission = Submission(criteria: criteria) } }
+
+    private func searchWorks() {
+        let query = criteria
+        guard query.valid else { return }
+        titleFocused = false
+        submission = Submission(criteria: query)
+    }
 }
 
-/// The query spans the first two filter columns. Both actions share the third.
+/// Native input stays out of the frozen header copy used during navigation.
 private struct SearchTitleField: View {
     @Binding var text: String
+    let prompt: String
+    let identifier: String
     let focused: FocusState<Bool>.Binding
     let onSubmit: () -> Void
     @Environment(\.headerPreviewCanGoBack) private var headerPreview
 
     var body: some View {
         if headerPreview != nil {
-            Text(text.isEmpty ? "标题开头" : text)
+            Text(text.isEmpty ? prompt : text)
                 .foregroundStyle(text.isEmpty ? .secondary : .primary)
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
         } else {
-            TextField("标题开头", text: $text, prompt: FloatingPageChrome.fieldPrompt("标题开头"))
-                .accessibilityIdentifier("search-title-input")
+            TextField(prompt, text: $text, prompt: FloatingPageChrome.fieldPrompt(prompt))
+                .accessibilityIdentifier(identifier)
                 .focused(focused)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .submitLabel(.search)
                 .onSubmit(onSubmit)
         }
-    }
-}
-
-private struct SearchQueryRowLayout: Layout {
-    private let spacing = FloatingPageChrome.groupInset
-
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        let width = proposal.width ?? subviews.reduce(spacing) { $0 + $1.sizeThatFits(.unspecified).width }
-        let proposals = columnProposals(width: width)
-        let height = zip(subviews, proposals).map { $0.sizeThatFits($1).height }.max() ?? 0
-        return CGSize(width: width, height: height)
-    }
-
-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        let proposals = columnProposals(width: bounds.width)
-        var x = bounds.minX
-        for (view, column) in zip(subviews, proposals) {
-            view.place(at: CGPoint(x: x, y: bounds.midY), anchor: .leading, proposal: column)
-            x += (column.width ?? 0) + spacing
-        }
-    }
-
-    private func columnProposals(width: CGFloat) -> [ProposedViewSize] {
-        let column = FloatingPageChrome.columnWidth(in: width, count: 3, gap: spacing)
-        return [.init(width: 2 * column + spacing, height: nil), .init(width: column, height: nil)]
     }
 }
 
@@ -254,8 +272,7 @@ private struct SearchResultGrid: View {
         let policy: TagAvailabilityPolicy
     }
     let criteria: MediaSearchCriteria
-    let filter: FeedFilter
-    let queryHeader: AnyView
+    @Binding var filter: FeedFilter
     @EnvironmentObject private var session: SiteSession
     @ObservedObject private var blocklist = TagBlocklist.shared
     @ObservedObject private var authorBlocks = AuthorBlocklist.shared
@@ -267,33 +284,49 @@ private struct SearchResultGrid: View {
     @State private var emptyTagKinds: Set<MediaKind> = []
 
     private var requestKey: FeedStoreRequestKey { .init(identity: session.feedIdentity, filter: filter, source: .search(target)) }
-    private var target: MediaSearchTarget { .combined(criteria) }
-    private var resultsContext: AnyView {
-        let hasBlockedTag = criteria.tags.contains { blocklist.names.contains(TagPolicy.normalize($0.name)) }
-        return AnyView(
-            VStack(alignment: .leading, spacing: FloatingPageChrome.groupInset) {
-                queryHeader
-                VStack(alignment: .leading, spacing: FloatingPageChrome.groupInset) {
-                    if hasBlockedTag {
-                        Text("所选标签已屏蔽，相关作品仍会隐藏。")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                    if let author = criteria.author {
-                        NavigationLink { CreatorView(creator: author, initialKind: filter.effectiveKind) } label: {
-                            Label("作者主页", systemImage: "person.crop.circle")
-                        }
-                        .buttonStyle(FloatingPageButtonStyle())
+    private var authorOnly: Creator? {
+        guard criteria.normalizedText.isEmpty, criteria.tags.isEmpty else { return nil }
+        return criteria.author
+    }
+    private var target: MediaSearchTarget {
+        if let authorOnly { return .author(authorOnly) }
+        return .combined(criteria)
+    }
+    private var resultsHeader: some View {
+        VStack(alignment: .leading, spacing: FloatingPageChrome.spacing) {
+            if let authorOnly {
+                CreatorIdentityCard(creator: authorOnly)
+                    .accessibilityIdentifier("search.author-result")
+            }
+            Menu {
+                ForEach(FeedSort.allCases) { sort in
+                    Button {
+                        filter.sort = sort.rawValue
+                    } label: {
+                        if filter.sort == sort.rawValue { Label(sort.title, systemImage: "checkmark") }
+                        else { Text(sort.title) }
                     }
                 }
-                .padding(.horizontal, FloatingPageChrome.pageInset)
+            } label: {
+                AppFilterLabel(title: filter.sortTitle, symbol: "arrow.up.arrow.down")
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        )
+            .buttonStyle(FloatingPageButtonStyle())
+            .menuOrder(.fixed)
+            .accessibilityLabel("排序")
+            .accessibilityValue(filter.sortTitle)
+            .accessibilityIdentifier("search.results.sort")
+            if criteria.tags.contains(where: { blocklist.names.contains(TagPolicy.normalize($0.name)) }) {
+                Text("所选标签已屏蔽，相关作品仍会隐藏。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, FloatingPageChrome.pageInset)
     }
 
     var body: some View {
         MediaGrid(feed: feed,
-                  isVisible: viewer == nil, refreshFromStart: refreshFeed, header: resultsContext,
+                  isVisible: viewer == nil, refreshFromStart: refreshFeed, header: AnyView(resultsHeader),
                   horizontalInset: AppTheme.spacing) { item in
             focused = item.id
             viewer = item

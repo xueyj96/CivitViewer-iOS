@@ -33,6 +33,8 @@ import Foundation
         check(MediaSearchText.matchesPrefix("City Lights",keyword:"city") && !MediaSearchText.matchesPrefix("The City",keyword:"city") && !MediaSearchText.matchesPrefix(nil,keyword:"city"),"Title matching means prefix, not arbitrary contains or missing text")
         let source=SearchFixture(),lookup=SearchLookupStore()
         func key(_ mode:MediaSearchMode,_ text:String,blocked:Set<String>=[]) -> SearchLookupStore.Key { .init(mode:mode,text:text,identity:source.feedIdentity,blockedTags:blocked) }
+        check(MediaSearchText.authorKeyword("  @Author_Name  ") == "Author_Name" &&
+              MediaSearchText.authorKeyword("@").isEmpty, "Author queries accept pasted handles without sending the @ prefix")
         source.authorQuery={_ in (1...25).map{Creator(id:$0,username:"fixture-\($0)",image:nil)}}
         await lookup.reload(key:key(.author,"fixture"),source:source)
         check(lookup.authors.count==20 && lookup.reachedEnd,"Bounded author candidates do not pretend to support unavailable offset paging")
