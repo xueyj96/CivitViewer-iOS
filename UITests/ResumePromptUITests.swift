@@ -4016,6 +4016,32 @@ final class ResumePromptUITests: XCTestCase {
         XCTAssertEqual(app.buttons["search-author-picker"].valueDescription, "未选择")
     }
 
+    func testAuthorSearchCentersInitialProgressAndLoadsMoreAtTheEnd() {
+        app = XCUIApplication()
+        app.launchArguments = ["--qa-collection-paging", "--qa-height-audit", "-muted", "YES"]
+        XCUIDevice.shared.orientation = .portrait
+        app.launch()
+        mainTabButton("搜索").tap()
+        app.buttons["search.mode"].tap()
+        let username = app.textFields["search-author-input"]
+        XCTAssertTrue(username.waitForExistence(timeout: 5))
+        username.tap()
+        username.typeText("pagedfixture")
+        app.buttons["search-authors-submit"].tap()
+
+        let results = app.scrollViews["author-lookup.results"]
+        let progress = app.descendants(matching: .any)["author-lookup.initial-progress"].firstMatch
+        XCTAssertTrue(progress.waitForExistence(timeout: 3))
+        XCTAssertEqual(progress.frame.midX, app.frame.midX, accuracy: 2)
+        XCTAssertEqual(progress.frame.midY, app.frame.midY, accuracy: 12)
+
+        XCTAssertTrue(app.buttons["search.author.29000001"].waitForExistence(timeout: 6))
+        let lastAuthor = app.buttons["search.author.29000025"]
+        for _ in 0..<6 where !lastAuthor.isHittable { results.swipeUp() }
+        XCTAssertTrue(lastAuthor.waitForExistence(timeout: 5))
+        XCTAssertTrue(lastAuthor.isHittable)
+    }
+
     func testAuthorPageSearchUsesTheSameInlineResults() {
         app = XCUIApplication()
         app.launchArguments = ["--qa-collection-paging", "--qa-height-audit", "-app.appearance", "light", "-muted", "YES"]

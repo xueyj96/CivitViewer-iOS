@@ -312,37 +312,32 @@ struct AuthorSearchPicker: View {
     @State private var text = ""
     private var keyword: String { MediaSearchText.authorKeyword(text) }
     var body: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: FloatingPageChrome.groupInset) {
-                HStack(spacing: FloatingPageChrome.spacing) {
-                    FloatingPageIcon(symbol: "magnifyingglass")
-                        .foregroundStyle(.secondary).frame(width: 28).accessibilityHidden(true)
-                    TextField("输入作者昵称", text: $text, prompt: FloatingPageChrome.fieldPrompt("用户名或开头"))
-                        .textInputAutocapitalization(.never).autocorrectionDisabled()
-                        .accessibilityIdentifier("author-picker.input")
-                    if selected != nil || draft != nil {
-                        Button { draft = nil } label: {
-                            Text("不限作者")
-                                .fixedSize(horizontal: true, vertical: false)
-                                .frame(minHeight: FloatingPageChrome.controlHeight)
-                                .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(draft == nil ? Color.secondary : Color.accentColor)
-                        .disabled(draft == nil)
-                        .accessibilityIdentifier("author-picker.clear")
+        AuthorLookupResults(keyword: keyword, selectedID: draft?.id, onSelect: { draft = $0 }) {
+            HStack(spacing: FloatingPageChrome.spacing) {
+                FloatingPageIcon(symbol: "magnifyingglass")
+                    .foregroundStyle(.secondary).frame(width: 28).accessibilityHidden(true)
+                TextField("输入作者昵称", text: $text, prompt: FloatingPageChrome.fieldPrompt("用户名或开头"))
+                    .textInputAutocapitalization(.never).autocorrectionDisabled()
+                    .accessibilityIdentifier("author-picker.input")
+                if selected != nil || draft != nil {
+                    Button { draft = nil } label: {
+                        Text("不限作者")
+                            .fixedSize(horizontal: true, vertical: false)
+                            .frame(minHeight: FloatingPageChrome.controlHeight)
+                            .contentShape(Rectangle())
                     }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(draft == nil ? Color.secondary : Color.accentColor)
+                    .disabled(draft == nil)
+                    .accessibilityIdentifier("author-picker.clear")
                 }
-                .frame(minHeight: FloatingPageChrome.controlHeight)
-                .padding(.horizontal, 12)
-                .background(AppTheme.secondarySurface, in: FloatingPageChrome.controlShape)
-                .accessibilityElement(children: .contain)
-                .accessibilityIdentifier("author-picker.field")
-
-                AuthorLookupResults(keyword: keyword, selectedID: draft?.id, onSelect: { draft = $0 })
             }
+            .frame(minHeight: FloatingPageChrome.controlHeight)
+            .padding(.horizontal, 12)
+            .background(AppTheme.secondarySurface, in: FloatingPageChrome.controlShape)
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("author-picker.field")
             .font(FloatingPageChrome.controlFont)
-            .pageScrollContentInsets()
         }
         .scrollDismissesKeyboard(.interactively)
         .floatingTitleBar(title) {
@@ -361,62 +356,92 @@ struct AuthorSearchPicker: View {
     }
 }
 
-struct AuthorLookupResults: View {
+struct AuthorLookupResults<Header: View>: View {
     let keyword: String
     var selectedID: Int? = nil
     var opensProfiles = false
     let onSelect: (Creator) -> Void
+    @ViewBuilder let header: () -> Header
     @EnvironmentObject private var session: SiteSession
     @StateObject private var lookup = SearchLookupStore()
 
     private var key: SearchLookupStore.Key { .init(mode: .author, text: keyword, identity: session.feedIdentity, blockedTags: []) }
+    private var valid: Bool { MediaSearchText.valid(keyword, mode: .author) }
+    private var loadingFirstPage: Bool {
+        valid && (lookup.key != key || (lookup.authors.isEmpty && lookup.loading))
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: FloatingPageChrome.groupInset) {
-            if lookup.key == key {
-                ForEach(lookup.authors) { author in
-                    Button { onSelect(author) } label: {
-                        HStack(spacing: FloatingPageChrome.spacing) {
-                            AuthorRowIdentity(name: author.username, showsHandle: true)
-                            Spacer(minLength: 0)
-                            if opensProfiles {
-                                Image(systemName: "chevron.right").font(.caption2.weight(.semibold))
-                                    .foregroundStyle(.tertiary).accessibilityHidden(true)
-                            } else if selectedID == author.id {
-                                Image(systemName: "checkmark").foregroundStyle(Color.accentColor)
-                            }
-                        }
-                        .padding(.horizontal, 12)
-                        .frame(maxWidth: .infinity, minHeight: FloatingPageChrome.controlHeight, alignment: .leading)
-                        .background(AppTheme.secondarySurface, in: FloatingPageChrome.controlShape)
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityAddTraits(selectedID == author.id ? .isSelected : [])
-                    .accessibilityLabel("@" + author.username)
-                    .accessibilityIdentifier(opensProfiles ? "search.author.\(author.id)" : "author-picker.author.\(author.id)")
-                }
-                if lookup.loading { loadingIndicator }
-                else if let error = lookup.error {
-                    HStack {
-                        Text(error).font(.caption).foregroundStyle(.secondary)
-                        Spacer(minLength: 0)
-                        StatusReloadButton { Task { await lookup.reload(key: key, source: session) } }
-                    }
-                } else if lookup.authors.isEmpty && !keyword.isEmpty {
-                    Text("没有返回匹配作者").font(.footnote).foregroundStyle(.secondary)
-                }
-            } else if !keyword.isEmpty {
-                if MediaSearchText.valid(keyword, mode: .author) { loadingIndicator }
-                else { Text(MediaSearchText.validationMessage).font(.caption).foregroundStyle(.secondary) }
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: FloatingPageChrome.groupInset) {
+                header()
+                results
+            }
+            .pageScrollContentInsets()
+        }
+        .accessibilityIdentifier("author-lookup.results")
+        .overlay {
+            if loadingFirstPage {
+                Color.clear
+                    .overlay { loadingIndicator.accessibilityIdentifier("author-lookup.initial-progress") }
+                    .ignoresSafeArea(.container, edges: .vertical)
+                    .allowsHitTesting(false)
             }
         }
         .task(id: key) {
             guard lookup.key != key else { return }
             lookup.clear()
-            guard MediaSearchText.valid(keyword, mode: .author) else { return }
+            guard valid else { return }
             do { try await Task.sleep(for: .milliseconds(350)); try Task.checkCancellation() } catch { return }
             await lookup.reload(key: key, source: session)
+        }
+    }
+
+    @ViewBuilder private var results: some View {
+        if lookup.key == key {
+            ForEach(Array(lookup.authors.enumerated()), id: \.element.id) { index, author in
+                Button { onSelect(author) } label: {
+                    HStack(spacing: FloatingPageChrome.spacing) {
+                        AuthorRowIdentity(name: author.username, showsHandle: true, position: opensProfiles ? index + 1 : nil)
+                        Spacer(minLength: 0)
+                        if opensProfiles {
+                            Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(.tertiary).accessibilityHidden(true)
+                        } else if selectedID == author.id {
+                            Image(systemName: "checkmark").foregroundStyle(Color.accentColor)
+                        }
+                    }
+                    .padding(.horizontal, opensProfiles ? 10 : 12)
+                    .frame(maxWidth: .infinity, minHeight: FloatingPageChrome.controlHeight, alignment: .leading)
+                    .background(AppTheme.secondarySurface, in: FloatingPageChrome.controlShape)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityAddTraits(selectedID == author.id ? .isSelected : [])
+                .accessibilityLabel("@" + author.username)
+                .accessibilityIdentifier(opensProfiles ? "search.author.\(author.id)" : "author-picker.author.\(author.id)")
+            }
+            if let error = lookup.error {
+                HStack {
+                    Text(error).font(.caption).foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                    StatusReloadButton { Task { await lookup.next(source: session) } }
+                }
+            } else if !lookup.authors.isEmpty && !lookup.reachedEnd {
+                loadingIndicator
+                    .frame(maxWidth: .infinity, minHeight: FloatingPageChrome.controlHeight)
+                    .task(id: lookup.authors.last?.id) {
+                        guard lookup.key == key else { return }
+                        await lookup.next(source: session)
+                    }
+            } else if lookup.authors.count >= SearchLookupStore.authorResultLimit {
+                Text("已显示 \(lookup.authors.count) 位作者，可缩小搜索范围")
+                    .font(.footnote).foregroundStyle(.secondary)
+            } else if lookup.authors.isEmpty && lookup.reachedEnd {
+                Text("没有返回匹配作者").font(.footnote).foregroundStyle(.secondary)
+            }
+        } else if !keyword.isEmpty && !valid {
+            Text(MediaSearchText.validationMessage).font(.caption).foregroundStyle(.secondary)
         }
     }
 

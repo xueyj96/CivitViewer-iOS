@@ -457,15 +457,25 @@ final class SiteSession: NSObject, ObservableObject, PublicationSource, MediaSea
         return try await request(path: path)
     }
 
-    func searchAuthors(keyword: String) async throws -> [Creator] {
+    func searchAuthors(keyword: String, excluding: [Int] = []) async throws -> [Creator] {
         #if DEBUG && targetEnvironment(simulator)
         if ViewportAuditQA.enabled {
+            if keyword == "pagedfixture" {
+                if excluding.isEmpty { try await Task.sleep(for: .seconds(2)) }
+                let excluded = Set(excluding)
+                return (1...25).map { Creator(id: 29_000_000 + $0, username: "PagedFixture\($0)") }
+                    .filter { !excluded.contains($0.id) }
+                    .prefix(SearchLookupStore.authorPageSize).map { $0 }
+            }
             let creator = Creator(id: CollectionPagingQA.ownerID, username: "PagingFixture")
             return creator.username.localizedCaseInsensitiveContains(MediaSearchText.normalized(keyword)) ? [creator] : []
         }
         #endif
         guard MediaSearchText.valid(keyword, mode: .author) else { throw ClientError.format("作者关键词") }
-        return try await rpc("user.getAll", input: ["query": MediaSearchText.normalized(keyword), "limit": 20, "include": [String]()])
+        var input: [String: Any] = ["query": MediaSearchText.normalized(keyword),
+                                    "limit": SearchLookupStore.authorPageSize, "include": [String]()]
+        if !excluding.isEmpty { input["excludedUserIds"] = excluding }
+        return try await rpc("user.getAll", input: input)
     }
 
     func searchTags(keyword: String, page: Int) async throws -> [SearchTag] {

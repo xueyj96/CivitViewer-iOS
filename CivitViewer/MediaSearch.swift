@@ -90,7 +90,7 @@ struct SearchPostPage: Decodable {
 
 @MainActor protocol MediaSearchSource: AnyObject {
     var feedIdentity: String { get }
-    func searchAuthors(keyword: String) async throws -> [Creator]
+    func searchAuthors(keyword: String, excluding: [Int]) async throws -> [Creator]
     func searchTags(keyword: String, page: Int) async throws -> [SearchTag]
     func searchTitlePosts(keyword: String, filter: FeedFilter, cursor: PublicationCursor?) async throws -> SearchPostPage
     func searchPostMedia(postID: Int, filter: FeedFilter, cursor: String?, includeTags: Bool) async throws -> MediaPage
@@ -180,6 +180,8 @@ struct SearchPostPage: Decodable {
 }
 
 @MainActor final class SearchLookupStore: ObservableObject {
+    static let authorPageSize = 20
+    static let authorResultLimit = 200
     struct Key: Equatable { let mode: MediaSearchMode; let text: String; let identity: String; let blockedTags: Set<String> }
     @Published private(set) var authors: [Creator] = []
     @Published private(set) var tags: [SearchTag] = []
@@ -202,11 +204,14 @@ struct SearchPostPage: Decodable {
         defer { if revision == generation { loading = false } }
         do {
             if key.mode == .author {
-                let result = try await source.searchAuthors(keyword: key.text)
+                // The site ignores page offsets for users but accepts an exclusion list.
+                let result = try await source.searchAuthors(keyword: key.text, excluding: authors.map(\.id))
                 try Task.checkCancellation()
                 guard revision == generation, key.identity == source.feedIdentity else { return }
-                authors = Array(result.filter { $0.id > 0 && !$0.username.isEmpty && seen.insert($0.id).inserted }.prefix(20))
-                reachedEnd = true // Server username-search has no offset; maximum20.
+                let fresh = result.prefix(Self.authorPageSize).filter { $0.id > 0 && !$0.username.isEmpty && seen.insert($0.id).inserted }
+                guard result.isEmpty || !fresh.isEmpty else { throw ClientError.format("作者搜索返回重复结果，请重试或缩小搜索范围") }
+                authors += fresh.prefix(Self.authorResultLimit - authors.count)
+                reachedEnd = result.count < Self.authorPageSize || authors.count >= Self.authorResultLimit
             } else {
                 let result = try await source.searchTags(keyword: TagPolicy.normalize(key.text), page: nextPage)
                 try Task.checkCancellation()

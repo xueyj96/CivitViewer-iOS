@@ -147,14 +147,7 @@ private struct LeaderboardList: View {
         let shape = FloatingPageChrome.controlShape
         return NavigationLink { CreatorView(creator: entry.user) } label: {
             HStack(spacing: 10) {
-                ZStack(alignment: .trailing) {
-                    Text("0000").hidden().accessibilityHidden(true)
-                    Text(String(format: "%02d", entry.position))
-                }
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: true, vertical: false)
-                AuthorRowIdentity(name: entry.user.username, detail: publicationDate(for: entry))
+                AuthorRowIdentity(name: entry.user.username, detail: publicationDate(for: entry), position: entry.position)
                 Spacer(minLength: 0)
                 if session.following.contains(entry.user.id) {
                     Image(systemName: "checkmark.circle.fill")
@@ -221,17 +214,32 @@ struct AuthorRowIdentity: View {
     let name: String
     var showsHandle = false
     var detail: String? = nil
+    var position: Int? = nil
 
     var body: some View {
-        HStack(spacing: FloatingPageChrome.spacing) {
-            AvatarView(name: name, size: 28).accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(showsHandle ? "@" + name : name)
-                    .font(FloatingPageChrome.controlFont)
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-                if let detail {
-                    Text(detail).font(.caption).foregroundStyle(.secondary)
+        HStack(spacing: 6) {
+            if let position {
+                ZStack {
+                    Text("0000").hidden().accessibilityHidden(true)
+                    Text(String(position))
+                }
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 4)
+                .padding(.vertical, 2)
+                .background(.quaternary, in: RoundedRectangle(cornerRadius: 4))
+                .fixedSize(horizontal: true, vertical: false)
+            }
+            HStack(spacing: FloatingPageChrome.spacing) {
+                AvatarView(name: name, size: 28).accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(showsHandle ? "@" + name : name)
+                        .font(FloatingPageChrome.controlFont)
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    if let detail {
+                        Text(detail).font(.caption).foregroundStyle(.secondary)
+                    }
                 }
             }
         }
@@ -442,6 +450,7 @@ struct MediaGrid: View {
     var refreshFromStart: (() async -> Void)? = nil
     var header: AnyView? = nil
     var horizontalInset: CGFloat = 10
+    var centersInitialProgress = false
     var showRoutineTagSummary = true
     var favoriteSelection: Set<Int>? = nil
     var beginSelection: ((MediaItem) -> Void)? = nil
@@ -454,6 +463,16 @@ struct MediaGrid: View {
     @Environment(\.scenePhase) private var scenePhase
     private var nearEnd: Bool { !Set(feed.items.suffix(4).map(\.id)).isDisjoint(with: visibleCells) }
     private var continuationStatus: FeedContinuationState { continuationState ?? feed.continuationState }
+    private var empty: Bool { (previewItems ?? feed.items).isEmpty }
+    private var showsCenteredProgress: Bool {
+        centersInitialProgress && previewItems == nil && empty && (continuationStatus == .ready || continuationStatus.isLoading)
+    }
+    private var continuationView: some View {
+        FeedContinuationStatusView(state: continuationStatus, empty: empty,
+                                   performing: continuationAction != nil, restartRetryAvailableAt: feed.restartRetryAvailableAt,
+                                   retry: { startExplicitAction(loadMore) },
+                                   restart: { startExplicitAction(refreshFromStart ?? { _ = await feed.restartCurrentFeed(session: session) }) })
+    }
     private struct AutomaticLoadKey: Equatable {
         let request: FeedStoreRequestKey?
         let tail: Int?
@@ -502,15 +521,19 @@ struct MediaGrid: View {
                         .onDisappear { visibleCells.remove(item.id) }
                 }
             }.scrollTargetLayout().padding(.horizontal, horizontalInset)
-            if previewItems == nil || continuationStatus.failure != nil {
-                FeedContinuationStatusView(state: continuationStatus, empty: (previewItems ?? feed.items).isEmpty,
-                                           performing: continuationAction != nil, restartRetryAvailableAt: feed.restartRetryAvailableAt,
-                                           retry: { startExplicitAction(loadMore) },
-                                           restart: { startExplicitAction(refreshFromStart ?? { _ = await feed.restartCurrentFeed(session: session) }) })
-                    .padding(.vertical, 16)
+            if !showsCenteredProgress && (previewItems == nil || continuationStatus.failure != nil) {
+                continuationView.padding(.vertical, 16)
             }
             if feed.items.isEmpty, continuationStatus == .ended, let emptyDescription {
                 Text(emptyDescription).font(.caption).foregroundStyle(.secondary).padding(.horizontal, 20)
+            }
+        }
+        .overlay {
+            if showsCenteredProgress {
+                Color.clear
+                    .overlay { continuationView }
+                    .ignoresSafeArea(.container, edges: .vertical)
+                    .allowsHitTesting(false)
             }
         }
         .modifier(MediaGridPosition(anchor: anchor))

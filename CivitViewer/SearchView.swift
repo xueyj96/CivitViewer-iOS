@@ -40,13 +40,9 @@ struct SearchView: View {
     var body: some View {
         ZStack {
             if mode == .authors {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: FloatingPageChrome.groupInset) {
-                        AuthorLookupResults(keyword: submittedAuthor, opensProfiles: true) { openedAuthor = $0 }
-                    }
-                    .padding(.horizontal, FloatingPageChrome.pageInset)
+                AuthorLookupResults(keyword: submittedAuthor, opensProfiles: true, onSelect: { openedAuthor = $0 }) {
+                    EmptyView()
                 }
-                .avoidOverlaidTabBar()
             } else if let submission {
                 SearchResultGrid(criteria: submission.criteria, filter: $filter)
                     .id(submission.id)
@@ -327,7 +323,7 @@ private struct SearchResultGrid: View {
     var body: some View {
         MediaGrid(feed: feed,
                   isVisible: viewer == nil, refreshFromStart: refreshFeed, header: AnyView(resultsHeader),
-                  horizontalInset: AppTheme.spacing) { item in
+                  horizontalInset: AppTheme.spacing, centersInitialProgress: true) { item in
             focused = item.id
             viewer = item
         } loadMore: { await feed.next(session: session) }

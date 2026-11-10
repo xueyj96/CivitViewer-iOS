@@ -2,13 +2,13 @@ import Foundation
 
 @MainActor private final class SearchFixture: MediaSearchSource {
     var feedIdentity = "fixture-A"
-    var authorQuery: (String) async throws -> [Creator] = { _ in [] }
+    var authorQuery: (String, [Int]) async throws -> [Creator] = { _, _ in [] }
     var tagQuery: (String,Int) async throws -> [SearchTag] = { _,_ in [] }
     var posts: (String,FeedFilter,PublicationCursor?) async throws -> SearchPostPage = { _,_,_ in .init(items: [],nextCursor: nil) }
     var media: (Int,FeedFilter,String?,Bool) async throws -> MediaPage = { _,_,_,_ in .init(items: [],metadata: .init(nextCursor: nil)) }
     var requests: [(post: Int,cursor: String?,filter: FeedFilter,tags: Bool)] = []
     var postReads = 0
-    func searchAuthors(keyword: String) async throws -> [Creator] { try await authorQuery(keyword) }
+    func searchAuthors(keyword: String, excluding: [Int]) async throws -> [Creator] { try await authorQuery(keyword, excluding) }
     func searchTags(keyword: String, page: Int) async throws -> [SearchTag] { try await tagQuery(keyword,page) }
     func searchTitlePosts(keyword: String, filter: FeedFilter, cursor: PublicationCursor?) async throws -> SearchPostPage { postReads += 1; return try await posts(keyword,filter,cursor) }
     func searchPostMedia(postID: Int, filter: FeedFilter, cursor: String?, includeTags: Bool) async throws -> MediaPage {
@@ -35,9 +35,15 @@ import Foundation
         func key(_ mode:MediaSearchMode,_ text:String,blocked:Set<String>=[]) -> SearchLookupStore.Key { .init(mode:mode,text:text,identity:source.feedIdentity,blockedTags:blocked) }
         check(MediaSearchText.authorKeyword("  @Author_Name  ") == "Author_Name" &&
               MediaSearchText.authorKeyword("@").isEmpty, "Author queries accept pasted handles without sending the @ prefix")
-        source.authorQuery={_ in (1...25).map{Creator(id:$0,username:"fixture-\($0)",image:nil)}}
+        source.authorQuery = { _, excluded in
+            let ids = excluded.isEmpty ? Array(1...20) : Array(20...25)
+            precondition(excluded.isEmpty || excluded == Array(1...20))
+            return ids.map { Creator(id: $0, username: "fixture-\($0)", image: nil) }
+        }
         await lookup.reload(key:key(.author,"fixture"),source:source)
-        check(lookup.authors.count==20 && lookup.reachedEnd,"Bounded author candidates do not pretend to support unavailable offset paging")
+        check(lookup.authors.count == 20 && !lookup.reachedEnd, "Full first author page offers more results")
+        await lookup.next(source: source)
+        check(lookup.authors.map(\.id) == Array(1...25) && lookup.reachedEnd, "Author continuation excludes earlier IDs, preserves order, and ends on a short page")
         lookup.clear();check(lookup.authors.isEmpty && lookup.tags.isEmpty && lookup.key==nil && lookup.error==nil,"Clear removes results and request identity")
         source.tagQuery={_,page in (page==1 ? Array(1...20) : Array(20...25)).map{SearchTag(id:$0,name:"city\($0)")}}
         await lookup.reload(key:key(.tag,"city",blocked:["city2"]),source:source)
@@ -54,7 +60,7 @@ import Foundation
         fail=false;await lookup.next(source:source)
         check(lookup.error==nil && lookup.tags.map(\.id)==[30],"Retry retains query and page")
         let start=SearchGate(),release=SearchGate()
-        source.authorQuery={keyword in if keyword=="old" {start.open();await release.wait();return [.init(id:1,username:"old",image:nil)]};return [.init(id:2,username:"new",image:nil)]}
+        source.authorQuery={keyword,_ in if keyword=="old" {start.open();await release.wait();return [.init(id:1,username:"old",image:nil)]};return [.init(id:2,username:"new",image:nil)]}
         let old=Task{await lookup.reload(key:key(.author,"old"),source:source)}
         await start.wait();await lookup.reload(key:key(.author,"new"),source:source);release.open();await old.value
         check(lookup.authors.map(\.id)==[2],"Late old lookup cannot replace new keywords")
