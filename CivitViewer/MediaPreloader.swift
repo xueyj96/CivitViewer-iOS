@@ -146,8 +146,15 @@ final class MediaPreloader: ObservableObject {
             attempted.subtract(retryable); failed.subtract(retryable)
             for key in retryable { failureCodes[key] = nil; spaceDeferred[key] = nil }
         }
+        let previousVideo: MediaItem? = {
+            guard normalizedIndex > 0 else { return nil }
+            let item = items[normalizedIndex - 1]
+            return item.isVideo && makeMediaKey(item) != nil ? item : nil
+        }()
+        let futureCount = max(0, windowSize - (previousVideo == nil ? 0 : 1))
         let start = normalizedIndex >= 0 ? normalizedIndex + 1 : 0
-        let window = Array(items.dropFirst(start).prefix(windowSize))
+        let futureWindow = Array(items.dropFirst(start).prefix(futureCount))
+        let window = (previousVideo.map { [$0] } ?? []) + futureWindow
         var ordered: [Candidate] = []
         var newCandidates: [Key: Candidate] = [:]
         for (offset, item) in window.enumerated() {

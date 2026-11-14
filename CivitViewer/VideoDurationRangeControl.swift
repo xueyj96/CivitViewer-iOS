@@ -56,7 +56,7 @@ struct VideoDurationRangeControl: View {
     }
     private func endpointMenu(lower: Bool) -> some View {
         let index = currentIndex(lower: lower)
-        return Menu {
+        return AppMenu {
             Button(index == VideoDurationScale.terminalIndex ? "设为02:00" : "减少1秒") { range = moving(to: index - 1, lower: lower) }
                 .disabled(moving(to: index - 1, lower: lower) == value)
             if index < VideoDurationScale.terminalIndex {

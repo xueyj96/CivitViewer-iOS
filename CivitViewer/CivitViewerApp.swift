@@ -16,7 +16,10 @@ struct CivitViewerApp: App {
             if AppReadback.tagMediaRequested { TagMetadataReadbackView().environmentObject(session) }
             else {
             #if targetEnvironment(simulator)
-            if ProcessInfo.processInfo.arguments.contains("--qa-gesture-scope68") { MediaGestureScopeQAView() }
+            if ProcessInfo.processInfo.arguments.contains("--qa-toast169") { AppToastQAView() }
+            else if ProcessInfo.processInfo.arguments.contains("--qa-header-staging161") { HeaderStagingQAView() }
+            else if ProcessInfo.processInfo.arguments.contains("--qa-presentation-lifecycle") { PresentationLifecycleQAView().environmentObject(session) }
+            else if ProcessInfo.processInfo.arguments.contains("--qa-gesture-scope68") { MediaGestureScopeQAView() }
             else if ProcessInfo.processInfo.arguments.contains("--qa-grid-retry55") { GridRetryQAView() }
             else if ProcessInfo.processInfo.arguments.contains("--qa-preparation48") { VideoPreparationOverlayQAView() }
             else if CollectionPagingQA.enabled { CollectionPagingQAView().environmentObject(session).environmentObject(session.oauth) }
@@ -161,12 +164,9 @@ struct RootView: View {
         .onChange(of: session.savedMembershipUpdate) { _, update in
             if let update { offline.accept(update); offline.requestSync(session: session) }
         }
-        .sheet(isPresented: $session.showLogin, onDismiss: { session.oauth.cancel() }) {
-            LoginView().environmentObject(session)
-        }
-        .alert("Civit Viewer", isPresented: Binding(get: { session.message != nil }, set: { if !$0 { session.message = nil } })) {
-            Button("好") { session.message = nil }
-        } message: { Text(session.message ?? "") }
+        .existingFeedbackToast(session.message, global: true, scope: session.feedIdentity, onShown: { message in
+            if session.message == message { session.message = nil }
+        })
     }
 }
 
@@ -177,11 +177,11 @@ struct SiteBrowser: UIViewRepresentable {
 }
 
 struct LoginView: View {
-    var forCollections = false
+    var forCollections: Bool? = nil
     var onClose: (() -> Void)? = nil
     @EnvironmentObject private var session: SiteSession
     @EnvironmentObject private var oauth: OAuthLogin
-    private var collectionLogin: Bool { forCollections || session.loginForCollections }
+    private var collectionLogin: Bool { forCollections ?? session.loginForCollections }
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -192,7 +192,6 @@ struct LoginView: View {
                             if collectionLogin {
                                 Text("收藏授权用于查看、保存和移除收藏作品。")
                             }
-                            if let error = oauth.error { Text(error).font(.caption).foregroundStyle(.red) }
                         }
                         .font(.subheadline)
                         .padding(.vertical, FloatingPageChrome.cardInset)
@@ -221,10 +220,20 @@ struct LoginView: View {
                 .buttonStyle(FloatingPageButtonStyle(iconOnly: true))
                 .accessibilityLabel("关闭")
             }, actions: { EmptyView() })
+            .pageReturnAction(enabled: !oauth.busy) {
+                guard !oauth.busy else { return false }
+                if let onClose { onClose() } else { session.showLogin = false }
+                return true
+            }
                 .fullScreenCover(item: $oauth.browserPage) { page in
                     SystemAuthBrowser(url: page.url) { oauth.cancel() }.ignoresSafeArea()
                 }
-        }.ordinaryPresentationAppearance()
+        }
+        .onChange(of: session.accountSessionID) { _, _ in
+            if session.account != nil, !collectionLogin || session.hasCollectionAccess { onClose?() }
+        }
+        .ordinaryPresentationAppearance()
+        .existingFeedbackToast(oauth.error, scope: session.feedIdentity)
     }
 }
 
@@ -232,13 +241,16 @@ struct FollowButton: View {
     let creator: Creator
     var onSignIn: (() -> Void)? = nil
     var mediaItemID: Int? = nil
+    @Environment(\.requestSignIn) private var requestSignIn
     @EnvironmentObject private var session: SiteSession
     private var following: Bool { session.following.contains(creator.id) }
 
     var body: some View {
         Button {
             if session.account == nil {
-                if let onSignIn { onSignIn() } else { session.openLogin() }
+                if let onSignIn { onSignIn() }
+                else if let requestSignIn { requestSignIn(false) }
+                else { session.openLogin() }
             } else { Task { await session.setFollowing(!following, creator: creator) } }
         } label: {
             ZStack {
@@ -274,7 +286,7 @@ private struct FollowButtonStyle: ButtonStyle {
             .foregroundStyle(ink).tint(ink)
             .padding(.horizontal, FloatingPageChrome.spacing)
             .padding(.vertical, FloatingPageChrome.groupInset)
-            .background(fill, in: Capsule())
+            .background(fill, in: FloatingPageChrome.surfaceShape(nested: true))
             .frame(minWidth: FloatingPageChrome.controlHeight, minHeight: FloatingPageChrome.controlHeight)
             .contentShape(Rectangle())
             .opacity(enabled ? (configuration.isPressed ? 0.65 : 1) : 0.55)
@@ -285,8 +297,10 @@ struct FailureView: View {
     let message: String
     let retry: () -> Void
     var body: some View {
-        ContentUnavailableView {
-            Label("暂时无法加载", systemImage: "wifi.exclamationmark")
-        } description: { Text(message) } actions: { StatusReloadButton(action: retry) }
+        ScrollView {
+            PageStatusCard(title: "", symbol: "wifi.exclamationmark", retry: retry)
+                .padding(.horizontal, FloatingPageChrome.pageInset)
+        }
+        .existingFeedbackToast(message.isEmpty ? "暂时无法加载" : message)
     }
 }

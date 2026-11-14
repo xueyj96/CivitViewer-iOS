@@ -1,0 +1,59 @@
+# 171 导航返回颜色、底栏交接与初始加载
+
+用户图片1是作者页边缘返回播放后固定栏先白后黑；图片2是底角弧形残影；图片3是首次请求前先显示无作品。与170根页面转场分别复现，不把170根切换通过视为子页面通过。
+
+## 处理范围
+
+FeedStore新增displayContinuationState仅投影显示：未配置、激活防抖和incomplete初始请求在items为空时显示loading；真实ended/failed不改。TimelineLane及Creator/MediaGrid消费该属性，传输continuationState不改。模型185项检查通过，build/feed171-checks.log。
+
+导航边缘返回在同几何且目标身份有效时，由NativeHeaderMotion.beginBodyReturn建立shared tone，与正文同一p驱动header controls和颜色；缓存只存像素及角色几何，不保留目标SwiftUI环境。目标真实header/layout fence完成后才撤下交接。不同高度和缺缓存保持原有安全路径，未扩大云端提交权限。
+
+第七轮四条图片/视频左右边缘均sharedHeader=true，但逐帧发现正文p1后旧灰footer胶囊仍继续向右退场，底角弧与胶囊边缘对应。nativePop/contentPop为0且非interactive，不支持双原生交互猜测，未强改UIKit圆角。
+
+修复在accepted p1时将目标canonical footer controls与目标owner自身canvas固定在外置footer.frame，随同body receipt保持到真实目标接稳。canvas从page捕获，controls用rootFooterRenderer明确目标角色，不复制window内正在混色的footer。缓存沿现有最多3项，并在receipt清理时detach以供复用。
+
+## 冻结验证
+
+第八轮源码manifest：d82a0d22b47c6c8b1c89c368c4d64d69d546c7f6360a6f25b10c54bc6eefed30，前后一致。build/171-eighth-run.log、build/171-eighth-run.mp4。
+
+- AuthorDragAndButtonReturnHandoff164通过45.393秒；图片/视频左右共四条边缘实际sharedHeader=true且footerProtected=true，按钮返回同时回归。
+- EdgeReturnIdentityClearsHoldingAndHandoff165通过33.199秒。
+- InitialTimelineShowsLoadingBeforeActivation171通过7.234秒。
+- AutomaticContinuationInitialEmptyReachesRealEnd失败：已到真实ended，但请求计数14而断言10。保留失败，正在隔离额外请求，不能记整轮通过。
+- 高级独立源码review：footer protection未发现阻塞，原始交接帧视觉复核待完成。
+
+尚未覆盖手机；当前手机170。此前约340.76ms首次作者榜至搜索停顿未因本次视觉修复被宣布解决。
+
+## 视觉复核后的补充
+
+第八轮四路径均未再出现旧灰胶囊向右退场的底角弧；仍在接近p1时灰、提交后黑。原始录像在相关区间缺少精确p1帧，不能记为p1后失败。源码确认PageToneBarCanvas只淡出来源白色，底下仍是尚未切换的来源白页。仅显式destination return tone先铺目标角色canvas，再叠同clock来源淡出；root170 destination=nil保持原路径。此处是角色底色，不声称所有延展媒体像素都已跟手。
+
+空结果用例失败的计数来自共享fixture：当前链与邻source/kind预热共用计数。QA现按真实followed、creator与完整filter限定initial-empty主链，另留totalRequests与source-kind-first/next全量分组，未禁预载。第十轮主链10/1/9与终态主链不增长通过；scoped-end总数12只是该时刻，之后following邻页仍在请求，不宣称所有请求停止。FeedStore显示投影没有触发请求副作用。
+
+只读分析另发现：TimelineModel.warm所写one metadata page注释与activate的跨过滤空页扫描不一致。隐藏预热并发有界，但没有独立transport-page总数预算；该策略问题另行处理，不能用fixture计数隔离宣称产品预载预算已修复。
+
+## 最终候选回归
+
+第十一轮最终源码manifest：8a14682f3267c759296e7c9e2c11dff3f6e493e1eab049d51b4a160ab8ca8a07，before/after一致。build/171-eleventh-run.log，录像build/171-eleventh-run.mp4；5/5通过：
+
+- AuthorDragAndButtonReturnHandoff164：42.578秒，四条edge实际sharedHeader/footerProtected均true。
+- AuthorPickerEntryAndBothEdgeReturnsKeepHeaderGeometry168：27.369秒。
+- AutomaticContinuationInitialEmptyReachesRealEnd：15.147秒，主链10/1/9，终态主链无增长，total分组仍保留。
+- InitialTimelineShowsLoadingBeforeActivation171：7.847秒。
+- RootVideoCanvasRemainsUnderFixedChrome165：17.851秒。
+
+第八轮identity失效清理33.199秒通过；该后的AppTheme目标canvas与QA计数修改已由独立高级agent按实际SHA256审核。最终录屏视觉待回读。
+
+第十一轮原始逐帧复核：footer接近p=.964亮度约38.4、p=.999约32.8、稳态31.8，连续变黑，底角弧未出现。审核初看10fps合成表误把中间进度灰色当终点，原始PTS复核后已明确撤回该初判。footer无需扩大架构。
+
+Header仍灰约0.6秒，HeaderHandoffView来源surface始终存在、目标半透明surface叠白且缺目标canvas。仅显式return endpoint补目标canvas与来源canvas淡出，同时来源surface按1-p退出；destination=nil原路径不变。
+
+第十二轮短暂双footer候选在新的精确复核到达后中止，未安装；已精确撤回，PageEdgeReturn与PageBodyHandoff SHA恢复高级review通过版本c852d2fe…与578b8e2a…并断言匹配。第十三轮仅检验HeaderHandoff修正。
+
+第十三轮最终Header修正候选源码manifest：07eae2942529e7b737090b483059894a1c60d9443f459291339b38e239fb239b，before/after一致。3/3通过：AuthorDragAndButtonReturnHandoff164 43.896秒，EdgeReturnIdentityClearsHoldingAndHandoff165 32.250秒，RootVideoCanvasRemainsUnderFixedChrome165 16.884秒。build/171-thirteenth-run.log/mp4。HeaderHandoff SHA98f1450e…经独立审核确认仅显式return路径改变；初始加载与计数逻辑沿第十一轮通过版本不变。
+
+## 独立视觉结论与手机覆盖
+
+第十三轮独立原始帧复核允许进入覆盖：图片/视频左右四路径未再出现白/浅灰空栏晚退、灰胶囊右退或底角弧；图片顶栏终点稳定约80.5、footer约31.8。视频live交接仍有58.5→86的小亮度差，背景媒体进入与角色canvas不完全等价，不能断言具体每个像素来源，更不宣称所有动画零差异。整体卡顿与隐藏预热预算仍是未完成项。
+
+Release1.1.0(171)签名验证与目标profile检查通过后覆盖手机，devicectl实际apps读回171。第一次安装后apps只读查询遇到CoreDevice4000断连，重试同一只读查询后成功；没有重复安装。安装前后离线index字节相同，87条全部ready，174目录项名称/大小/mtime一致；未由agent启动手机App。证据build/phone171-signature-readback.json、build/phone171-delivery-readback.json。保留用户数据；未推Git、发Release或清理产物，等待用户真机体验。

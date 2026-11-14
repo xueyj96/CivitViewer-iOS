@@ -49,6 +49,12 @@ enum FollowingListError: LocalizedError {
     }
 }
 
+enum FollowingMembership {
+    static func eligibleIDs(_ ids: Set<Int>, actorID: Int?) -> Set<Int> {
+        Set(ids.filter { $0 != -1 && $0 != actorID })
+    }
+}
+
 enum FollowingListOrdering {
     static func sort(_ creators: [Creator], by mode: FollowingSort, reverse: Bool = false) -> [Creator] {
         let result: [Creator]
@@ -66,6 +72,75 @@ enum FollowingListOrdering {
     }
 }
 
+actor FollowingListCache {
+    static let shared = FollowingListCache()
+    private static let lifetime: TimeInterval = 7 * 24 * 60 * 60
+    private static let maximumBytes = 1024 * 1024
+    private static let maximumCreators = 20_000
+
+    private struct Entry: Codable {
+        let identity: String
+        let memberIDs: [Int]
+        let revision: Int
+        let checkedAt: Date
+        let creators: [Row]
+    }
+
+    private struct Row: Codable {
+        let id: Int
+        let username: String
+        var creator: Creator { Creator(id: id, username: username, image: nil) }
+        init(_ creator: Creator) { id = creator.id; username = creator.username }
+    }
+
+    private let file: URL
+
+    init(file: URL? = nil) {
+        if let file {
+            self.file = file
+        } else {
+            self.file = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("CivitFollowing", isDirectory: true)
+                .appendingPathComponent("index-v1.json")
+        }
+    }
+
+    func creators(for key: FollowingListKey) -> [Creator]? {
+        guard let entry = read(), entry.identity == key.identity,
+              entry.memberIDs == key.memberIDs.sorted(), entry.revision == key.revision,
+              Self.fresh(entry.checkedAt), entry.creators.count <= Self.maximumCreators else { return nil }
+        let creators = entry.creators.map(\.creator)
+        guard Set(creators.map(\.id)).count == creators.count else { return nil }
+        return creators
+    }
+
+    func store(_ creators: [Creator], for key: FollowingListKey) {
+        guard creators.count <= Self.maximumCreators,
+              Set(creators.map(\.id)).count == creators.count else { return }
+        let entry = Entry(identity: key.identity, memberIDs: key.memberIDs.sorted(), revision: key.revision,
+                          checkedAt: .now, creators: creators.map(Row.init))
+        guard let data = try? JSONEncoder().encode(entry), data.count <= Self.maximumBytes else { return }
+        do {
+            try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try data.write(to: file, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        } catch { }
+    }
+
+    private func read() -> Entry? {
+        guard let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+              size > 0, size <= Self.maximumBytes,
+              let data = try? Data(contentsOf: file),
+              let entry = try? JSONDecoder().decode(Entry.self, from: data),
+              entry.creators.count <= Self.maximumCreators, Self.fresh(entry.checkedAt) else { return nil }
+        return entry
+    }
+
+    private static func fresh(_ date: Date) -> Bool {
+        let age = Date.now.timeIntervalSince(date)
+        return age >= 0 && age < lifetime
+    }
+}
+
 @MainActor final class FollowingListStore: ObservableObject {
     @Published private(set) var creators: [Creator] = []
     @Published private(set) var loading = false
@@ -73,22 +148,28 @@ enum FollowingListOrdering {
     @Published private(set) var error: String?
     @Published private(set) var totalItems = 0
     @Published private(set) var nextPage = 1
-    @Published private(set) var canContinue = false
+    @Published private(set) var isStaleSnapshot = false
     @Published private(set) var requestKey: FollowingListKey?
 
     let pageSize: Int
     let batchPages: Int
+    private let cache: FollowingListCache?
     private var eligible = Set<Int>()
     private var requestGeneration = 0
+    private var workingCreators: [Creator] = []
+    private var workingTotal = 0
+    private var workingComplete = false
 
-    init(pageSize: Int = 50, batchPages: Int = 20) {
+    init(pageSize: Int = 50, batchPages: Int = 20, cache: FollowingListCache? = nil) {
         self.pageSize = min(max(pageSize, 1), 200)
         self.batchPages = min(max(batchPages, 1), 20)
+        self.cache = cache
     }
 
     func clear() {
         requestGeneration += 1; requestKey = nil; eligible = []; creators = []; loading = false
-        complete = false; error = nil; totalItems = 0; nextPage = 1; canContinue = false
+        complete = false; error = nil; totalItems = 0; nextPage = 1; isStaleSnapshot = false
+        workingCreators = []; workingTotal = 0; workingComplete = false
     }
 
     func ordered(_ mode: FollowingSort, reverse: Bool = false) -> [Creator] {
@@ -99,20 +180,51 @@ enum FollowingListOrdering {
     func reload(key newKey: FollowingListKey, source: FollowingListSource) async {
         guard !Task.isCancelled else { return }
         requestGeneration += 1; let generation = requestGeneration
-        requestKey = newKey; eligible = []; creators = []; complete = false; error = nil
-        totalItems = 0; nextPage = 1; canContinue = false; loading = true
+        let retained = requestKey == newKey && complete ? creators : nil
+        requestKey = newKey; eligible = []; error = nil; loading = true
+        nextPage = 1; workingCreators = []; workingTotal = 0; workingComplete = false
+        complete = false; isStaleSnapshot = false; totalItems = 0
         defer { if generation == requestGeneration { loading = false } }
         do {
             guard source.followingIdentity == newKey.identity else { throw FollowingListError.accountChanged }
+            guard source.followingMemberIDs == newKey.memberIDs,
+                  source.followingRevision == newKey.revision else { throw FollowingListError.membershipChanged }
+            if let retained {
+                creators = retained; complete = true; isStaleSnapshot = true; totalItems = retained.count
+            } else {
+                creators = []
+                let cached = await cache?.creators(for: newKey)
+                try Task.checkCancellation()
+                guard generation == requestGeneration else { return }
+                if let cached,
+                   source.followingIdentity == newKey.identity,
+                   source.followingMemberIDs == newKey.memberIDs,
+                   source.followingRevision == newKey.revision {
+                    let expected = FollowingMembership.eligibleIDs(newKey.memberIDs, actorID: source.followingActorID)
+                    if Set(cached.map(\.id)) == expected, cached.count == expected.count {
+                        creators = cached; complete = true; isStaleSnapshot = true; totalItems = cached.count
+                    }
+                }
+            }
             let ids = try await source.refreshFollowingIDs()
             try Task.checkCancellation()
             guard generation == requestGeneration else { return }
-            guard source.followingIdentity == newKey.identity else { throw FollowingListError.accountChanged }
-            guard ids == newKey.memberIDs, source.followingMemberIDs == newKey.memberIDs, source.followingRevision == newKey.revision else { throw FollowingListError.membershipChanged }
+            guard source.followingIdentity == newKey.identity else {
+                creators = []; complete = false; isStaleSnapshot = false; totalItems = 0
+                throw FollowingListError.accountChanged
+            }
+            guard ids == newKey.memberIDs, source.followingMemberIDs == newKey.memberIDs, source.followingRevision == newKey.revision else {
+                creators = []; complete = false; isStaleSnapshot = false; totalItems = 0
+                throw FollowingListError.membershipChanged
+            }
             guard ids.allSatisfy({ $0 > 0 || $0 == -1 || $0 == source.followingActorID }) else { throw FollowingListError.invalidSnapshotID }
-            eligible = Set(ids.filter { $0 != -1 && $0 != source.followingActorID })
-            if eligible.isEmpty { complete = true; canContinue = false; return }
-            try await loadBatch(source: source, generation: generation)
+            eligible = FollowingMembership.eligibleIDs(ids, actorID: source.followingActorID)
+            if eligible.isEmpty {
+                creators = []; totalItems = 0; complete = true; isStaleSnapshot = false; workingComplete = true
+                await cache?.store([], for: newKey)
+                return
+            }
+            try await loadAllPages(source: source, generation: generation)
         } catch is CancellationError {
             if generation == requestGeneration { error = "加载已取消，可重试当前关注列表。" }
         } catch {
@@ -120,17 +232,9 @@ enum FollowingListOrdering {
         }
     }
 
-    func nextBatch(source: FollowingListSource) async {
-        guard requestKey != nil, !loading, !complete else { return }
-        requestGeneration += 1; let generation = requestGeneration; loading = true; error = nil
-        defer { if generation == requestGeneration { loading = false } }
-        do { try await loadBatch(source: source, generation: generation) }
-        catch is CancellationError { if generation == requestGeneration { error = "加载已取消，可重试当前分页。" } }
-        catch { if generation == requestGeneration { self.error = error.localizedDescription } }
-    }
-
-    private func loadBatch(source: FollowingListSource, generation: Int) async throws {
-        for _ in 0..<batchPages {
+    private func loadAllPages(source: FollowingListSource, generation: Int) async throws {
+        var pagesInBatch = 0
+        while !workingComplete {
             try Task.checkCancellation()
             guard generation == requestGeneration else { return }
             guard let key = requestKey, source.followingIdentity == key.identity else { throw FollowingListError.accountChanged }
@@ -148,24 +252,28 @@ enum FollowingListOrdering {
                   response.items.count <= pageSize,
                   response.items.count == (nextPage < response.totalPages ? pageSize : response.totalItems - (nextPage - 1) * pageSize)
             else { throw FollowingListError.invalidPage }
-            let candidateTotal = nextPage == 1 ? response.totalItems : totalItems
+            let candidateTotal = nextPage == 1 ? response.totalItems : workingTotal
             guard candidateTotal == response.totalItems else { throw FollowingListError.changedCounts }
-            let existing = Set(creators.map(\.id))
+            let existing = Set(workingCreators.map(\.id))
             guard response.items.allSatisfy({ eligible.contains($0.id) }) else { throw FollowingListError.unexpectedCreator }
             guard Set(response.items.map(\.id)).count == response.items.count,
                   existing.isDisjoint(with: response.items.map(\.id)) else { throw FollowingListError.duplicateCreator }
-            let combined = creators + response.items
+            let combined = workingCreators + response.items
             let finalPage = nextPage == response.totalPages
             if finalPage {
                 guard Set(combined.map(\.id)) == eligible, combined.count == candidateTotal else { throw FollowingListError.incomplete }
             }
-            creators = combined
-            totalItems = candidateTotal
+            workingCreators = combined
+            workingTotal = candidateTotal
             nextPage += 1
             if finalPage {
-                complete = true; canContinue = false; return
+                creators = combined; totalItems = candidateTotal; complete = true; isStaleSnapshot = false
+                workingComplete = true
+                await cache?.store(combined, for: key)
+                return
             }
+            pagesInBatch += 1
+            if pagesInBatch >= batchPages { pagesInBatch = 0; await Task.yield() }
         }
-        canContinue = !complete
     }
 }

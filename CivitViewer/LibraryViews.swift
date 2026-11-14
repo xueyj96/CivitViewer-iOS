@@ -4,29 +4,27 @@ struct LeaderboardView: View {
     @EnvironmentObject private var session: SiteSession
     @State private var board: Board = .seasonal
     @State private var recent: RecentPublication = .any
+    @State private var openedAuthor: Creator?
     var body: some View {
-        ZStack {
-            ForEach(Board.allCases) { value in
-                LeaderboardList(board: value, visible: board == value, recent: recent)
-                    .opacity(board == value ? 1 : 0)
-                    .allowsHitTesting(board == value).accessibilityHidden(board != value)
-            }
+        SegmentedContentPager(selection: board, options: Board.allCases, identifier: "leaderboard.board", isolatesNativeLists: true) { value, active in
+            LeaderboardList(board: value, visible: active, selected: value == board, recent: recent, onOpen: { openedAuthor = $0 })
         }
         .floatingPageBar("leaderboard.top-bar") {
             HStack(spacing: FloatingPageChrome.groupInset) {
                 FloatingSegmentedControl(title: "作者榜类型", selection: $board, options: Board.allCases,
                                          optionTitle: { $0.title }, identifier: "leaderboard.board")
-                Menu {
-                    Picker("作品更新时间", selection: $recent) {
-                        ForEach(RecentPublication.allCases) { Text($0.title).tag($0) }
-                    }
-                } label: { AppFilterLabel(title: recent.title, symbol: "calendar") }
+                AppValueSelector(title: "作品更新时间", selection: $recent,
+                                 options: RecentPublication.allCases, name: { $0.title }) {
+                    AppFilterLabel(title: recent.title, symbol: "calendar")
+                }
                 .accessibilityLabel("作品更新：" + recent.title)
                 .accessibilityIdentifier("leaderboard.recent-filter")
             }
             .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
         }
         .ordinaryAppearance()
+        .navigationDestination(item: $openedAuthor) { CreatorView(creator: $0) }
+        .edgeSwitchingSegments(selection: $board, options: Board.allCases, identifier: "leaderboard.board", reservesPageEdges: false, leftEdge: false, rightEdge: false, centerSwipe: true)
     }
 }
 
@@ -34,7 +32,11 @@ struct LeaderboardView: View {
 private struct LeaderboardList: View {
     let board: Board
     let visible: Bool
+    let selected: Bool
     let recent: RecentPublication
+    let onOpen: (Creator) -> Void
+    @Environment(\.rootPageParticipation) private var rootParticipation
+    @Environment(\.segmentedPageMotion) private var segmentMotion
     @EnvironmentObject private var session: SiteSession
     @State private var entries: [LeaderboardEntry] = []
     @State private var loading = false
@@ -44,7 +46,7 @@ private struct LeaderboardList: View {
     @State private var showUnknown = false
     @StateObject private var activity = CreatorActivityStore()
     private struct ActivityKey: Equatable { let visible: Bool; let active: Bool; let identity: String; let ids: [Int] }
-    private var activityKey: ActivityKey { .init(visible: visible, active: recent != .any, identity: session.feedIdentity, ids: entries.map(\.id)) }
+    private var activityKey: ActivityKey { .init(visible: visible && selected && rootParticipation.isActive, active: recent != .any, identity: session.feedIdentity, ids: entries.map(\.id)) }
     private var matching: [LeaderboardEntry] {
         entries.filter { entry in
             if recent == .any { return true }
@@ -60,6 +62,9 @@ private struct LeaderboardList: View {
         return "符合 \(matching.count) 位 · 已核实 \(verified)/\(total)"
     }
     var body: some View {
+        #if DEBUG && targetEnvironment(simulator)
+        let _ = segmentMotion?.recordProfileBodyEvaluation()
+        #endif
         Group {
             if entries.isEmpty {
                 if loading || (!loaded && error == nil) {
@@ -102,20 +107,22 @@ private struct LeaderboardList: View {
                     }
                 }
                 .listStyle(.plain)
-                .contentMargins(.top, 0, for: .scrollContent)
+                .pageContentViewport(active: visible && selected && rootParticipation.canPrepare)
+                .floatingScrollCanvas()
                 .refreshable { await load() }
                     .overlay(alignment: .bottom) {
                         if error != nil {
                             HStack(spacing: 4) {
-                                Text("刷新失败").font(.footnote)
                                 StatusReloadButton { Task { await load() } }
                             }.padding(.leading, 12).background(AppTheme.secondarySurface, in: Capsule()).padding()
                         }
                     }
             }
-        }.task(id: visible) { if visible && !loaded { await load(replacing: true) } }
+        }
+        .existingFeedbackToast(entries.isEmpty ? nil : error.map { _ in "刷新失败" }, active: visible && selected, scope: session.feedIdentity)
+        .task(id: visible && rootParticipation.canPrepare) { if visible && rootParticipation.canPrepare && !loaded { await load(replacing: true) } }
             .task(id: activityKey) {
-                guard visible, recent != .any else { return }
+                guard visible, selected, rootParticipation.isActive, recent != .any else { return }
                 await activity.checkNext(entries.map(\.user), source: session)
             }
     }
@@ -145,8 +152,11 @@ private struct LeaderboardList: View {
     }
     private func row(_ entry: LeaderboardEntry, startsSection: Bool = false) -> some View {
         let shape = FloatingPageChrome.controlShape
-        return NavigationLink { CreatorView(creator: entry.user) } label: {
-            HStack(spacing: 10) {
+        return Button {
+            guard selected, visible, rootParticipation.isActive, segmentMotion?.isInteracting != true else { return }
+            onOpen(entry.user)
+        } label: {
+            HStack(spacing: FloatingPageChrome.spacing) {
                 AuthorRowIdentity(name: entry.user.username, detail: publicationDate(for: entry), position: entry.position)
                 Spacer(minLength: 0)
                 if session.following.contains(entry.user.id) {
@@ -159,14 +169,12 @@ private struct LeaderboardList: View {
                     .foregroundStyle(.tertiary)
                     .accessibilityHidden(true)
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .frame(minHeight: FloatingPageChrome.controlHeight)
+            .authorCardRow()
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(AppTheme.secondarySurface, in: shape)
             .contentShape(shape)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(SegmentedContentButtonStyle())
         .navigationLinkIndicatorVisibility(.hidden)
         .listRowInsets(EdgeInsets(top: startsSection ? 0 : 2, leading: FloatingPageChrome.pageInset, bottom: 2, trailing: FloatingPageChrome.pageInset))
         .listRowBackground(Color.clear)
@@ -210,6 +218,23 @@ struct AvatarView: View {
     }
 }
 
+/// Shared list numbering reserves the width of four digits without zero padding.
+struct OrdinalLabel: View {
+    let position: Int
+    var body: some View {
+        ZStack {
+            Text("0000").hidden().accessibilityHidden(true)
+            Text(String(position))
+        }
+        .font(.caption.monospacedDigit())
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 4)
+        .padding(.vertical, 2)
+        .background(.quaternary, in: RoundedRectangle(cornerRadius: 4))
+        .fixedSize(horizontal: true, vertical: false)
+    }
+}
+
 struct AuthorRowIdentity: View {
     let name: String
     var showsHandle = false
@@ -219,16 +244,7 @@ struct AuthorRowIdentity: View {
     var body: some View {
         HStack(spacing: 6) {
             if let position {
-                ZStack {
-                    Text("0000").hidden().accessibilityHidden(true)
-                    Text(String(position))
-                }
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 4)
-                .padding(.vertical, 2)
-                .background(.quaternary, in: RoundedRectangle(cornerRadius: 4))
-                .fixedSize(horizontal: true, vertical: false)
+                OrdinalLabel(position: position)
             }
             HStack(spacing: FloatingPageChrome.spacing) {
                 AvatarView(name: name, size: 28).accessibilityHidden(true)
@@ -246,17 +262,25 @@ struct AuthorRowIdentity: View {
     }
 }
 
+extension View {
+    func authorCardRow(horizontalInset: Bool = true) -> some View {
+        padding(.horizontal, horizontalInset ? FloatingPageChrome.cardInset : 0)
+            .padding(.vertical, FloatingPageChrome.groupInset)
+            .frame(minHeight: FloatingPageChrome.controlHeight)
+    }
+}
+
 struct CreatorIdentityCard: View {
     let creator: Creator
 
     var body: some View {
         HStack(spacing: FloatingPageChrome.spacing) {
             AuthorRowIdentity(name: creator.username, showsHandle: true)
-            Spacer(minLength: 6)
+            Spacer(minLength: FloatingPageChrome.groupInset)
             FollowButton(creator: creator)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 3)
+        .padding(.horizontal, FloatingPageChrome.cardInset)
+        .padding(.vertical, FloatingPageChrome.groupInset)
         .background(AppTheme.secondarySurface, in: FloatingPageChrome.controlShape)
     }
 }
@@ -266,29 +290,41 @@ struct CreatorView: View {
     @EnvironmentObject private var session: SiteSession
     @ObservedObject private var blocklist = TagBlocklist.shared
     @ObservedObject private var authorBlocklist = AuthorBlocklist.shared
-    @StateObject private var feed = FeedStore(diagnostics: .shared, observations: .shared, authorBlocks: AuthorBlocklist.shared)
+    @StateObject private var imageFeed = FeedStore(diagnostics: .shared, observations: .shared, authorBlocks: AuthorBlocklist.shared)
+    @StateObject private var videoFeed = FeedStore(diagnostics: .shared, observations: .shared, authorBlocks: AuthorBlocklist.shared)
     @State private var filter: FeedFilter
     @State private var showFilter = false
     @State private var showWorkSearch = false
     @State private var focused: Int?
+    @State private var creatorGridAnchors: [MediaKind: Int] = [:]
     @State private var viewerItem: MediaItem?
     @State private var authorBlockError: String?
     @State private var favoriteBatch = FavoriteBatchSelection()
-    @State private var gridWidth: CGFloat = 0
-    private var requestKey: FeedStoreRequestKey { .init(identity: session.feedIdentity, filter: filter, source: .creator(creator)) }
+    private struct CreatorPaneKey: Equatable {
+        let request: FeedStoreRequestKey
+        let active: Bool
+        let blocked: Bool
+    }
+    private var requestKey: FeedStoreRequestKey { requestKey(for: filter.effectiveKind) }
+    private func requestKey(for kind: MediaKind) -> FeedStoreRequestKey {
+        .init(identity: session.feedIdentity, filter: filter.selecting(kind: kind), source: .creator(creator))
+    }
+    private func feed(for kind: MediaKind) -> FeedStore { kind == .video ? videoFeed : imageFeed }
+    private var feed: FeedStore { feed(for: filter.effectiveKind) }
     private var creatorBlocked: Bool { authorBlocklist.contains(id: creator.id) }
     private var creatorFeedHeader: some View {
-        VStack(spacing: 0) {
+        VStack(spacing: FloatingPageChrome.spacing) {
             CreatorIdentityCard(creator: creator)
                 .padding(.horizontal, FloatingPageChrome.pageInset)
-            if let authorBlockError { Text(authorBlockError).font(.caption).foregroundStyle(.red).padding(.horizontal, AppTheme.spacing) }
         }
         .padding(.bottom, 8)
     }
     private var floatingBar: some View {
         HStack(spacing: FloatingPageChrome.groupInset) {
             FloatingPageBackButton()
-            if creatorBlocked { Spacer() }
+            if creatorBlocked {
+                Text("作者").font(FloatingPageChrome.controlFont).frame(maxWidth: .infinity)
+            }
             else {
                 FloatingMediaPicker(title: "作者媒体类型",
                                     selection: Binding(get: { filter.effectiveKind }, set: selectMediaKind),
@@ -299,7 +335,7 @@ struct CreatorView: View {
         }
     }
     private var creatorActions: some View {
-        Menu {
+        AppMenu {
             if !creatorBlocked {
                 Button("搜索作品", systemImage: "magnifyingglass") { showWorkSearch = true }
                     .accessibilityIdentifier("creator.search")
@@ -311,17 +347,13 @@ struct CreatorView: View {
                     .accessibilityIdentifier("favorite-batch.select")
             }
             if let profileURL {
-                Link(destination: profileURL) { Label("在 Civitai 打开", systemImage: "safari") }
+                AppMenuLink(destination: profileURL) { Label("在 Civitai 打开", systemImage: "safari") }
                     .accessibilityIdentifier("creator.open-site")
-                ShareLink(item: profileURL) { Label("分享作者", systemImage: "square.and.arrow.up") }
+                AppMenuShareLink(item: profileURL) { Label("分享作者", systemImage: "square.and.arrow.up") }
                     .accessibilityIdentifier("creator.share")
-                Divider()
             }
-            if creatorBlocked {
-                Button("取消本机屏蔽", systemImage: "person.crop.circle.badge.checkmark") {
-                    authorBlocklist.remove(id: creator.id); authorBlockError = nil
-                }
-            } else {
+            if !creatorBlocked {
+                Divider()
                 Button("在本机屏蔽作者", systemImage: "person.crop.circle.badge.xmark", role: .destructive) {
                     if !authorBlocklist.add(creator) { authorBlockError = "无法加入本机屏蔽名单。" }
                     else { authorBlockError = nil }
@@ -329,7 +361,6 @@ struct CreatorView: View {
             }
         } label: { FloatingPageIcon(symbol: "ellipsis") }
         .buttonStyle(FloatingPageButtonStyle(iconOnly: true))
-        .menuOrder(.fixed)
         .accessibilityLabel("作者更多操作")
         .accessibilityValue(creatorBlocked ? "" : filter.summary)
         .accessibilityIdentifier("creator.actions")
@@ -347,33 +378,24 @@ struct CreatorView: View {
     var body: some View {
         VStack(spacing: 0) {
             if creatorBlocked {
-                CreatorIdentityCard(creator: creator)
-                    .padding(.horizontal, FloatingPageChrome.pageInset)
-                ContentUnavailableView {
-                    Label("该作者已在本机屏蔽", systemImage: "person.crop.circle.badge.xmark")
-                } description: {
-                    Text("此作者的作品仅在本客户端隐藏；站点关注关系和其他本地数据保持不变。")
-                } actions: {
-                    Button("取消本机屏蔽") { authorBlocklist.remove(id: creator.id); authorBlockError = nil }
-                    if let authorBlockError { Text(authorBlockError).font(.caption).foregroundStyle(.red) }
+                ScrollView {
+                    VStack(alignment: .leading, spacing: FloatingPageChrome.spacing) {
+                        CreatorIdentityCard(creator: creator)
+                        PageMessageCard(title: "已屏蔽此作者", symbol: "person.crop.circle.badge.xmark",
+                                        detail: "可在设置中管理屏蔽作者。") { EmptyView() }
+                    }
+                    .pageScrollContentInsets()
                 }
             } else {
-                MediaGrid(feed: feed, emptyDescription: filter.summary + "。可切换媒体类型，或调整时间与内容范围。",
-                          isVisible: viewerItem == nil, refreshFromStart: refreshFeed, header: AnyView(creatorFeedHeader),
-                          horizontalInset: AppTheme.spacing, showRoutineTagSummary: false, favoriteSelection: favoriteBatch.works,
-                          beginSelection: { item in
-                    guard feed.requestKey == requestKey else { return }
-                    favoriteBatch.begin(selecting: item.id)
-                }, open: { item in
-                    if favoriteBatch.works != nil { favoriteBatch.toggle(item.id) }
-                    else { focused = item.id; viewerItem = item }
-                }) { await feed.next(session: session) }
-                    .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { gridWidth = $0 }
-                    .simultaneousGesture(DragGesture(minimumDistance: 24).onEnded(handleMediaSwipe))
+                SegmentedContentPager(selection: filter.effectiveKind, options: MediaKind.browsingCases,
+                                      identifier: "creator.media-kind") { kind, active in
+                    creatorMediaPane(kind: kind, active: active)
+                }
             }
         }
         .avoidOverlaidTabBar()
-        .floatingPageBar("creator.top-bar") { floatingBar }
+        .floatingPageBar("creator.top-bar", layoutIdentity: creatorBlocked) { floatingBar }
+        .existingFeedbackToast(authorBlockError, scope: session.feedIdentity)
         .navigationDestination(isPresented: $showFilter) { FilterView(filter: $filter, context: .creator) }
         .navigationDestination(isPresented: $showWorkSearch) {
             SearchView(initialCriteria: .init(author: creator), initialFilter: filter, showsBack: true)
@@ -382,7 +404,7 @@ struct CreatorView: View {
         .favoriteBatchEditor($favoriteBatch)
         .mediaCover(item: $viewerItem) { opening in
             FeedMediaViewer(items: feed.items, focused: $focused, initialID: opening.id,
-                            continuationState: feed.continuationState,
+                            continuationState: feed.displayContinuationState,
                             loadMoreAutomatically: { await feed.nextAutomatically(session: session) },
                             refreshFromStart: refreshFeed, restartRetryAvailableAt: feed.restartRetryAvailableAt,
                             onDetailsVisibility: { feed.setTagPolicyDeferred($0) }, title: "作者作品",
@@ -391,37 +413,62 @@ struct CreatorView: View {
                 await feed.next(session: session)
             }
         }
-        .task(id: requestKey) {
-            guard !creatorBlocked else { feed.invalidatePendingRequests(); return }
-            let retainedKey = feed.requestKey == requestKey
-            let commit = await feed.activate(session: session, filter: filter, source: .creator(creator), blockedTags: blocklist.names)
-            if !retainedKey && feed.accepts(commit, identity: session.feedIdentity) { focused = nil }
-        }
         .onChange(of: requestKey) { _, _ in favoriteBatch.reset() }
-        .onChange(of: blocklist.names) { _, tags in feed.applyBlockedTags(tags); favoriteBatch.reset() }
+        .onChange(of: blocklist.names) { _, tags in
+            imageFeed.applyBlockedTags(tags); videoFeed.applyBlockedTags(tags); favoriteBatch.reset()
+        }
         .onChange(of: authorBlocklist.entries) { _, _ in
-            if creatorBlocked { viewerItem = nil; feed.invalidatePendingRequests(); favoriteBatch.reset() }
-            else { Task { _ = await feed.activate(session: session, filter: filter, source: .creator(creator), blockedTags: blocklist.names) } }
+            if creatorBlocked {
+                viewerItem = nil; imageFeed.invalidatePendingRequests(); videoFeed.invalidatePendingRequests(); favoriteBatch.reset()
+            }
         }
         .ordinaryAppearance()
+        .edgeSwitchingSegments(selection: Binding(get: { filter.effectiveKind }, set: selectMediaKind),
+                               options: MediaKind.browsingCases, identifier: "creator.media-kind",
+                               enabled: !creatorBlocked && viewerItem == nil && !showFilter && !showWorkSearch && favoriteBatch.works == nil,
+                               reservesPageEdges: false, leftEdge: false, rightEdge: false, centerSwipe: true)
     }
     private func selectMediaKind(_ kind: MediaKind) {
         guard filter.effectiveKind != kind else { return }
         filter = filter.selecting(kind: kind)
     }
 
-    private func handleMediaSwipe(_ drag: DragGesture.Value) {
-        // Leave the edge touch to the navigation stack's interactive pop.
-        let distanceFromEdge = min(drag.startLocation.x, gridWidth - drag.startLocation.x)
-        let dx = drag.translation.width
-        guard viewerItem == nil, !showFilter, favoriteBatch.works == nil,
-              distanceFromEdge > ScreenEdgeGesture.width,
-              abs(dx) >= 48, abs(dx) > abs(drag.translation.height) * 1.4 else { return }
-        selectMediaKind(dx < 0 ? .video : .image)
+    private func creatorMediaPane(kind: MediaKind, active: Bool) -> some View {
+        let paneFeed = feed(for: kind)
+        let paneFilter = filter.selecting(kind: kind)
+        let paneKey = requestKey(for: kind)
+        return MediaGrid(feed: paneFeed, previewItems: paneFeed.requestKey == paneKey ? nil : [],
+                         emptyDescription: paneFilter.summary + "。可切换媒体类型，或调整时间与内容范围。",
+                         anchor: Binding(get: { creatorGridAnchors[kind] }, set: { creatorGridAnchors[kind] = $0 }),
+                         isVisible: active && kind == filter.effectiveKind && viewerItem == nil,
+                         refreshFromStart: { await refreshFeed(kind: kind) }, header: AnyView(creatorFeedHeader),
+                         horizontalInset: AppTheme.spacing, showRoutineTagSummary: false, favoriteSelection: favoriteBatch.works,
+                         beginSelection: { item in
+            guard paneFeed.requestKey == paneKey else { return }
+            favoriteBatch.begin(selecting: item.id)
+        }, open: { item in
+            if favoriteBatch.works != nil { favoriteBatch.toggle(item.id) }
+            else { focused = item.id; viewerItem = item }
+        }) { await paneFeed.next(session: session) }
+            .task(id: CreatorPaneKey(request: paneKey, active: active, blocked: creatorBlocked)) {
+                guard active else { return }
+                guard !creatorBlocked else { paneFeed.invalidatePendingRequests(); return }
+                let retainedKey = paneFeed.requestKey == paneKey
+                let commit = await paneFeed.activate(session: session, filter: paneFilter, source: .creator(creator), blockedTags: blocklist.names)
+                if !retainedKey && paneFeed.accepts(commit, identity: session.feedIdentity), commit.state == .loaded || commit.state == .ended {
+                    focused = nil
+                    creatorGridAnchors[kind] = nil
+                }
+            }
     }
 
     private func refreshFeed() async {
-        if await feed.restartCurrentFeed(session: session)?.status == .committed { focused = feed.items.first?.id }
+        await refreshFeed(kind: filter.effectiveKind)
+    }
+
+    private func refreshFeed(kind: MediaKind) async {
+        let paneFeed = feed(for: kind)
+        if await paneFeed.restartCurrentFeed(session: session)?.status == .committed { focused = paneFeed.items.first?.id }
     }
 }
 
@@ -439,6 +486,7 @@ struct MediaGrid: View {
     var previewItems: [MediaItem]? = nil
     var waitingForPreviewOpen: Int? = nil
     var continuationState: FeedContinuationState? = nil
+    @Environment(\.rootPageParticipation) private var rootParticipation
     @EnvironmentObject private var session: SiteSession
     var emptyDescription: String? = nil
     var anchor: Binding<Int?>? = nil
@@ -462,7 +510,7 @@ struct MediaGrid: View {
     @State private var continuationActionID: UUID?
     @Environment(\.scenePhase) private var scenePhase
     private var nearEnd: Bool { !Set(feed.items.suffix(4).map(\.id)).isDisjoint(with: visibleCells) }
-    private var continuationStatus: FeedContinuationState { continuationState ?? feed.continuationState }
+    private var continuationStatus: FeedContinuationState { continuationState ?? feed.displayContinuationState }
     private var empty: Bool { (previewItems ?? feed.items).isEmpty }
     private var showsCenteredProgress: Bool {
         centersInitialProgress && previewItems == nil && empty && (continuationStatus == .ready || continuationStatus.isLoading)
@@ -481,7 +529,7 @@ struct MediaGrid: View {
         let demanded: Bool
     }
     private var automaticLoadKey: AutomaticLoadKey {
-        .init(request: feed.requestKey, tail: feed.items.last?.id, active: isVisible && scenePhase == .active,
+        .init(request: feed.requestKey, tail: feed.items.last?.id, active: isVisible && rootParticipation.isActive && scenePhase == .active,
               permitted: automaticLoadingAllowed, demanded: (loadsOnAppearance || userScrolled) && (feed.items.isEmpty || nearEnd))
     }
     var body: some View {
@@ -490,18 +538,18 @@ struct MediaGrid: View {
             if let header { header.id(-1001) }
             if feed.unverifiedDuration > 0 || feed.hiddenByDuration > 0 {
                 Text("时长范围隐藏 \(feed.hiddenByDuration) 项；\(feed.unverifiedDuration) 项时长未知，暂不展示。")
-                    .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 16).padding(.vertical, 6)
+                    .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 16).padding(.vertical, FloatingPageChrome.groupInset)
             }
             if feed.durationMetadataFailedPages > 0 {
                 Text("视频时长暂时无法取得，当前作品和位置已保留；请稍后重试。")
                     .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 16)
             }
-            if feed.duplicatesDiscarded > 0 { Text("已去除 \(feed.duplicatesDiscarded) 项重复结果").font(.caption).foregroundStyle(.secondary).padding(.horizontal, 16).padding(.vertical, 6) }
+            if feed.duplicatesDiscarded > 0 { Text("已去除 \(feed.duplicatesDiscarded) 项重复结果").font(.caption).foregroundStyle(.secondary).padding(.horizontal, 16).padding(.vertical, FloatingPageChrome.groupInset) }
             if feed.unverifiedTags > 0 || (feed.hiddenByTags > 0 && (showRoutineTagSummary || (previewItems ?? feed.items).isEmpty)) {
                 Text("标签屏蔽已隐藏 \(feed.hiddenByTags) 项；\(feed.unverifiedTags) 项标签待核实，暂不展示。").font(.caption).foregroundStyle(.secondary).padding(.horizontal, 16).padding(.vertical, 8)
             }
             if feed.hiddenByAuthors > 0 {
-                Text("本机作者屏蔽隐藏 \(feed.hiddenByAuthors) 项；取消屏蔽后可重新显示。").font(.caption).foregroundStyle(.secondary).padding(.horizontal, 16).padding(.vertical, 6)
+                Text("本机作者屏蔽隐藏 \(feed.hiddenByAuthors) 项；取消屏蔽后可重新显示。").font(.caption).foregroundStyle(.secondary).padding(.horizontal, 16).padding(.vertical, FloatingPageChrome.groupInset)
             }
             LazyVGrid(columns: [.init(.flexible(), spacing: 8), .init(.flexible(), spacing: 8)], spacing: 8) {
                 ForEach(previewItems ?? feed.items) { item in
@@ -537,7 +585,10 @@ struct MediaGrid: View {
             }
         }
         .modifier(MediaGridPosition(anchor: anchor))
-        .onAppear { if let id = anchor?.wrappedValue { proxy.scrollTo(id, anchor: .top) } }
+        .pageContentViewport(active: isVisible && rootParticipation.canPrepare,
+                             initiallyAtTop: anchor.map { $0.wrappedValue == nil || $0.wrappedValue == feed.items.first?.id })
+        // scrollPosition owns restoration. The reader handles only an explicit
+        // caller request; reappearing must not snap an existing row to its top.
         .onChange(of: scrollRequest) { _, _ in userScrolled = false; if let id = anchor?.wrappedValue { proxy.scrollTo(id, anchor: .top) } }
         .task(id: automaticLoadKey) {
             let key = automaticLoadKey
@@ -603,6 +654,18 @@ private struct MediaGridCell: View {
     @State private var failure: String?
     @State private var retry = 0
     @Environment(\.dynamicTypeSize) private var textSize
+    @Environment(\.showsCollectionDownloads) private var collectionDownloads
+    @EnvironmentObject private var session: SiteSession
+    @ObservedObject private var offline = OfflineLibrary.shared
+    private var displayItem: MediaItem {
+        collectionDownloads ? offline.localCollectionItem(item, owner: session.account?.id) ?? item : item
+    }
+    @Environment(\.segmentedPageMotion) private var segmentMotion
+    @Environment(\.tabPageMotion) private var pageMotion
+    @Environment(\.motionTab) private var tab
+    private var activationAllowed: Bool {
+        segmentMotion?.isInteracting != true && pageMotion?.blocksContentActivation(tab: tab) != true
+    }
     #if DEBUG && targetEnvironment(simulator)
     @State private var previewAttempts = 0
     #endif
@@ -610,10 +673,22 @@ private struct MediaGridCell: View {
     private var coverTitle: String { "\(item.isVideo ? "视频" : "图片") · #\(item.id)\(item.username.map { " · \($0)" } ?? "")" }
     var body: some View {
         ZStack(alignment: .topTrailing) {
-            Button(action: open) {
+            Button {
+                guard activationAllowed else { return }
+                open()
+            } label: {
                 Group {
-                    if item.isVideo, let source = item.mediaURL {
-                        CachedPoster(source: source, declared: item.posterURL, retryToken: retry,
+                    if collectionDownloads, offline.localCollectionItem(item, owner: session.account?.id) == nil {
+                        // A waiting collection card may fetch a small declared
+                        // cover, never a remote full image/video as a fallback.
+                        if let cover = item.posterURL {
+                            CachedImage(url: cover, allowsRetry: false, imageBlur: blurred ? 20 : 0)
+                        } else {
+                            CoverPlaceholder(symbol: item.isVideo ? "play.rectangle" : "photo", title: coverTitle)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity).background(.quaternary)
+                        }
+                    } else if item.isVideo, let source = displayItem.mediaURL {
+                        CachedPoster(source: source, declared: displayItem.posterURL, retryToken: retry,
                                      onFailure: { failed in
                                          #if DEBUG && targetEnvironment(simulator)
                                          if !failed { previewAttempts += 1 }
@@ -621,7 +696,7 @@ private struct MediaGridCell: View {
                                          failure = failed ? "封面暂时无法加载" : nil
                                      }, showsFailure: false,
                                      placeholderTitle: "视频 · #\(item.id)\(item.username.map { " · \($0)" } ?? "")", imageBlur: blurred ? 20 : 0)
-                    } else if let url = item.mediaURL ?? (item.isVideo ? item.posterURL : nil) {
+                    } else if let url = displayItem.mediaURL ?? (item.isVideo ? displayItem.posterURL : nil) {
                         CachedImage(url: url, allowsRetry: false, retryToken: retry, showsFailure: false,
                                     onFailureMessage: { message in
                                         #if DEBUG && targetEnvironment(simulator)
@@ -638,9 +713,12 @@ private struct MediaGridCell: View {
                         }
                     }
                 }.opacity(failure == nil || favoriteSelected != nil ? 1 : 0).frame(height: cardHeight).contentShape(Rectangle())
-            }.buttonStyle(.plain).accessibilityLabel("\(item.isVideo ? "视频" : "图片") \(item.id)")
+            }.buttonStyle(SegmentedContentButtonStyle()).accessibilityLabel("\(item.isVideo ? "视频" : "图片") \(item.id)")
                 .highPriorityGesture(LongPressGesture(minimumDuration: 0.45, maximumDistance: 12)
-                    .onEnded { _ in beginSelection?() }, including: beginSelection == nil ? .none : .all)
+                    .onEnded { _ in
+                        guard activationAllowed else { return }
+                        beginSelection?()
+                    }, including: beginSelection == nil ? .none : .all)
                 .accessibilityAddTraits(favoriteSelected == true ? .isSelected : [])
                 .accessibilityIdentifier("media.grid.cell.\(item.id)")
             if item.isVideo && favoriteSelected == nil {
@@ -654,10 +732,13 @@ private struct MediaGridCell: View {
                     .allowsHitTesting(favoriteSelected == nil)
                     .accessibilityHidden(favoriteSelected != nil)
             }
-        }.frame(height: cardHeight).clipShape(RoundedRectangle(cornerRadius: 9))
+        }.frame(height: cardHeight).clipShape(FloatingPageChrome.controlShape)
+        .overlay(alignment: .topLeading) {
+            if collectionDownloads { CollectionDownloadBadge(workID: item.id).padding(FloatingPageChrome.spacing) }
+        }
         .overlay(alignment: .topTrailing) {
             if let favoriteSelected {
-                FavoriteSelectionMark(selected: favoriteSelected, onMedia: true).padding(9).allowsHitTesting(false)
+                FavoriteSelectionMark(selected: favoriteSelected, onMedia: true).padding(FloatingPageChrome.spacing).allowsHitTesting(false)
             }
         }
         #if DEBUG && targetEnvironment(simulator)
@@ -688,7 +769,7 @@ struct GridRetryQAView: View {
     var body: some View {
         VStack(spacing: 18) {
             Text("本地加载失败布局").font(.headline)
-            HStack(spacing: 10) {
+            HStack(spacing: FloatingPageChrome.spacing) {
                 ForEach(items) { item in
                     MediaGridCell(item: item, blurred: false, open: { opened += 1 })
                         .frame(maxWidth: .infinity)
@@ -705,65 +786,83 @@ struct GridRetryQAView: View {
 #endif
 
 struct FollowingView: View {
+    private enum PresentationOrder: String, CaseIterable, Identifiable {
+        case newest, oldest, nameAscending, nameDescending
+        var id: Self { self }
+        var title: String {
+            switch self {
+            case .newest: "最近关注"
+            case .oldest: "最早关注"
+            case .nameAscending: "名称 A–Z"
+            case .nameDescending: "名称 Z–A"
+            }
+        }
+        var sort: FollowingSort { self == .nameAscending || self == .nameDescending ? .name : .followed }
+        var reverse: Bool { self == .oldest || self == .nameDescending }
+        init(sort: FollowingSort, reverse: Bool) {
+            switch (sort, reverse) {
+            case (.followed, false): self = .newest
+            case (.followed, true): self = .oldest
+            case (.name, false): self = .nameAscending
+            case (.name, true): self = .nameDescending
+            }
+        }
+    }
     @EnvironmentObject private var session: SiteSession
-    @StateObject private var store = FollowingListStore()
+    @StateObject private var store = FollowingListStore(cache: .shared)
     @AppStorage("following.sort") private var sortRaw = FollowingSort.followed.rawValue
     @AppStorage("following.reverseTime") private var reverseTime = false
     @AppStorage("following.reverseName") private var reverseName = false
     private var sort: FollowingSort { FollowingSort(rawValue: sortRaw) ?? .followed }
     private var reverse: Bool { sort == .followed ? reverseTime : reverseName }
+    private var presentationOrder: PresentationOrder {
+        get { PresentationOrder(sort: sort, reverse: reverse) }
+        nonmutating set {
+            sortRaw = newValue.sort.rawValue
+            if newValue.sort == .followed { reverseTime = newValue.reverse }
+            else { reverseName = newValue.reverse }
+        }
+    }
     private var key: FollowingListKey { .init(identity: session.followingIdentity, memberIDs: session.following, revision: session.followingRevision) }
     private var current: Bool { store.requestKey == key }
     private var orderIdentity: String { "\(session.followingIdentity):\(sort.rawValue):\(reverse)" }
     var body: some View {
         Group {
             if session.account == nil {
-                ContentUnavailableView { Label("登录后查看关注", systemImage: "star") } description: { Text("与 Civitai 账号同步关注关系。") } actions: { Button("登录 Civitai") { session.openLogin() }.buttonStyle(AppActionButtonStyle(tone: .accent)) }
-            } else {
+                ScrollView {
+                    PageMessageCard(title: "登录后查看关注", symbol: "star", detail: "与 Civitai 账号同步关注关系。") {
+                        Button("登录 Civitai") { session.openLogin() }
+                            .buttonStyle(AppActionButtonStyle(tone: .accent))
+                    }
+                }
+                .pageScrollContentInsets()
+            } else if current, store.complete {
                 List {
-                    Group {
+                    Section {
+                        ForEach(store.ordered(sort, reverse: reverse)) { creator in
+                            NavigationLink { CreatorView(creator: creator) } label: {
+                                    AuthorRowIdentity(name: creator.username).authorCardRow(horizontalInset: false)
+                            }
+                        }
+                    }
+                    .floatingCardListRows()
+                    if store.creators.isEmpty {
+                        Section { Text("你还没有关注作者").foregroundStyle(.secondary) }
+                            .floatingCardListRows()
+                    }
+                    if store.error != nil {
                         Section {
-                            FloatingSegmentedControl(title: "关注作者排序",
-                                                     selection: Binding(get: { sort }, set: { sortRaw = $0.rawValue }),
-                                                     options: FollowingSort.allCases, optionTitle: { $0.title },
-                                                     identifier: "following.sort")
-                            Button {
-                                if sort == .followed { reverseTime.toggle() } else { reverseName.toggle() }
-                            } label: {
-                                HStack {
-                                    Label(sort == .followed ? "关注时间" : "名称顺序", systemImage: "arrow.up.arrow.down")
-                                    Spacer()
-                                    Text(sort == .followed ? (reverse ? "最早关注在前" : "最近关注在前") : (reverse ? "Z–A" : "A–Z")).foregroundStyle(.secondary)
-                                }
-                            }
-                        } footer: {
-                            FloatingCardListNote(sort == .followed ? "按站点记录的真实关注时间排列。重新关注会按新的关注时间排序。" : "按作者昵称排序，忽略大小写，并将名称中的数字按数值排列。")
-                        }
-                        if current, store.complete {
-                            Section("已关注 \(store.creators.count) 位") {
-                                ForEach(store.ordered(sort, reverse: reverse)) { creator in
-                                NavigationLink { CreatorView(creator: creator) } label: { AuthorRowIdentity(name: creator.username).padding(.vertical, 5) }
-                                }
-                                if store.creators.isEmpty { Text("你还没有关注作者").foregroundStyle(.secondary) }
-                            }
-                        } else {
-                            Section {
-                                if !current || store.loading { ProgressView("正在读取关注作者…") }
-                                if current, store.totalItems > 0 { Text("已读取 \(store.creators.count) / \(store.totalItems) 位").font(.subheadline).foregroundStyle(.secondary) }
-                                if current, let error = store.error {
-                                    HStack(spacing: FloatingPageChrome.spacing) {
-                                        Text(error).font(.caption).foregroundStyle(.secondary)
-                                            .fixedSize(horizontal: false, vertical: true)
-                                        Spacer(minLength: 0)
-                                        StatusReloadButton(title: "重新加载关注列表") { Task { await load(force: true) } }
-                                    }
-                                } else if current, store.canContinue, !store.loading {
-                                    Button("继续读取关注作者") { Task { await store.nextBatch(source: session) } }
-                                }
-                            } footer: {
-                                FloatingCardListNote("完整读取后统一排序。作者较多时会分批加载，避免只对部分作者排序。")
+                            HStack(spacing: FloatingPageChrome.spacing) {
+                                Spacer(minLength: 0)
+                                StatusReloadButton(title: "重新加载关注列表") { Task { await load(force: true) } }
                             }
                         }
+                        .floatingCardListRows()
+                    }
+                    Section {
+                        Text("共 \(store.creators.count) 位")
+                            .font(.footnote).foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .center)
                     }
                     .floatingCardListRows()
                 }
@@ -772,16 +871,50 @@ struct FollowingView: View {
                 .listRowSpacing(FloatingPageChrome.groupInset)
                 .id(orderIdentity)
                 .refreshable { await load(force: true) }
+            } else if !current || store.loading {
+                VStack {
+                    Spacer(minLength: 0)
+                    ProgressView()
+                    Spacer(minLength: 0)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .accessibilityIdentifier("following.loading")
+            } else {
+                List {
+                    Section {
+                        if store.error != nil {
+                            HStack(spacing: FloatingPageChrome.spacing) {
+                                Spacer(minLength: 0)
+                                StatusReloadButton(title: "重新加载关注列表") { Task { await load(force: true) } }
+                            }
+                        }
+                    }
+                    .floatingCardListRows()
+                }
+                .listStyle(.plain)
+                .refreshable { await load(force: true) }
             }
         }
         .avoidOverlaidTabBar(constrainViewport: true)
-        .floatingTitleBar("我的关注").task(id: key) { await load(force: false) }.ordinaryAppearance()
+        .existingFeedbackToast(store.error, active: current, scope: session.feedIdentity)
+        .floatingTitleBar("我的关注") {
+                AppValueSelector(title: "关注排序", selection: Binding(get: { presentationOrder }, set: { presentationOrder = $0 }),
+                                 options: PresentationOrder.allCases, name: { $0.title }) {
+                    FloatingPageIcon(symbol: "arrow.up.arrow.down")
+                }
+                .buttonStyle(FloatingPageButtonStyle(iconOnly: true))
+                .accessibilityLabel("关注排序")
+                .accessibilityValue(presentationOrder.title)
+                .accessibilityIdentifier("following.order")
+        }
+        .task(id: key) { await load(force: false) }.ordinaryAppearance()
     }
     private func load(force: Bool) async {
         guard !Task.isCancelled else { return }
         guard session.account != nil else { store.clear(); return }
         let requestedKey = key
-        if !force, store.requestKey == requestedKey, store.complete { return }
+        if !force, store.requestKey == requestedKey, store.complete,
+           !store.isStaleSnapshot, store.error == nil { return }
         await store.reload(key: requestedKey, source: session)
     }
 }

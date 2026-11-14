@@ -6,6 +6,8 @@ import Combine
 @MainActor final class TimelineModel: ObservableObject {
     let followed: Bool
     let feed: FeedStore
+    private let adjacentFeed: FeedStore
+    private var adjacentFocus: Int?
     let history: BrowsingHistory
     private let authors: AuthorBlocklist
     private let dismissals: TimelineCheckpointDismissals
@@ -40,6 +42,7 @@ import Combine
         self.filter = filter ?? FeedFilter.saved(followed: followed)
         let authors = authors ?? .shared
         self.authors = authors
+        self.adjacentFeed = FeedStore(diagnostics: .shared, observations: .shared, authorBlocks: authors)
         self.feed = feed ?? FeedStore(diagnostics: .shared, observations: .shared, authorBlocks: authors)
         self.history = history ?? .shared
         self.dismissals = dismissals
@@ -73,7 +76,8 @@ import Combine
     }
     func bindHistory(ownerID: Int?) {
         guard self.ownerID != ownerID else { return }
-        self.ownerID = ownerID; restartAction?.cancel(); invalidateOperation()
+        self.ownerID = ownerID; adjacentFeed.clear(); adjacentFocus = nil
+        restartAction?.cancel(); invalidateOperation()
         restoreState = .browsing; pagingMode = .automatic; clearMessage(); focused = nil; feed.clear()
     }
     func setVisible(_ value: Bool) {
@@ -87,15 +91,52 @@ import Combine
     }
     func selectFilter(_ value: FeedFilter) {
         guard value != filter else { return }
+        let prepared = adjacentFeed.requestKey.flatMap { key -> (FeedStoreRequestKey, Int?)? in
+            guard key.filter == value, key.source == source, key.identity == feed.requestKey?.identity else { return nil }
+            return (key, adjacentFocus)
+        }
+        let oldKey = feed.requestKey, oldItems = feed.items, oldFocus = focused
+        let oldContinuation = feed.continuationSnapshot(windowIDs: oldItems.map(\.id))
         restartAction?.cancel(); invalidateOperation(); filter = value
-        restoreState = .browsing; pagingMode = .automatic; clearMessage(); focused = nil; feed.clear()
+        restoreState = .browsing; pagingMode = .automatic; clearMessage(); focused = nil
+        if let prepared, feed.adoptPrepared(adjacentFeed, key: prepared.0, blockedTags: blockedTags) {
+            focused = prepared.1.flatMap { id in feed.items.contains(where: { $0.id == id }) ? id : nil } ?? feed.items.first?.id
+        } else { feed.clear() }
+        if let oldKey, !oldItems.isEmpty, oldKey.filter.effectiveKind != value.effectiveKind {
+            adjacentFeed.restoreTimeline(items: oldItems, identity: oldKey.identity, filter: oldKey.filter,
+                                         followed: followed, continuation: oldContinuation, blockedTags: blockedTags)
+            adjacentFocus = oldFocus
+        } else if prepared == nil { adjacentFeed.clear(); adjacentFocus = nil }
+    }
+
+    /// One metadata page only. Hidden neighbors never become visible players,
+    /// write history, or start automatic continuation here.
+    func warm(session: any TimelineReading, blockedTags: Set<String>, otherKind: Bool) async {
+        guard !Task.isCancelled, !restoreState.isBusy, !followed || session.account != nil else { return }
+        if !otherKind {
+            guard !visible else { return }
+            bindHistory(ownerID: session.tagLibraryOwnerID)
+        }
+        let store = otherKind ? adjacentFeed : feed
+        let target = otherKind ? filter.selecting(kind: filter.effectiveKind == .video ? .image : .video) : filter
+        let key = FeedStoreRequestKey(identity: session.feedIdentity, filter: target, source: source)
+        guard store.requestKey != key else { return }
+        _ = await store.activate(session: session, filter: target, source: source, blockedTags: blockedTags, transportPageBudget: 1)
+    }
+
+    func previewItem(otherKind: Bool, identity: String) -> MediaItem? {
+        let store = otherKind ? adjacentFeed : feed
+        guard store.requestKey?.identity == identity else { return nil }
+        let id = otherKind ? adjacentFocus : focused
+        return id.flatMap { id in store.items.first(where: { $0.id == id }) } ?? store.items.first
     }
     func invalidateSession() {
+        adjacentFeed.clear(); adjacentFocus = nil
         restartAction?.cancel(); invalidateOperation(); restoreState = .browsing; pagingMode = .automatic; clearMessage(); focused = nil; feed.clear()
     }
     func applyBlockedTags(_ names: Set<String>) {
         if blockedTags != names { invalidateFill() }
-        blockedTags = names; feed.applyBlockedTags(names)
+        blockedTags = names; feed.applyBlockedTags(names); adjacentFeed.applyBlockedTags(names)
     }
     func dismissPrompt() {
         guard let checkpoint = resumeCandidate, let context else { return }

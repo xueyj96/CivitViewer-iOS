@@ -35,30 +35,26 @@ import Foundation
         let key = FollowingListKey(identity: "acct", memberIDs: rawIDs)
         mock.fetch = { p, _ in p == 1 ? page([creator(3,"Zed"), creator(1,"item10")], p, 2, 4) : page([creator(4,"item2"), creator(2,"Éclair")], p, 2, 4) }
         await store.reload(key: key, source: mock)
-        precondition(store.creators.map(\.id) == [3,1] && !store.complete && store.canContinue && store.ordered(.name).isEmpty, "First page keeps server follow order and withholds incomplete global name order")
-        precondition(store.ordered(.followed).isEmpty && store.nextPage == 2, "Neither partial normal nor reverse follow order is exposed as the complete list")
-        await store.nextBatch(source: mock)
+        precondition(store.creators.map(\.id) == [3,1,4,2] && store.complete && !store.isStaleSnapshot && store.ordered(.name).isEmpty == false, "Reload automatically traverses every batch and preserves server follow order")
         precondition(store.complete && store.creators.map(\.id) == [3,1,4,2] && store.ordered(.followed).map(\.id) == [3,1,4,2] && store.ordered(.followed, reverse: true).map(\.id) == [2,4,1,3], "Reverse follow order reverses the actual server sequence")
         precondition(store.ordered(.name).map(\.id) == [2,3,4,1], "Complete name order uses the fixed POSIX collation and natural numeric runs")
 
-        // One bounded batch can be resumed repeatedly without losing its cursor.
+        // Several bounded batches are chained automatically without losing the cursor.
         let budget = FollowingListStore(pageSize: 1, batchPages: 1), four = FollowingListKey(identity: "acct", memberIDs: [10,11,12])
         mock.followingMemberIDs = [10,11,12]; mock.refreshIDs = [10,11,12]
         mock.fetch = { p, _ in page([creator(9+p,"N\(p)")], p, 1, 3) }
         await budget.reload(key: four, source: mock)
-        precondition(budget.nextPage == 2 && !budget.complete && budget.canContinue, "A batch budget is explicit continuation, not false completion")
-        await budget.nextBatch(source: mock); await budget.nextBatch(source: mock)
-        precondition(budget.complete && budget.creators.count == 3 && mock.requested.suffix(3).elementsEqual([1,2,3]), "Continuation consumes each page once and reaches complete membership")
+        precondition(budget.complete && budget.creators.count == 3 && mock.requested.suffix(3).elementsEqual([1,2,3]), "Automatic continuation consumes each page once and reaches complete membership")
 
         // Invalid data fails closed and the exact uncommitted page can be retried.
         let bad = FollowingListStore(pageSize: 1, batchPages: 1)
         mock.followingMemberIDs = [20,21]; mock.refreshIDs = [20,21]
         let badKey = FollowingListKey(identity: "acct", memberIDs: [20,21])
         mock.fetch = { p, _ in p == 1 ? page([creator(20,"A")],1,1,2) : page([creator(20,"A")],2,1,2) }
-        await bad.reload(key: badKey, source: mock); await bad.nextBatch(source: mock)
+        await bad.reload(key: badKey, source: mock)
         precondition(bad.error != nil && !bad.complete && bad.nextPage == 2, "Repeated creators are rejected without advancing the failed page")
         mock.fetch = { p, _ in p == 1 ? page([creator(20,"A")],1,1,2) : page([creator(21,"B")],2,1,2) }
-        await bad.nextBatch(source: mock)
+        await bad.reload(key: badKey, source: mock)
         precondition(bad.complete && bad.error == nil && bad.creators.map(\.id) == [20,21], "Retry resumes the same page and completes")
 
         let invalids: [([Creator], Int, Int, Int, FollowingListError)] = [
@@ -79,7 +75,7 @@ import Foundation
         let changing = FollowingListStore(pageSize: 1, batchPages: 1)
         mock.followingMemberIDs = [30,31]; mock.refreshIDs = [30,31]
         mock.fetch = { p, _ in p == 1 ? page([creator(30,"A")],1,1,2) : page([creator(31,"B")],2,1,3) }
-        await changing.reload(key: .init(identity: "acct", memberIDs: [30,31]), source: mock); await changing.nextBatch(source: mock)
+        await changing.reload(key: .init(identity: "acct", memberIDs: [30,31]), source: mock)
         precondition(changing.error != nil && !changing.complete && changing.nextPage == 2, "Changing total count remains an error at the current page")
 
         let finalMismatch = FollowingListStore(pageSize: 2, batchPages: 1)
@@ -88,7 +84,7 @@ import Foundation
         await finalMismatch.reload(key: .init(identity: "acct", memberIDs: [32,33]), source: mock)
         precondition(finalMismatch.error != nil && finalMismatch.creators.isEmpty && finalMismatch.nextPage == 1 && finalMismatch.totalItems == 0, "Final set mismatch commits neither rows, count nor cursor")
         mock.fetch = { _, _ in page([creator(32,"A"), creator(33,"B")],1,2,2) }
-        await finalMismatch.nextBatch(source: mock)
+        await finalMismatch.reload(key: .init(identity: "acct", memberIDs: [32,33]), source: mock)
         precondition(finalMismatch.complete && finalMismatch.creators.count == 2, "Final membership failure retries the same page cleanly")
 
         let invalidSnapshot = FollowingListStore()
@@ -169,6 +165,65 @@ import Foundation
         await revisionStarted.wait(); mock.followingRevision = 4; revisionRelease.open(); await revisionTask.value
         precondition(staleRevision.creators.isEmpty && !staleRevision.complete && staleRevision.error == FollowingListError.membershipChanged.errorDescription, "A late same-set page cannot commit after a confirmed unfollow/refollow cycle")
 
-        print("FollowingListChecks: 26 regression checks passed")
+        let cacheDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("FollowingListChecks-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: cacheDirectory) }
+        let diskCache = FollowingListCache(file: cacheDirectory.appendingPathComponent("cache.json"))
+        let cachedIDs: Set<Int> = [200,201]
+        let cachedKey = FollowingListKey(identity: "cache-acct", memberIDs: cachedIDs, revision: 3)
+        let cachedRows = [creator(201,"Before"), creator(200,"After")]
+        await diskCache.store(cachedRows, for: cachedKey)
+        let readCachedRows = await diskCache.creators(for: cachedKey)
+        precondition(readCachedRows?.map(\.id) == [201,200], "Disk cache stores only the complete ordered identity snapshot")
+        let cacheSource = FollowingMock()
+        cacheSource.followingIdentity = cachedKey.identity; cacheSource.followingActorID = 999
+        cacheSource.followingMemberIDs = cachedIDs; cacheSource.followingRevision = cachedKey.revision
+        cacheSource.refreshIDs = cachedIDs; cacheSource.refreshFailure = true
+        let cachedStore = FollowingListStore(cache: diskCache)
+        await cachedStore.reload(key: cachedKey, source: cacheSource)
+        precondition(cachedStore.complete && cachedStore.isStaleSnapshot && cachedStore.creators.map(\.id) == [201,200] && cachedStore.error != nil,
+                     "A matching disk snapshot displays immediately and survives refresh failure")
+        let changedRevision = FollowingListKey(identity: cachedKey.identity, memberIDs: cachedIDs, revision: 4)
+        let refollowCache = await diskCache.creators(for: changedRevision)
+        precondition(refollowCache == nil, "Same IDs with a new refollow revision cannot reuse cached ordering")
+
+        cacheSource.refreshFailure = false
+        cacheSource.fetch = { _, _ in page([creator(200,"Refreshed first"),creator(201,"Renamed")],1,50,2) }
+        await cachedStore.reload(key: cachedKey, source: cacheSource)
+        precondition(cachedStore.complete && !cachedStore.isStaleSnapshot && cachedStore.error == nil && cachedStore.creators.map(\.id) == [200,201] && cachedStore.creators.last?.username == "Renamed",
+                     "Retrying the same stale store replaces cached order and author names after refresh failure")
+
+        let partialIDs: Set<Int> = [210,211]
+        let partialKey = FollowingListKey(identity: "cache-acct", memberIDs: partialIDs, revision: 8)
+        let partialRows = [creator(211,"Old first"), creator(210,"Old second")]
+        await diskCache.store(partialRows, for: partialKey)
+        cacheSource.followingMemberIDs = partialIDs; cacheSource.followingRevision = partialKey.revision
+        cacheSource.refreshIDs = partialIDs
+        cacheSource.fetch = { p, _ in
+            if p == 1 { return page([creator(210,"Partial new")],1,1,2) }
+            throw URLError(.timedOut)
+        }
+        let partialFailure = FollowingListStore(pageSize: 1, batchPages: 1, cache: diskCache)
+        await partialFailure.reload(key: partialKey, source: cacheSource)
+        let retainedDiskRows = await diskCache.creators(for: partialKey)
+        precondition(partialFailure.complete && partialFailure.isStaleSnapshot && partialFailure.creators.map(\.id) == [211,210] &&
+                     partialFailure.creators.first?.username == "Old first" && partialFailure.error != nil && retainedDiskRows?.map(\.id) == [211,210],
+                     "A partial refresh failure keeps the displayed and persisted complete snapshot")
+
+        cacheSource.refreshFailure = true
+        let wrongRevisionKey = FollowingListKey(identity: "cache-acct", memberIDs: partialIDs, revision: 9)
+        cacheSource.followingRevision = wrongRevisionKey.revision
+        let wrongRevisionStore = FollowingListStore(cache: diskCache)
+        await wrongRevisionStore.reload(key: wrongRevisionKey, source: cacheSource)
+        precondition(!wrongRevisionStore.complete && wrongRevisionStore.creators.isEmpty,
+                     "A revision mismatch does not display a prior same-membership cache")
+        let changedMembers: Set<Int> = [210,212]
+        let wrongMembersKey = FollowingListKey(identity: "cache-acct", memberIDs: changedMembers, revision: 8)
+        cacheSource.followingRevision = wrongMembersKey.revision; cacheSource.followingMemberIDs = changedMembers; cacheSource.refreshIDs = changedMembers
+        let wrongMembersStore = FollowingListStore(cache: diskCache)
+        await wrongMembersStore.reload(key: wrongMembersKey, source: cacheSource)
+        precondition(!wrongMembersStore.complete && wrongMembersStore.creators.isEmpty,
+                     "A membership mismatch does not display a prior account snapshot")
+
+        print("FollowingListChecks: 33 regression checks passed")
     }
 }

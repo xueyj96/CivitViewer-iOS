@@ -37,7 +37,7 @@ struct BitmapMediaSurface: View {
             } else if failure == nil { ProgressView().tint(.white) }
             if let failure {
                 MediaLoadFailureContent(message: failure, retry: { retry += 1 })
-                    .foregroundStyle(.white).background(.black.opacity(0.65), in: RoundedRectangle(cornerRadius: 12))
+                    .modifier(MediaFeedbackSurface())
             }
         }
         .task(id: Key(url: url, retry: retry)) {
@@ -172,7 +172,7 @@ struct CachedPoster: View {
     @State private var image: UIImage?
     @State private var failed = false
     @State private var cacheRevision = 0
-    private struct Key: Equatable { let source: URL; let declared: URL?; let active: Bool; let local: Bool; let retry: Int; let workID: Int?; let cacheRevision: Int }
+    private struct Key: Equatable { let source: URL; let declared: URL?; let local: Bool; let retry: Int; let workID: Int?; let cacheRevision: Int }
     var body: some View {
         GeometryReader { geometry in
             ZStack {
@@ -190,7 +190,7 @@ struct CachedPoster: View {
                 }
             }.frame(width: geometry.size.width, height: geometry.size.height).clipped()
         }
-        .task(id: Key(source: source, declared: declared, active: active, local: allowLocalExtraction, retry: retryToken, workID: diagnosticWorkID, cacheRevision: cacheRevision)) {
+        .task(id: Key(source: source, declared: declared, local: allowLocalExtraction, retry: retryToken, workID: diagnosticWorkID, cacheRevision: cacheRevision)) {
             guard !Task.isCancelled else { return }
             image = nil; failed = false; onFailure?(false)
             var stage = PosterDiagnosticStage.cachedPoster

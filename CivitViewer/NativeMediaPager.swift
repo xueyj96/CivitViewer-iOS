@@ -19,6 +19,7 @@ struct NativeMediaPager: View {
     var onUserBoundaryCancel: (() -> Void)? = nil
     var onBoundaryDrag: ((CGFloat, MediaPanPhase) -> Void)? = nil
     var onPageDisplayed: ((Int) -> Void)? = nil
+    var onCanvasReady: ((UIView) -> Void)? = nil
     let renderPage: (Int, Bool) -> AnyView
     #if DEBUG && targetEnvironment(simulator)
     @StateObject private var frames = NativePagerFrameBridge()
@@ -28,14 +29,14 @@ struct NativeMediaPager: View {
         #if DEBUG && targetEnvironment(simulator)
         NativeMediaPagerController(ids: ids, focused: $focused, initialID: initialID, focusRequest: focusRequest,
             queueRevision: queueRevision, viewport: viewport, accessibilityIdentifier: accessibilityIdentifier,
-            isVisible: isVisible, onUserPageSettled: onUserPageSettled, onUserContinuationDemand: onUserContinuationDemand, onUserBoundaryDemand: onUserBoundaryDemand, boundaryWaiting: boundaryWaiting, onUserBoundaryCancel: onUserBoundaryCancel, onBoundaryDrag: onBoundaryDrag, onPageDisplayed: onPageDisplayed, renderPage: renderPage, frames: frames)
+            isVisible: isVisible, onUserPageSettled: onUserPageSettled, onUserContinuationDemand: onUserContinuationDemand, onUserBoundaryDemand: onUserBoundaryDemand, boundaryWaiting: boundaryWaiting, onUserBoundaryCancel: onUserBoundaryCancel, onBoundaryDrag: onBoundaryDrag, onPageDisplayed: onPageDisplayed, onCanvasReady: onCanvasReady, renderPage: renderPage, frames: frames)
             .preference(key: CollectionPagingQAFrameKey.self, value: frames.collection)
             .preference(key: ResumePromptQAFrameKey.self, value: frames.resume)
             .preference(key: PlaybackLayoutQAFrameKey.self, value: frames.playback)
         #else
         NativeMediaPagerController(ids: ids, focused: $focused, initialID: initialID, focusRequest: focusRequest,
             queueRevision: queueRevision, viewport: viewport, accessibilityIdentifier: accessibilityIdentifier,
-            isVisible: isVisible, onUserPageSettled: onUserPageSettled, onUserContinuationDemand: onUserContinuationDemand, onUserBoundaryDemand: onUserBoundaryDemand, boundaryWaiting: boundaryWaiting, onUserBoundaryCancel: onUserBoundaryCancel, onBoundaryDrag: onBoundaryDrag, onPageDisplayed: onPageDisplayed, renderPage: renderPage)
+            isVisible: isVisible, onUserPageSettled: onUserPageSettled, onUserContinuationDemand: onUserContinuationDemand, onUserBoundaryDemand: onUserBoundaryDemand, boundaryWaiting: boundaryWaiting, onUserBoundaryCancel: onUserBoundaryCancel, onBoundaryDrag: onBoundaryDrag, onPageDisplayed: onPageDisplayed, onCanvasReady: onCanvasReady, renderPage: renderPage)
         #endif
     }
 }
@@ -56,6 +57,7 @@ private struct NativeMediaPagerController: UIViewControllerRepresentable {
     var onUserBoundaryCancel: (() -> Void)? = nil
     var onBoundaryDrag: ((CGFloat, MediaPanPhase) -> Void)? = nil
     var onPageDisplayed: ((Int) -> Void)? = nil
+    var onCanvasReady: ((UIView) -> Void)? = nil
     let renderPage: (Int, Bool) -> AnyView
     #if DEBUG && targetEnvironment(simulator)
     let frames: NativePagerFrameBridge
@@ -67,10 +69,12 @@ private struct NativeMediaPagerController: UIViewControllerRepresentable {
         context.coordinator.container = container
         container.onLayout = { [weak coordinator = context.coordinator] in coordinator?.layoutChanged() }
         context.coordinator.receive(self)
+        onCanvasReady?(container.view)
         return container
     }
     func updateUIViewController(_ container: NativePagerContainerController, context: Context) {
         context.coordinator.receive(self)
+        onCanvasReady?(container.view)
     }
     static func dismantleUIViewController(_ container: NativePagerContainerController, coordinator: Coordinator) {
         container.onLayout = nil
@@ -97,6 +101,8 @@ private struct NativeMediaPagerController: UIViewControllerRepresentable {
         private var pendingApplyTask: Task<Void, Never>?
         private var generation = 0
         private var isVisible = true
+        private var controlsWaiting = false
+        private var exposesControls: Bool { isVisible && !controlsWaiting }
         private var activeAccessibilityIdentifier = ""
         private weak var observedBoundaryPan: UIPanGestureRecognizer?
         private var boundaryGate: UIPanGestureRecognizer?
@@ -116,18 +122,30 @@ private struct NativeMediaPagerController: UIViewControllerRepresentable {
         private var touchTrace: PagerGestureTraceQA?
         #endif
 
-        init(_ configuration: NativeMediaPagerController) { self.configuration = configuration }
+        init(_ configuration: NativeMediaPagerController) {
+            self.configuration = configuration
+            isVisible = configuration.isVisible
+            controlsWaiting = configuration.boundaryWaiting
+            #if DEBUG && targetEnvironment(simulator)
+            NativePagerIdentityQA.shared.received(debugInstanceID)
+            #endif
+        }
 
         func receive(_ value: NativeMediaPagerController) {
             generation &+= 1
             // Visibility is immediate even while page-list changes wait for a
             // transition callback. Hiding the view itself would lose that callback.
             isVisible = value.isVisible
+            controlsWaiting = value.boundaryWaiting
             activeAccessibilityIdentifier = value.accessibilityIdentifier
             container?.view.accessibilityElementsHidden = !isVisible
             container?.view.isUserInteractionEnabled = isVisible
             controller?.view.accessibilityElementsHidden = !isVisible
             controller?.view.isUserInteractionEnabled = isVisible
+            for host in hosts.values {
+                host.view.accessibilityElementsHidden = !exposesControls
+                host.view.isUserInteractionEnabled = exposesControls
+            }
             #if DEBUG && targetEnvironment(simulator)
             value.frames.isVisible = isVisible
             #endif
@@ -282,11 +300,21 @@ private struct NativeMediaPagerController: UIViewControllerRepresentable {
         }
 
         func dismantle() {
+            #if DEBUG && targetEnvironment(simulator)
+            let wasMoving = nativeScrollIsMoving || transition != nil
+            let hostsBefore = hosts.count
+            #endif
+            // Invalidate already queued focus receipts before old native hosts
+            // are released. Their bindings must never write into the new identity.
+            generation &+= 1
+            isVisible = false
+            currentID = nil
             cancelPendingApply()
             transition = nil; pending = nil
             removeNativeQueue()
             hosts.removeAll()
             #if DEBUG && targetEnvironment(simulator)
+            NativePagerIdentityQA.shared.dismantled(moving: wasMoving, hostsBefore: hostsBefore, hostsAfter: hosts.count)
             debugSnapshotWork?.cancel(); debugSnapshotWork = nil
             configuration.frames.clear()
             touchTrace?.detach(); touchTrace = nil
@@ -317,6 +345,7 @@ private struct NativeMediaPagerController: UIViewControllerRepresentable {
             let content = value.renderPage(id, id == currentID)
                 .frame(width: value.viewport.width, height: value.viewport.height)
                 .clipped()
+                .accessibilityHidden(!exposesControls)
             #if DEBUG && targetEnvironment(simulator)
             return AnyView(NativePagerQAContent(content: AnyView(content), id: id, bridge: value.frames))
             #else
@@ -330,8 +359,8 @@ private struct NativeMediaPagerController: UIViewControllerRepresentable {
             let host = NativePageHost(id: id, rootView: content(for: id, using: configuration))
             host.view.backgroundColor = .black
             host.view.clipsToBounds = true
-            host.view.accessibilityElementsHidden = configuration.boundaryWaiting
-            host.view.isUserInteractionEnabled = !configuration.boundaryWaiting
+            host.view.accessibilityElementsHidden = !exposesControls
+            host.view.isUserInteractionEnabled = exposesControls
             // The parent GeometryReader has already selected the safe-area viewport.
             // A nested hosting root must not subtract those insets a second time.
             host.safeAreaRegions = []
@@ -346,8 +375,8 @@ private struct NativeMediaPagerController: UIViewControllerRepresentable {
             for (key, host) in hosts where value.ids.contains(key.id) {
                 // UIKit owns this hosting root. Suppress its old controls at the
                 // native boundary as well as inside the SwiftUI waiting canvas.
-                host.view.accessibilityElementsHidden = value.boundaryWaiting
-                host.view.isUserInteractionEnabled = !value.boundaryWaiting
+                host.view.accessibilityElementsHidden = !exposesControls
+                host.view.isUserInteractionEnabled = exposesControls
                 host.rootView = content(for: key.id, using: value)
             }
         }
@@ -400,6 +429,8 @@ private struct NativeMediaPagerController: UIViewControllerRepresentable {
             // This offset belongs to UIPageViewController's internal page queue;
             // system scroll-to-top must not compete with explicit focus requests.
             scroll.scrollsToTop = false
+            scroll.accessibilityElementsHidden = !isVisible
+            scroll.accessibilityElements = isVisible ? nil : []
             scroll.accessibilityIdentifier = isVisible ? activeAccessibilityIdentifier : "inactive." + activeAccessibilityIdentifier
             #if DEBUG && targetEnvironment(simulator)
             if PagerGestureTraceQA.enabled, let container {

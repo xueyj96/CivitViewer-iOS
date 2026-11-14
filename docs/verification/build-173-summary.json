@@ -1,0 +1,57 @@
+{
+  "version": "1.1.0",
+  "build": "173",
+  "userAcceptance": "approved for release",
+  "sourceProductionManifestSHA256": "9230cde142293aa503d21097f7b00405ae495c66ccc726603fe07249be49f9c6",
+  "releaseConfiguration": "Release arm64, code coverage disabled, recipient re-signing required",
+  "package": {
+    "bundle_identifier": "com.xueyj.civitviewer",
+    "version": "1.1.0",
+    "build": "173",
+    "minimum_ios": "17.0",
+    "platforms": [
+      "iPhoneOS"
+    ],
+    "ipa_filename": "CivitViewer-1.1.0-build173-sideload.ipa",
+    "ipa_bytes": 7972012,
+    "ipa_sha256": "3a83d099b20f0699b6205825baf9cd6e469b6aa6235b55b105bb96e5fccd9b49",
+    "packaged_regular_files": 11,
+    "macho_binaries_checked": 2,
+    "personal_provisioning_profiles": 0,
+    "personal_certificate_signatures": 0,
+    "personal_signing_entitlements": 0,
+    "local_checksum_signatures": "ad-hoc, must be replaced by recipient signing",
+    "deep_strict_codesign_passed": true,
+    "ipa_crc_and_file_hashes_passed": true,
+    "main_executable_has_no_coverage_sections": true,
+    "original_input_app_unchanged": true,
+    "recipient_resigning_required": true,
+    "device_install_after_recipient_resigning": "NOT_TESTED"
+  },
+  "checks": {
+    "core": "passed",
+    "presentationLifecycle": 103,
+    "nativePlaybackPool": 67,
+    "feedStore": 189,
+    "timelineModel": 136,
+    "followingList": 33,
+    "localDiagnostics": 72,
+    "ui": "See floating-chrome-173.md for scoped passes and retained failures",
+    "independentReview": "production code and scoped recordings passed"
+  },
+  "deviceDelivery": {
+    "status": "installed_verified",
+    "installedBuild": "173",
+    "indexBytesUnchanged": true,
+    "fileNamesSizesMtimesUnchanged": true,
+    "offlineRecords": 87,
+    "directoryEntries": 174,
+    "physicalAppLaunched": false
+  },
+  "knownLimitations": [
+    "Overall gesture performance is not proven resolved.",
+    "Decoder prewarming is next-only; multidirectional design remains unimplemented.",
+    "Compatibility close entry restoration failed in earlier QA; later lifecycle-logged valid collection fixture passed; earlier failure remains UNKNOWN."
+  ],
+  "publication": "Release assets and Git refs require separate remote readback; not established by this source report."
+}

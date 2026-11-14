@@ -80,6 +80,15 @@ final class FeedStore: ObservableObject {
             (!loading || cancelledOwner) && !reachedEnd && continuationState.failure == nil &&
             (!continuationState.isLoading || cancelledOwner)
     }
+    /// Request scheduling and presentation are separate: before activation,
+    /// during debounce, and after an interrupted initial fetch, an empty store
+    /// has not established that the source contains no works.
+    var displayContinuationState: FeedContinuationState {
+        guard items.isEmpty, continuationState == .ready, restartRetryError == nil else { return continuationState }
+        if !configured || activationPendingRevision == generation || loadState == .incomplete { return .loading }
+        return continuationState
+    }
+
     var retryAvailableAt: Date? { continuationState.retryAvailableAt }
     var canRetryContinuation: Bool {
         guard let failure = continuationState.failure, !failure.requiresRestart else { return false }
@@ -161,7 +170,7 @@ final class FeedStore: ObservableObject {
     /// debounced so transient view state does not issue a request for every step.
     func activate(session: any FeedPageReading, filter: FeedFilter, source: FeedSource,
                   blockedTags: Set<String> = [], deduplicateMediaAssets: Bool? = nil,
-                  force: Bool = false) async -> FeedCommit {
+                  force: Bool = false, transportPageBudget: Int? = nil) async -> FeedCommit {
         if Task.isCancelled {
             return FeedCommit(status: .cancelled, key: requestKey, revision: generation, state: loadState)
         }
@@ -175,7 +184,7 @@ final class FeedStore: ObservableObject {
         }
         if !force, requestKey == targetKey {
             if activationPendingRevision != generation {
-                if loadState == .incomplete { return await next(session: session) }
+                if loadState == .incomplete { return await next(session: session, transportPageBudget: transportPageBudget) }
                 applyPolicies(blockedTags: blockedTags, deduplicateMediaAssets: deduplicateMediaAssets)
                 return FeedCommit(status: .unchanged, key: targetKey, revision: generation, state: loadState)
             }
@@ -212,7 +221,7 @@ final class FeedStore: ObservableObject {
             return FeedCommit(status: .superseded, key: targetKey, revision: requestGeneration, state: nil)
         }
         activationPendingRevision = nil
-        return await next(session: session)
+        return await next(session: session, transportPageBudget: transportPageBudget)
     }
 
     private func applyPolicies(blockedTags: Set<String>, deduplicateMediaAssets: Bool?) {
@@ -237,7 +246,7 @@ final class FeedStore: ObservableObject {
     }
 
     @discardableResult
-    func next(session: any FeedPageReading) async -> FeedCommit {
+    func next(session: any FeedPageReading, transportPageBudget: Int? = nil) async -> FeedCommit {
         if Task.isCancelled {
             return FeedCommit(status: .cancelled, key: requestKey, revision: generation, state: loadState)
         }
@@ -270,14 +279,14 @@ final class FeedStore: ObservableObject {
         activePageLease = lease
         defer { if requestGeneration == generation { loading = false; activePageLease = nil; activePageTask = nil; activeSliceTask = nil } }
         return await withTaskCancellationHandler {
-            await performNext(session: session, key: activeKey, revision: requestGeneration, lease: lease)
+            await performNext(session: session, key: activeKey, revision: requestGeneration, lease: lease, transportPageBudget: transportPageBudget)
         } onCancel: {
             lease.cancel()
         }
     }
 
     private func performNext(session: any FeedPageReading, key activeKey: FeedStoreRequestKey,
-                             revision requestGeneration: Int, lease: FeedCancellationLease) async -> FeedCommit {
+                             revision requestGeneration: Int, lease: FeedCancellationLease, transportPageBudget: Int?) async -> FeedCommit {
         func stopped() -> FeedCommit? {
             if Task.isCancelled {
                 if requestGeneration == generation, activeKey == requestKey {
@@ -346,6 +355,12 @@ final class FeedStore: ObservableObject {
                     return FeedCommit(status: .committed, key: activeKey, revision: requestGeneration, state: loadState)
                 }
                 scannedPages += 1
+                if let transportPageBudget, scannedPages >= max(1, transportPageBudget) {
+                    // Hidden preparation yields with its accepted cursor intact.
+                    // Visible activation resumes this incomplete chain normally.
+                    loadState = .incomplete; continuationState = .ready
+                    return FeedCommit(status: .committed, key: activeKey, revision: requestGeneration, state: .incomplete)
+                }
                 continuationState = .scanning
                 if scannedPages.isMultiple(of: 4) {
                     let slice = scannedPages / 4
@@ -621,6 +636,35 @@ final class FeedStore: ObservableObject {
     func continuationSnapshot(windowIDs: [Int], capturedAt: Date = Date()) -> TimelineContinuation? {
         guard TimelineStatePolicy.continuationCoversLoadedTail(windowIDs: windowIDs, sourceTailID: accumulator.sourceTailID) else { return nil }
         return TimelineContinuation(cursor: accumulator.cursor, capturedAt: capturedAt, reachedEnd: accumulator.reachedEnd)
+    }
+
+    /// Session-local preparation transfers the complete accepted accumulator,
+    /// including filtered rows. History snapshots deliberately keep their
+    /// stricter visible-tail rule and are not used for this handoff.
+    @discardableResult
+    func adoptPrepared(_ prepared: FeedStore, key: FeedStoreRequestKey, blockedTags: Set<String>) -> Bool {
+        guard prepared !== self, prepared.configured, prepared.requestKey == key,
+              !prepared.loading, prepared.activationPendingRevision == nil,
+              prepared.restartRevision == nil, !prepared.tagPolicyDeferred,
+              prepared.continuationState.failure == nil else { return false }
+        generation += 1; cancelRestart(); cancelPageScan(); resetRestartRetry()
+        filter = key.filter; source = key.source; requestKey = key
+        configured = true; activationPendingRevision = nil; tagPolicyDeferred = false
+        accumulator = prepared.accumulator; seenCursors = prepared.seenCursors
+        self.blockedTags = prepared.blockedTags
+        deduplicateMediaAssets = prepared.deduplicateMediaAssets
+        assetPolicyOverride = prepared.assetPolicyOverride
+        loading = false; error = nil; searchProgress = prepared.searchProgress
+        reachedEnd = prepared.reachedEnd; loadState = prepared.loadState
+        continuationState = prepared.continuationState
+        durationMetadataFailedPages = prepared.durationMetadataFailedPages
+        consecutiveRequestFailures = 0
+        let authors = currentAuthorBlocks()
+        accumulator.applyBlockedAuthors(ids: authors.ids, handles: authors.handles)
+        applyPolicies(blockedTags: blockedTags, deduplicateMediaAssets: currentAssetDeduplicationPolicy)
+        reachedEnd = accumulator.reachedEnd
+        if items.isEmpty && !reachedEnd { loadState = .incomplete; continuationState = .ready }
+        return true
     }
 
     func invalidatePendingRequests() {

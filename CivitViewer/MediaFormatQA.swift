@@ -123,6 +123,8 @@ struct MediaFormatQAView: View {
     }
     @MainActor final class Observer: ObservableObject {
         @Published var requests = 0
+        @Published var totalRequests = 0
+        @Published var requestGroups: [String: Int] = [:]
         @Published var first = 0
         @Published var continuations = 0
         @Published var lastCursor = "none"
@@ -134,7 +136,7 @@ struct MediaFormatQAView: View {
         @Published var gateScheduled = false
         var prepared = false
         var limited = false
-        var value: String { "scenario=\(AutoContinuationQA.scenario ?? "none");requests=\(requests);first=\(first);continuations=\(continuations);lastCursor=\(lastCursor);returned=\(returned);errors=\(errors);kind=\(kind);gate=\(gate)" }
+        var value: String { "scenario=\(AutoContinuationQA.scenario ?? "none");totalRequests=\(totalRequests);groups=\(requestGroups.keys.sorted().map { "\($0):\(requestGroups[$0]!)" }.joined(separator: ","));requests=\(requests);first=\(first);continuations=\(continuations);lastCursor=\(lastCursor);returned=\(returned);errors=\(errors);kind=\(kind);gate=\(gate)" }
     }
     static let shared = Observer()
     static func prepare() async throws {
@@ -155,13 +157,21 @@ struct MediaFormatQAView: View {
         }
         shared.prepared = true
     }
-    static func page(filter: FeedFilter, cursor: String?) async throws -> MediaPage {
+    static func page(filter: FeedFilter, cursor: String?, followed: Bool, isCreator: Bool) async throws -> MediaPage {
         guard let scenario else { throw ClientError.invalidResponse }
-        shared.requests += 1; shared.lastCursor = cursor ?? "none"; shared.kind = filter.effectiveKind.rawValue
-        if cursor == nil { shared.first += 1 } else { shared.continuations += 1 }
+        // The initial-empty assertion owns the discovery video chain. Neighbor
+        // preloads remain real reads, separately counted rather than disabled.
+        let primary = scenario != "initial-empty" || (!followed && !isCreator && filter == self.filter)
+        shared.totalRequests += 1
+        let group = "\(isCreator ? "creator" : followed ? "following" : "discovery")-\(filter.effectiveKind.rawValue)-\(cursor == nil ? "first" : "next")"
+        shared.requestGroups[group, default: 0] += 1
+        if primary {
+            shared.requests += 1; shared.lastCursor = cursor ?? "none"; shared.kind = filter.effectiveKind.rawValue
+            if cursor == nil { shared.first += 1 } else { shared.continuations += 1 }
+        }
         // Pause only the local transport response, after the real model has
         // entered loading. The QA button never calls a model or paging action.
-        if cursor == "scan-0", ["filtered-empty", "initial-empty", "sparse-reserve", "sparse-long64", "rate-limited"].contains(scenario), !shared.gateReleased {
+        if primary, cursor == "scan-0", ["filtered-empty", "initial-empty", "sparse-reserve", "sparse-long64", "rate-limited"].contains(scenario), !shared.gateReleased {
             shared.gate = "waiting"
             let deadline = ContinuousClock.now + .seconds(60)
             while !shared.gateReleased {
@@ -208,20 +218,48 @@ struct MediaFormatQAView: View {
             page = index < 8 ? .init(items: [fixture[0]], metadata: .init(nextCursor: "scan-\(index + 1)"))
                 : .init(items: scenario == "initial-empty" ? [] : [fixture[4]], metadata: .init(nextCursor: nil))
         }
-        shared.returned = page.items.map { String($0.id) }.joined(separator: ",")
+        if primary { shared.returned = page.items.map { String($0.id) }.joined(separator: ",") }
         return page
     }
 }
 
+@MainActor final class NativePagerIdentityQA: ObservableObject {
+    static let shared = NativePagerIdentityQA()
+    static var enabled: Bool { ProcessInfo.processInfo.arguments.contains("--qa-identity-during-drag161") }
+    @Published var invalidated = false
+    @Published private(set) var instances = Set<String>()
+    @Published private(set) var movingDismantles = 0
+    @Published private(set) var clearedDismantles = 0
+    func received(_ id: String) { if Self.enabled { instances.insert(id) } }
+    func dismantled(moving: Bool, hostsBefore: Int, hostsAfter: Int) {
+        guard Self.enabled, invalidated else { return }
+        if moving { movingDismantles += 1 }
+        if hostsBefore > 0 && hostsAfter == 0 { clearedDismantles += 1 }
+    }
+    var value: String { "instances=\(instances.count);moving=\(movingDismantles);cleared=\(clearedDismantles);invalidated=\(invalidated ? 1 : 0)" }
+}
+
 private struct AutoContinuationQAReadback: View {
     @ObservedObject private var state = AutoContinuationQA.shared
+    @ObservedObject private var identity = NativePagerIdentityQA.shared
+    @EnvironmentObject private var session: SiteSession
     var body: some View {
         HStack(spacing: 8) {
             Text(state.value).font(.system(size: 1)).frame(width: 1, height: 1).opacity(0.01).allowsHitTesting(false)
                 .accessibilityIdentifier("continuation.qa.state").accessibilityValue(state.value)
+            if NativePagerIdentityQA.enabled {
+                Text(identity.value).font(.system(size: 1)).frame(width: 1, height: 1).opacity(0.01)
+                    .accessibilityIdentifier("pager.identity.qa").accessibilityValue(identity.value)
+            }
             if ["filtered-empty", "initial-empty", "sparse-reserve", "sparse-long64", "rate-limited"].contains(AutoContinuationQA.scenario ?? "") {
                 Button(state.gateReleased ? "本地响应已释放" : "释放本地响应") {
-                    if ProcessInfo.processInfo.arguments.contains("--qa-release-during-drag64") {
+                    if NativePagerIdentityQA.enabled {
+                        state.gateScheduled = true
+                        Task { @MainActor in
+                            try? await Task.sleep(for: .seconds(2))
+                            session.invalidateFeedIdentityForPagerQA()
+                        }
+                    } else if ProcessInfo.processInfo.arguments.contains("--qa-release-during-drag64") {
                         state.gateScheduled = true
                         Task { @MainActor in
                             try? await Task.sleep(for: .seconds(2))
@@ -292,6 +330,15 @@ private struct AutoContinuationQAReadback: View {
         return (try? JSONDecoder().decode(FeedFilter.self, from: legacy)) ?? FeedFilter()
     }
     static var items: [MediaItem] {
+        if ProcessInfo.processInfo.arguments.contains("--qa-playback-sessions172") {
+            return (0..<6).map { offset in
+                var item = MediaItem(id: 28_172_000 + offset, url: "https://example.invalid/double-buffer172-\(offset)",
+                                     width: 320, height: 180, type: "video", username: VisualControlsQA.author,
+                                     browsingLevel: 1, thumbnail: nil, creatorID: VisualControlsQA.creatorID, tags: [])
+                item.offlinePosterURL = root.appendingPathComponent("pattern-2.png")
+                return item
+            }
+        }
         if let argument = ProcessInfo.processInfo.arguments.first(where: { $0.hasPrefix("--qa-failure-next66=") }),
            let count = Int(argument.components(separatedBy: "=").last ?? ""), [2, 4].contains(count) {
             return (0..<6).map { index in
@@ -457,6 +504,9 @@ private struct AutoContinuationQAReadback: View {
                 try image.pngData()!.write(to: cache.appendingPathComponent(name), options: .atomic)
             }
         }
+        if ProcessInfo.processInfo.arguments.contains("--qa-playback-sessions172") {
+            for item in items { try seedVideoCache(source: ResumePromptQA.videoFixtureURL, item: item) }
+        }
         // Audio is absent from the test video; mute is also enforced in the player.
         UserDefaults.standard.set(true, forKey: "muted")
         UserDefaults.standard.set(true, forKey: "autoplay")
@@ -519,11 +569,10 @@ struct CollectionPagingQAView: View {
                     .accessibilityIdentifier("favorite69.qa.state").accessibilityValue(value)
             }
         }
-        .alert("Civit Viewer", isPresented: Binding(get: {
-            ProcessInfo.processInfo.arguments.contains("--qa-favorite-save69-delay") && session.message != nil
-        }, set: { if !$0 { session.message = nil } })) {
-            Button("好") { session.message = nil }
-        } message: { Text(session.message ?? "") }
+        .existingFeedbackToast(ProcessInfo.processInfo.arguments.contains("--qa-favorite-save69-delay") ? session.message : nil,
+                               global: true, scope: session.feedIdentity, onShown: { message in
+            if session.message == message { session.message = nil }
+        })
         .overlay(alignment: .topLeading) { if CollectionPagingQA.playbackDiagnosticMode != nil { PlaybackDiagnostics43Readback() } }
         .overlay(alignment: .bottomTrailing) {
             if ready && ProcessInfo.processInfo.arguments.contains("--qa-poster-late51") {
@@ -705,6 +754,145 @@ struct CollectionPagingQAObserver: ViewModifier {
         if let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) {
             try? data.write(to: CollectionPagingQA.root.appendingPathComponent("geometry.json"), options: .atomic)
         }
+    }
+}
+/// Uses the real presenter with synthetic payloads; no network or account writes.
+struct PresentationLifecycleQAView: View {
+    private struct Request: Identifiable { let id = UUID(); let workID = 7; let number: Int }
+    @State private var request: Request?
+    @State private var sourceVisible = true
+    @State private var begins = 0
+    @State private var ends = 0
+    @State private var mounts = 0
+    @State private var staleRejected = false
+    @State private var oldMayClose: (() -> Bool)?
+    @State private var route = NativeHeaderRoute()
+    private var scenario: String {
+        ProcessInfo.processInfo.arguments.first { $0.hasPrefix("--qa-lifecycle-case=") }?.components(separatedBy: "=").last ?? "replace"
+    }
+    var body: some View {
+        VStack {
+            Text("Lifecycle").accessibilityIdentifier("qa.lifecycle.state")
+                .accessibilityValue("begins=\(begins);ends=\(ends);mounts=\(mounts);source=\(sourceVisible ? 1 : 0);staleRejected=\(staleRejected ? 1 : 0)")
+            if sourceVisible {
+                Button("Open") { request = Request(number: 1) }.accessibilityIdentifier("qa.lifecycle.open")
+                    .pagePresentation(item: $request, route: route, onBegin: { _, _ in
+                        begins += 1
+                        if scenario == "begin-remove" { request = nil; sourceVisible = false }
+                    }, onEnd: { payload, _ in
+                        ends += 1
+                        if scenario == "end-remove", payload.number == 1 {
+                            request = Request(number: 2)
+                            sourceVisible = false
+                        }
+                    }) { payload, _, mayClose in
+                        VStack {
+                            Text("Work \(payload.workID) / \(payload.number)")
+                                .accessibilityIdentifier("qa.lifecycle.presented.\(payload.number)")
+                            Button("Replace same work") { request = Request(number: 2) }
+                                .accessibilityIdentifier("qa.lifecycle.replace")
+                            Button("Close") { if mayClose() { request = nil } }
+                                .accessibilityIdentifier("qa.lifecycle.close")
+                        }
+                        .onAppear {
+                            mounts += 1
+                            if payload.number == 1 { oldMayClose = mayClose }
+                            else { staleRejected = oldMayClose?() == false }
+                        }
+                    }
+            }
+        }
+    }
+}
+/// Exercises the actual raster owner, including a target that changes row
+/// geometry after its first snapshot. No network or account is involved.
+struct HeaderStagingQAView: View {
+    @State private var report = "pending"
+    var body: some View {
+        Text(report).accessibilityIdentifier("header.staging.qa").accessibilityValue(report)
+            .task {
+                func header(height: CGFloat, row: CGFloat, light: Bool) -> HeaderContent {
+                    .init(frame: CGRect(x: 16, y: 70, width: 370, height: height), appearance: .init(
+                        controls: AnyView(Text(light ? "目标" : "来源").frame(width: 370, height: height)),
+                        firstRowHeight: row, colorScheme: light ? .light : .dark,
+                        surfaceColor: light ? .white : .black, borderColor: .gray, surfaceHeight: height))
+                }
+                let source = header(height: 36, row: 36, light: false)
+                let tone = PageToneTransition(source: .black, sourceScheme: .dark)
+                guard let flight = HeaderHandoff(source: source, tone: tone) else { report = "renderFailed"; return }
+                flight.stageSurface(header(height: 36, row: 36, light: true))
+                let initiallyStaged = flight.stagedControls != nil && flight.stagedTarget != nil
+                flight.stageSurface(header(height: 68, row: 34, light: true))
+                let heightRevoked = flight.stagedControls == nil && flight.stagedTarget == nil
+                flight.stageSurface(header(height: 36, row: 36, light: true))
+                let restaged = flight.stagedControls != nil
+                flight.stageSurface(header(height: 36, row: 18, light: true))
+                let rowRevoked = flight.stagedControls == nil && flight.stagedTarget == nil
+                flight.stageSurface(header(height: 36, row: 36, light: true))
+                let tall = header(height: 68, row: 34, light: true)
+                let replaced = await flight.replace(with: tall, while: { true })
+                report = "staged=\(initiallyStaged ? 1 : 0);heightRevoked=\(heightRevoked ? 1 : 0);restaged=\(restaged ? 1 : 0);rowRevoked=\(rowRevoked ? 1 : 0);finalRevoked=\(flight.stagedControls == nil ? 1 : 0);height=\(flight.height);finished=\(replaced && flight.phase == .finished ? 1 : 0)"
+                flight.cancel()
+            }
+    }
+}
+#endif
+
+#if DEBUG && targetEnvironment(simulator)
+struct AppToastQAView: View {
+    @State private var message: String?
+    @State private var pageMessage: String?
+    @State private var hiddenMessage: String?
+    @State private var event = 0
+    @State private var taps = 0
+    @State private var scope = 0
+    @State private var child = false
+    var body: some View {
+        ZStack(alignment: .top) {
+            Color(uiColor: .systemBackground)
+            VStack(spacing: 16) {
+                Button("显示已有错误") { event += 1; message = "已有错误提示" }.accessibilityIdentifier("toast.qa.show")
+                Button("重复已有错误") {
+                    event += 1; message = "重复错误提示"
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.6) {
+                        event += 1; message = "重复错误提示"
+                    }
+                }.accessibilityIdentifier("toast.qa.repeat")
+                Button("显示长提示") {
+                    event += 1; message = String(repeating: "已有的长错误提示，需要保留可读性。", count: 8)
+                }.accessibilityIdentifier("toast.qa.long")
+                Button("无反馈操作") { taps += 1 }.accessibilityIdentifier("toast.qa.silent")
+                Button("失活来源") { hiddenMessage = "失活来源错误" }.accessibilityIdentifier("toast.qa.inactive")
+                Button("切换作用域") { scope += 1 }.accessibilityIdentifier("toast.qa.scope")
+                Button("打开子页") { child = true }.accessibilityIdentifier("toast.qa.child")
+                Text("\(taps)").accessibilityIdentifier("toast.qa.count")
+            }.padding(.top, 90)
+            Button("透传点击") { taps += 1 }
+                .frame(width: 160, height: 44)
+                .position(x: UIScreen.main.bounds.midX, y: UIScreen.main.bounds.midY)
+                .accessibilityIdentifier("toast.qa.passthrough")
+            Color.clear.frame(width: 1, height: 1)
+                .existingFeedbackToast(hiddenMessage, active: false)
+        }
+        .ignoresSafeArea()
+        .existingFeedbackToast(message, id: event, global: true, scope: scope, onShown: { value in
+            if message == value { message = nil }
+        })
+        .existingFeedbackToast(pageMessage)
+        .fullScreenCover(isPresented: $child) { AppToastChildQAView() }
+    }
+}
+private struct AppToastChildQAView: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var message: String?
+    var body: some View {
+        VStack(spacing: 24) {
+            Button("显示子页已有错误") { message = "子页已有错误" }.accessibilityIdentifier("toast.qa.child-error")
+            Button("关闭子页") { dismiss() }.accessibilityIdentifier("toast.qa.close-child")
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(uiColor: .systemBackground))
+        .existingFeedbackToast(message)
     }
 }
 #endif

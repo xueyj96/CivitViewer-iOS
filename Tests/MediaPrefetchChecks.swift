@@ -645,6 +645,33 @@ import Combine
                 "cachedBytes": cachedBytes,
                 "allEightCached": largeReady, "pendingBudgetAfterCompletion": largeCache.pendingDownloadBudget])
         }
+        // A backward video shares the existing window budget; it must not
+        // silently add a fourth transfer or evict the type guard on images.
+        let adjacentCache = MediaCache(directoryURL: root.appendingPathComponent("adjacent170"), monitorNetwork: false,
+            diagnostics: nil, availableBytesProvider: { 2_000_000_000 })
+        let adjacent = MediaPreloader(cache: adjacentCache, network: Just(true).eraseToAnyPublisher())
+        var adjacentItems = [item(17000, "adjacent170-prev-video", video: true), item(17001, "adjacent170-current"),
+                             item(17002, "adjacent170-next1"), item(17003, "adjacent170-next2"), item(17004, "adjacent170-next3")]
+        adjacent.update(adjacentItems, after: 1, count: 3, context: "adjacent170", wifiOnly: false, concurrency: 2)
+        let adjacentReady = await waitUntil { adjacent.snapshot.ready == 3 }
+        precondition(adjacentReady && adjacent.snapshot.desired == 3, "Backward video stays inside the original three-work budget")
+        var adjacentRequests = try await stats()["requests"] as? [String: Int] ?? [:]
+        for path in ["/adjacent170-prev-video", "/adjacent170-next1", "/adjacent170-next2"] {
+            precondition(adjacentRequests[path] == 1, "The bounded adjacent window requests each needed work once")
+        }
+        precondition(adjacentRequests["/adjacent170-next3"] == nil, "The previous video replaces, rather than adds to, the third forward slot")
+        adjacent.update(adjacentItems, after: 1, count: 3, context: "adjacent170", wifiOnly: false, concurrency: 2)
+        try? await Task.sleep(for: .milliseconds(100))
+        adjacentRequests = try await stats()["requests"] as? [String: Int] ?? [:]
+        precondition(adjacentRequests["/adjacent170-prev-video"] == 1, "Repeated identical demand cannot download the backward video twice")
+        adjacentItems[0] = item(17000, "adjacent170-prev-image")
+        adjacent.update(adjacentItems, after: 1, count: 3, context: "adjacent170-image", wifiOnly: false, concurrency: 2)
+        let imageWindowReady = await waitUntil { adjacent.snapshot.ready == 3 }
+        adjacentRequests = try await stats()["requests"] as? [String: Int] ?? [:]
+        precondition(imageWindowReady && adjacentRequests["/adjacent170-next3"] == 1 && adjacentRequests["/adjacent170-prev-image"] == nil,
+                     "A previous image does not consume the backward-video slot; all three forward works are admitted")
+        adjacent.stop()
+
         precondition(MediaPrefetchConcurrency.validated(7) == MediaPrefetchConcurrency.defaultValue &&
                      MediaPrefetchConcurrency.validated(8) == 8,
                      "Only the declared discrete concurrency settings are accepted")
@@ -655,6 +682,7 @@ import Combine
         let output: [String: Any] = ["mode": legacy ? "baseline51" : "current", "rounds": rounds, "focusVideo2Requests": focusVideo2Requests,
             "concurrencyMeasurements": concurrencyMeasurements,
             "cacheLimitGB": cacheLimitArgument,
+            "adjacentWindow170": "previous-video-budget-and-dedup-checked",
             "observedRangesMs": ["firstVideoRequest": firstVideoTimes.isEmpty ? NSNull() : [firstVideoTimes.min()!, firstVideoTimes.max()!] as Any,
                                  "allFiveComplete": completionTimes.isEmpty ? NSNull() : [completionTimes.min()!, completionTimes.max()!] as Any],
             "coverage": ["expectedPerRound": 5, "observedCompletePerRound": rounds.map { $0["completedFiles"] ?? 0 }],

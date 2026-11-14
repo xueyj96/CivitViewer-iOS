@@ -50,6 +50,7 @@ struct FilterPresetLibraryView: View {
     @State private var editorName = ""
     @State private var deleteTarget: FilterPreset?
     @State private var operationError: String?
+    @State private var operationRevision = 0
     private var canSave: Bool { (try? current.validated(for: scope)) != nil }
     private var showsSummary: Bool { scope != .search }
     @ScaledMetric(relativeTo: .caption) private var searchLimitWidth: CGFloat = 108
@@ -58,18 +59,14 @@ struct FilterPresetLibraryView: View {
         List {
             Group {
                 if showsSummary {
-                    presetCard {
-                        VStack(alignment: .leading, spacing: 5) {
+                    presetCard(summary: true) {
+                        VStack(alignment: .leading, spacing: FloatingPageChrome.groupInset) {
                             Text("当前条件").font(.caption).foregroundStyle(.secondary)
                             Text(current.filter.summary).font(.subheadline.weight(.medium))
                         }
                     }
                 }
-                if let loadError {
-                    presetCard {
-                        Text(loadError).foregroundStyle(.red).accessibilityIdentifier("preset.library.error")
-                    }
-                } else if presets.isEmpty {
+                if loadError == nil && presets.isEmpty {
                     presetCard {
                         VStack(alignment: .leading, spacing: 4) {
                             Text("还没有保存的条件").font(.subheadline.weight(.semibold))
@@ -81,7 +78,7 @@ struct FilterPresetLibraryView: View {
                     .accessibilityIdentifier("preset.library.empty")
                 } else {
                     ForEach(presets) { preset in
-                        Button {
+                        AppContextButton {
                             guard isCurrent() else { return }
                             withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.16)) { onApply(preset.snapshot) }
                             dismiss()
@@ -89,11 +86,9 @@ struct FilterPresetLibraryView: View {
                             presetCard {
                                 presetRow(preset)
                             }
-                            .contentShape(.contextMenuPreview, FloatingPageChrome.controlShape)
-                            .contextMenu {
-                                Button("重命名") { beginRename(preset) }
-                                Button("删除", role: .destructive) { guard isCurrent() else { return }; deleteTarget = preset }
-                            }
+                        } menu: {
+                            Button("重命名") { beginRename(preset) }
+                            Button("删除", role: .destructive) { guard isCurrent() else { return }; deleteTarget = preset }
                         }
                         .buttonStyle(.plain)
                         .accessibilityLabel(preset.name)
@@ -105,9 +100,6 @@ struct FilterPresetLibraryView: View {
                             Button("重命名") { beginRename(preset) }.tint(.blue).accessibilityIdentifier("preset.library.rename.\(preset.id.uuidString.lowercased())")
                         }
                     }
-                }
-                if let operationError {
-                    presetCard { Text(operationError).font(.footnote).foregroundStyle(.red) }
                 }
             }
             .listRowInsets(EdgeInsets(top: 0, leading: FloatingPageChrome.pageInset,
@@ -135,19 +127,20 @@ struct FilterPresetLibraryView: View {
         }
         .task { refresh() }
         .onChange(of: store.revision) { _, _ in refresh() }
-        .alert("删除“\(deleteTarget?.name ?? "")”？", isPresented: Binding(get: { deleteTarget != nil }, set: { if !$0 { deleteTarget = nil } })) {
+        .appConfirmationDialog("删除“\(deleteTarget?.name ?? "")”？", isPresented: Binding(get: { deleteTarget != nil }, set: { if !$0 { deleteTarget = nil } })) {
             Button("删除方案", role: .destructive) { guard isCurrent() else { deleteTarget = nil; return }; if let target = deleteTarget { remove(target) }; deleteTarget = nil }
-            Button("取消", role: .cancel) { deleteTarget = nil }
         } message: { Text("只删除这组已存条件。") }
         .ordinaryAppearance()
+        .existingFeedbackToast(loadError ?? operationError, id: feedbackID, scope: scope)
     }
 
-    private func presetCard<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+    private func presetCard<Content: View>(summary: Bool = false, @ViewBuilder content: () -> Content) -> some View {
         let shape = FloatingPageChrome.controlShape
         return content()
-            .padding(.horizontal, 12)
-            .padding(.vertical, showsSummary ? 10 : 4)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .font(AppTypography.rowTitle)
+            .padding(.horizontal, FloatingPageChrome.cardInset)
+            .padding(.vertical, summary ? ContentMetrics.Card.summaryInset : ContentMetrics.Card.rowVerticalInset)
+            .frame(maxWidth: .infinity, minHeight: FloatingPageChrome.controlHeight, alignment: .leading)
             .background(AppTheme.secondarySurface, in: shape)
             .contentShape(shape)
     }
@@ -195,7 +188,6 @@ struct FilterPresetLibraryView: View {
             }
         }
         .foregroundStyle(.primary)
-        .frame(minHeight: 44)
         .contentShape(Rectangle())
     }
 
@@ -236,7 +228,19 @@ struct FilterPresetLibraryView: View {
     private func remove(_ preset: FilterPreset) {
         guard isCurrent() else { return }
         do { try store.delete(ownerID: ownerID, scope: scope, id: preset.id); operationError = nil; refresh() }
-        catch { operationError = (error as? LocalizedError)?.errorDescription }
+        catch {
+            if let message = (error as? LocalizedError)?.errorDescription {
+                operationRevision += 1
+                operationError = message
+            } else {
+                operationError = nil
+            }
+        }
+    }
+    private var feedbackID: AnyHashable? {
+        if let loadError { return AnyHashable(loadError) }
+        if operationError != nil { return AnyHashable(operationRevision) }
+        return nil
     }
 }
 
@@ -253,6 +257,7 @@ private struct FilterPresetNameView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var name: String
     @State private var error: String?
+    @State private var errorAttempt = 0
 
     init(ownerID: Int?, scope: FilterPresetScope, snapshot: FilterPresetSnapshot, mode: Mode, initialName: String = "", isCurrent: @escaping () -> Bool = { true }, onSaved: @escaping () -> Void) {
         self.ownerID = ownerID; self.scope = scope; self.snapshot = snapshot; self.mode = mode; self.initialName = initialName; self.isCurrent = isCurrent; self.onSaved = onSaved
@@ -278,11 +283,6 @@ private struct FilterPresetNameView: View {
                         .background(AppTheme.secondarySurface, in: FloatingPageChrome.controlShape)
                         .accessibilityLabel("名称")
                         .accessibilityIdentifier("preset.name.input")
-                    if let error {
-                        Text(error).font(.footnote).foregroundStyle(.red)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .accessibilityIdentifier("preset.name.error")
-                    }
                 }
 
                 VStack(alignment: .leading, spacing: FloatingPageChrome.spacing) {
@@ -290,9 +290,9 @@ private struct FilterPresetNameView: View {
                         if !criteria.normalizedText.isEmpty { conditionRow("标题开头", criteria.normalizedText) }
                         if let author = criteria.author { conditionRow("作者", "@\(author.username)") }
                         if !criteria.tags.isEmpty {
-                            TagPillLayout(spacing: FloatingPageChrome.groupInset, rowSpacing: 2) {
+                            TagPillLayout() {
                                 ForEach(criteria.tags) { tag in
-                                    WorkTagLabel(title: tag.name, selected: false, compact: true)
+                                    WorkTagLabel(title: tag.name, selected: false)
                                 }
                             }
                             .accessibilityLabel("标签")
@@ -315,11 +315,14 @@ private struct FilterPresetNameView: View {
         }
         .accessibilityIdentifier("preset.name")
         .floatingTitleBar(isRename ? "重命名" : "保存条件") {
-            Button("保存") { save() }
+            Button { save() } label: { FloatingPageIcon(symbol: "checkmark") }
+                .buttonStyle(FloatingPageButtonStyle(iconOnly: true))
+                .accessibilityLabel("保存")
                 .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !isCurrent())
                 .accessibilityIdentifier("preset.name.save")
         }
         .ordinaryAppearance()
+        .existingFeedbackToast(error, id: errorAttempt, scope: scope)
     }
 
     private func conditionRow(_ title: String, _ value: String) -> some View {
@@ -330,13 +333,20 @@ private struct FilterPresetNameView: View {
     }
 
     private func save() {
-        guard isCurrent() else { error = "账号已切换，请关闭此面板后重试。"; return }
+        guard isCurrent() else {
+            errorAttempt += 1
+            error = "账号已切换，请关闭此面板后重试。"
+            return
+        }
         do {
             switch mode {
             case .save: _ = try FilterPresetStore.shared.save(ownerID: ownerID, scope: scope, name: name, snapshot: snapshot)
             case .rename(let id): _ = try FilterPresetStore.shared.updateName(ownerID: ownerID, scope: scope, id: id, name: name)
             }
             error = nil; onSaved(); dismiss()
-        } catch { self.error = (error as? LocalizedError)?.errorDescription ?? "无法保存条件。" }
+        } catch {
+            errorAttempt += 1
+            self.error = (error as? LocalizedError)?.errorDescription ?? "无法保存条件。"
+        }
     }
 }

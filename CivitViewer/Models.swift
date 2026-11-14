@@ -141,6 +141,9 @@ struct MediaItem: Decodable, Identifiable, Hashable {
     // Assigned only by the local library, never decoded from a remote response.
     var offlineMediaURL: URL? = nil
     var offlinePosterURL: URL? = nil
+    // Resource location does not change the collection's bookmark/follow actions.
+    var collectionLocalPlayback = false
+    var isStandaloneOfflineCopy: Bool { offlineMediaURL != nil && !collectionLocalPlayback }
     private enum CodingKeys: String, CodingKey { case id, url, width, height, type, username, browsingLevel, thumbnail, creatorID, tags, metadata, createdAt; case postID = "postId" }
     struct Thumbnail: Decodable, Hashable { let url: String? }
     var isVideo: Bool { type == "video" }

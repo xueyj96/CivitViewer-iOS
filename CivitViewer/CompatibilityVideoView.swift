@@ -9,11 +9,8 @@ struct CompatibilityVideoView: View {
     let onProgress: (Double, Double, Bool) -> Void
     let onPlaying: () -> Void
     let onFailure: (Int) -> Void
-
-    @Environment(\.dismiss) private var dismiss
+    let onClose: () -> Void
     @Environment(\.scenePhase) private var scenePhase
-    @Environment(\.mediaTabs) private var tabs
-    @Environment(\.exitMediaCoverToTab) private var exitToTab
     @StateObject private var controller: CompatibilityVideoController
 
     init(
@@ -22,7 +19,8 @@ struct CompatibilityVideoView: View {
         initialPosition: Double? = nil,
         onProgress: @escaping (Double, Double, Bool) -> Void,
         onPlaying: @escaping () -> Void,
-        onFailure: @escaping (Int) -> Void
+        onFailure: @escaping (Int) -> Void,
+        onClose: @escaping () -> Void
     ) {
         self.url = url
         self.workID = workID
@@ -30,6 +28,7 @@ struct CompatibilityVideoView: View {
         self.onProgress = onProgress
         self.onPlaying = onPlaying
         self.onFailure = onFailure
+        self.onClose = onClose
         _controller = StateObject(wrappedValue: CompatibilityVideoController(
             url: url,
             initialPosition: initialPosition,
@@ -39,31 +38,18 @@ struct CompatibilityVideoView: View {
         ))
     }
 
-    private var tabBarHeight: CGFloat { exitToTab == nil ? 0 : (tabs?.height ?? 0) }
-
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
             CompatibilityWebView(controller: controller)
-                .padding(.bottom, tabBarHeight)
-                .ignoresSafeArea(edges: exitToTab == nil ? .bottom : [])
+                .ignoresSafeArea(.container, edges: .vertical)
             VideoWaitingIndicator(visible: controller.isLoading && controller.errorCode == nil && scenePhase == .active)
-            VStack(spacing: 0) {
-                Spacer()
-                if let error = controller.errorCode {
-                    Text("兼容播放暂不可用（错误\(error)）")
-                        .font(.callout)
-                        .foregroundStyle(.white)
-                        .padding(12)
-                        .background(.black.opacity(0.78), in: Capsule())
-                        .padding(.bottom, 24 + tabBarHeight)
-                }
-            }
             #if DEBUG && targetEnvironment(simulator)
             CompatibilityQAValue(controller: controller)
             #endif
         }
-        .playbackTitleBar("兼容播放", workID: workID, closeIdentifier: "compatibility.close", onClose: { dismiss() })
+        .existingFeedbackToast(controller.errorCode.map { "兼容播放暂不可用（错误\($0)）" }, scope: workID)
+        .playbackTitleBar("兼容播放", workID: workID, closeIdentifier: "compatibility.close", onClose: onClose)
         .overlay(alignment: .bottom) { PlaybackTabsBar(identifier: "compatibility.tabs") }
         .preferredColorScheme(.dark)
         .onChange(of: scenePhase) { _, phase in if phase != .active { controller.pauseAndFlush() } }

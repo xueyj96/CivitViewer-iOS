@@ -283,6 +283,126 @@ import Foundation
         let legacyDecoded = try JSONDecoder().decode(DiagnosticEntry.self, from: JSONSerialization.data(withJSONObject: legacyWithoutNewField))
         check(legacyDecoded.tagSearch == nil, "Existing diagnostic records remain decodable without the new optional context")
         }
+        do {
+            let privateValue = "offline-private-sentinel"
+            let privateURL = URL(string: "https://example.invalid/media?signature=\(privateValue)")!
+            let rawNetwork = NSError(domain: NSURLErrorDomain, code: URLError.notConnectedToInternet.rawValue,
+                userInfo: [NSLocalizedDescriptionKey: privateValue, NSURLErrorFailingURLErrorKey: privateURL,
+                           "account": privateValue])
+            let rawStorage = NSError(domain: NSCocoaErrorDomain, code: CocoaError.fileWriteNoPermission.rawValue,
+                userInfo: [NSFilePathErrorKey: "/private/\(privateValue)/media", NSLocalizedDescriptionKey: privateValue])
+            let rawUnknown = NSError(domain: privateValue, code: Int.max,
+                userInfo: [NSLocalizedDescriptionKey: privateValue, NSUnderlyingErrorKey: rawNetwork])
+            let http = OfflineDownloadDiagnostic.classify(mediaID: 81, stage: .fetch,
+                error: OfflineDownloadDiagnostic.Failure.http(403))!
+            let client = OfflineDownloadDiagnostic.classify(mediaID: 82, stage: .validate,
+                error: OfflineDownloadDiagnostic.Failure.client)!
+            let network = OfflineDownloadDiagnostic.classify(mediaID: 83, stage: .fetch, error: rawNetwork)!
+            let storage = OfflineDownloadDiagnostic.classify(mediaID: 84, stage: .install, error: rawStorage)!
+            let unknown = OfflineDownloadDiagnostic.classify(mediaID: 85, stage: .persist, error: rawUnknown)!
+            let quota = OfflineDownloadDiagnostic.classify(mediaID: 86, stage: .quota,
+                error: OfflineDownloadDiagnostic.Failure.limit)!
+            check(http.kind == .http && http.httpStatus == 403 && http.stage == .fetch && http.isBounded,
+                  "Offline HTTP failures retain only the positive media ID, finite stage and valid status")
+            check(client.kind == .client && client.httpStatus == nil && client.networkCode == nil,
+                  "Client failures are finite categories without client error descriptions")
+            check(network.kind == .network && network.networkCode == URLError.notConnectedToInternet.rawValue && network.isBounded,
+                  "URL-loading failures keep their numeric network code")
+            check(network.summary.contains("#83") && network.summary.contains("下载文件")
+                    && network.summary.contains("-1009") && !network.summary.contains(privateValue),
+                  "The diagnostics-page summary uses only finite labels and numeric media/error context")
+            check(storage.kind == .storage && storage.stage == .install && storage.networkCode == nil,
+                  "Cocoa file errors are storage failures without retaining paths")
+            check(OfflineDownloadDiagnostic.classify(mediaID: 84, stage: .validate,
+                    error: OfflineDownloadDiagnostic.Failure.storage)?.kind == .storage,
+                  "A typed unavailable-storage result does not become an invented network error")
+            check(unknown.kind == .unknown && unknown.httpStatus == nil && unknown.networkCode == nil,
+                  "Unrecognized errors stay UNKNOWN instead of inventing a network or storage cause")
+            check(quota.kind == .limit && quota.diagnosticCode == .limit && http.diagnosticCode == .downloadFailed,
+                  "Quota limits have a separate event code from failed offline saves")
+            check(OfflineDownloadDiagnostic.classify(mediaID: 81, stage: .fetch, error: CancellationError()) == nil,
+                  "Cancellation produces no offline failure diagnostic")
+            let urlCancellation = URLError(.cancelled)
+            let fileCancellation = CocoaError(.userCancelled)
+            for cancellation: Error in [urlCancellation, fileCancellation] {
+                check(OfflineDownloadDiagnostic.isCancellation(cancellation)
+                        && OfflineDownloadDiagnostic.classify(mediaID: 81, stage: .fetch, error: cancellation) == nil,
+                      "Foundation URL/file cancellations use the same nonfailure predicate as the offline loop")
+            }
+            let wrongCancellationDomain = NSError(domain: privateValue, code: URLError.cancelled.rawValue)
+            check(!OfflineDownloadDiagnostic.isCancellation(wrongCancellationDomain)
+                    && OfflineDownloadDiagnostic.classify(mediaID: 81, stage: .fetch, error: wrongCancellationDomain)?.kind == .unknown,
+                  "A matching numeric code in an unrelated domain is not fabricated cancellation")
+            let diskFull = CocoaError(.fileWriteOutOfSpace)
+            let posixFull = POSIXError(.ENOSPC)
+            for spaceError: Error in [diskFull, posixFull, OfflineDownloadDiagnostic.Failure.limit] {
+                let classified = OfflineDownloadDiagnostic.classify(mediaID: 81, stage: .install, error: spaceError)
+                check(OfflineDownloadDiagnostic.isSpaceLimit(spaceError)
+                        && classified?.kind == .limit && classified?.diagnosticCode == .limit
+                        && classified?.stage == .install && classified?.networkCode == nil,
+                      "Cocoa disk-full, POSIX ENOSPC and app quotas share the actual pause-branch predicate")
+            }
+            check(!OfflineDownloadDiagnostic.isSpaceLimit(rawStorage)
+                    && !OfflineDownloadDiagnostic.isSpaceLimit(NSError(domain: privateValue, code: Int(POSIXError.Code.ENOSPC.rawValue)))
+                    && !OfflineDownloadDiagnostic.isSpaceLimit(fileCancellation),
+                  "Permission errors, arbitrary-domain codes and cancellation do not become quota failures")
+            check(OfflineDownloadDiagnostic.classify(mediaID: 0, stage: .fetch, error: rawUnknown) == nil
+                    && OfflineDownloadDiagnostic.classify(mediaID: -1, stage: .fetch, error: rawUnknown) == nil,
+                  "Nonpositive media IDs cannot become download contexts")
+            let invalidHTTP = OfflineDownloadDiagnostic.classify(mediaID: 87, stage: .fetch,
+                error: OfflineDownloadDiagnostic.Failure.http(Int.max))!
+            let invalidNetwork = OfflineDownloadDiagnostic.classify(mediaID: 88, stage: .fetch,
+                error: NSError(domain: NSURLErrorDomain, code: Int.max))!
+            check(invalidHTTP.httpStatus == nil && invalidNetwork.networkCode == nil && invalidHTTP.isBounded && invalidNetwork.isBounded,
+                  "Out-of-range status/error numbers are omitted without discarding the finite category")
+
+            let offlineFile = root.appendingPathComponent("offline/diagnostics-0.jsonl")
+            let offlineStore = LocalDiagnosticsStore(fileURL: offlineFile, build: 158, now: { clock.date })
+            for context in [http, client, network, storage, unknown, quota] {
+                await offlineStore.record(area: .cache, code: context.diagnosticCode,
+                    httpStatus: context.httpStatus, download: context)
+            }
+            await offlineStore.record(area: .cache, code: http.diagnosticCode, httpStatus: 403, download: http)
+            let offlineEntries = try await offlineStore.entries()
+            check(offlineEntries.count == 6 && Set(offlineEntries.compactMap { $0.download?.mediaID }) == Set(81...86),
+                  "Each media failure has one event; an exact duplicate is suppressed without merging different media")
+            let offlineRestart = LocalDiagnosticsStore(fileURL: offlineFile, build: 158, now: { clock.date })
+            let reloaded = try await offlineRestart.entries()
+            check(reloaded == offlineEntries, "Download context survives JSONL persistence and restart")
+            let offlineExport = String(decoding: try await offlineRestart.exportData(), as: UTF8.self)
+            let offlineDisk = String(decoding: try Data(contentsOf: offlineFile), as: UTF8.self)
+            check(!offlineExport.contains(privateValue) && !offlineDisk.contains(privateValue)
+                    && !offlineExport.contains("example.invalid") && !offlineExport.contains("signature")
+                    && !offlineExport.contains("account") && !offlineExport.contains("/private/"),
+                  "Persisted and exported download diagnostics never contain URLs, account values, paths or raw errors")
+            var oldEntry = try JSONSerialization.jsonObject(with: JSONEncoder().encode(offlineEntries[0])) as! [String: Any]
+            oldEntry.removeValue(forKey: "download")
+            let oldDecoded = try JSONDecoder().decode(DiagnosticEntry.self, from: JSONSerialization.data(withJSONObject: oldEntry))
+            check(oldDecoded.download == nil && oldDecoded.id == offlineEntries[0].id,
+                  "Old diagnostic JSON without download context remains decodable")
+
+            let invalid = OfflineDownloadDiagnostic(mediaID: -1, stage: .fetch, kind: .network,
+                httpStatus: nil, networkCode: -1009)
+            check(!invalid.isBounded, "Untrusted persisted contexts must still have positive media IDs")
+            clock.date.addTimeInterval(11)
+            await offlineStore.record(area: .cache, code: .downloadFailed, download: invalid)
+            await offlineStore.record(area: .search, code: .downloadFailed, download: network)
+            await offlineStore.record(area: .cache, code: .storage, download: storage)
+            let sanitized = try await offlineStore.entries()
+            check(sanitized.prefix(3).allSatisfy { $0.download == nil },
+                  "Invalid contexts and unrelated areas/codes cannot acquire download payloads")
+            let invalidFile = root.appendingPathComponent("offline-invalid/diagnostics-0.jsonl")
+            try FileManager.default.createDirectory(at: invalidFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+            // Use the store's ISO date convention while constructing a malformed context fixture.
+            let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+            var datedEntry = try JSONSerialization.jsonObject(with: encoder.encode(offlineEntries[0])) as! [String: Any]
+            datedEntry["download"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(invalid))
+            var invalidLine = try JSONSerialization.data(withJSONObject: datedEntry); invalidLine.append(0x0A)
+            try invalidLine.write(to: invalidFile)
+            let invalidStore = LocalDiagnosticsStore(fileURL: invalidFile, build: 158, now: { clock.date })
+            let rejected = try await invalidStore.entries()
+            check(rejected.isEmpty, "Restart drops a malformed download context instead of exporting unbounded payloads")
+        }
         print("LocalDiagnosticsChecks: \(checks) local assertions passed; bulk sample \(boundedEntries.count) retained events / \(byteTotal) bytes")
     }
 }

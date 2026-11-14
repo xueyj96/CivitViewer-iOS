@@ -5,16 +5,21 @@ if [ "$#" -ne 1 ]; then
   exit 2
 fi
 device_target="$1"
+phone_configuration="${CIVIT_PHONE_CONFIGURATION:-Release}"
+case "$phone_configuration" in
+  Debug|Release) ;;
+  *) echo 'CIVIT_PHONE_CONFIGURATION 仅支持 Debug 或 Release' >&2; exit 2 ;;
+esac
 task_root="$(cd "$(dirname "$0")/.." && pwd)"
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 mkdir -p "$task_root/build"
 build_log="$task_root/build/phone-install-build.log"
-if ! xcodebuild -project "$task_root/CivitViewer.xcodeproj" -scheme CivitViewer -configuration Debug -destination 'generic/platform=iOS' -derivedDataPath "$task_root/build/Phone" -allowProvisioningUpdates build > "$build_log" 2>&1; then
+if ! xcodebuild -project "$task_root/CivitViewer.xcodeproj" -scheme CivitViewer -configuration "$phone_configuration" -destination 'generic/platform=iOS' -derivedDataPath "$task_root/build/Phone" -jobs 2 -allowProvisioningUpdates build > "$build_log" 2>&1; then
   rg 'error:|BUILD FAILED' "$build_log" >&2 || true
   echo "构建失败，日志: $build_log" >&2
   exit 1
 fi
-app_path="$task_root/build/Phone/Build/Products/Debug-iphoneos/CivitViewer.app"
+app_path="$task_root/build/Phone/Build/Products/$phone_configuration-iphoneos/CivitViewer.app"
 codesign --verify --deep --strict "$app_path"
 python3 - "$app_path/embedded.mobileprovision" <<'PY'
 import datetime, plistlib, subprocess, sys

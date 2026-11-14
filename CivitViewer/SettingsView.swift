@@ -1,6 +1,9 @@
 import SwiftUI
 
 struct FilterView: View {
+    @EnvironmentObject private var session: SiteSession
+    @State private var openedIdentity: SiteSession.AccountSessionID?
+    @State private var capturedIdentity = false
     @Binding private var filter: FeedFilter
     @State private var draft: FeedFilter
     private let context: FilterContext
@@ -65,11 +68,17 @@ struct FilterView: View {
             .pageScrollContentInsets()
         }
         .floatingTitleBar(isCollection ? "收藏筛选" : "浏览条件") {
-            Button("完成") {
-                filter = draft
-                if let followed = saveAsDefaultForFollowing { draft.saveDefault(followed: followed) }
-                dismiss()
-            }
+            Button { dismiss() } label: { FloatingPageIcon(symbol: "checkmark") }
+                .buttonStyle(FloatingPageButtonStyle(iconOnly: true))
+                .accessibilityLabel("完成")
+        }
+        .onAppear {
+            if !capturedIdentity { openedIdentity = session.accountSessionID; capturedIdentity = true }
+        }
+        .commitOnPageReturn { [draft, openedIdentity, capturedIdentity] in
+            guard capturedIdentity, openedIdentity == session.accountSessionID else { return }
+            filter = draft
+            if let followed = saveAsDefaultForFollowing { draft.saveDefault(followed: followed) }
         }
         .ordinaryAppearance()
     }
@@ -137,7 +146,6 @@ struct SettingsChoice<Value: Hashable>: View {
     @Binding var selection: Value
     let options: [Value]
     let name: (Value) -> String
-    @Environment(\.colorScheme) private var scheme
 
     init(title: String, symbol: String? = nil, selection: Binding<Value>, options: [Value], name: @escaping (Value) -> String) {
         self.title = title
@@ -148,23 +156,12 @@ struct SettingsChoice<Value: Hashable>: View {
     }
 
     var body: some View {
-        Menu {
-            Picker(title, selection: $selection) {
-                ForEach(options, id: \.self) { Text(name($0)).tag($0) }
-            }
-        } label: {
+        AppValueSelector(title: title, selection: $selection, options: options, name: name) {
             HStack(spacing: FloatingPageChrome.groupInset) {
                 if let symbol { SettingsRowLabel(title, symbol) }
                 else { Text(title).font(.subheadline) }
                 Spacer(minLength: FloatingPageChrome.spacing)
-                HStack(spacing: FloatingPageChrome.groupInset) {
-                    Text(name(selection)).lineLimit(1)
-                    Image(systemName: "chevron.up.chevron.down").font(.caption2.weight(.semibold))
-                }
-                .font(FloatingPageChrome.controlFont)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 5)
-                .background(AppTheme.pageBackground(for: scheme), in: FloatingPageChrome.surfaceShape(nested: true))
+                ChoiceValueLabel(title: name(selection))
             }
             .foregroundStyle(.primary)
             .frame(minHeight: FloatingPageChrome.controlHeight)
@@ -173,6 +170,29 @@ struct SettingsChoice<Value: Hashable>: View {
         .buttonStyle(.plain)
         .accessibilityLabel(title)
         .accessibilityValue(name(selection))
+    }
+}
+
+private struct ChoiceValueLabel: View {
+    let title: String
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.valueSelectorExpanded) private var expanded
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    var body: some View {
+        HStack(spacing: FloatingPageChrome.groupInset) {
+            Text(title).lineLimit(1).truncationMode(.tail)
+            Image(systemName: "chevron.down").font(.caption2.weight(.semibold))
+                .rotationEffect(.degrees(expanded ? 180 : 0))
+        }
+        .font(FloatingPageChrome.controlFont)
+        .foregroundStyle(expanded ? Color.accentColor : Color.primary)
+        .padding(.horizontal, FloatingPageChrome.spacing)
+        .padding(.vertical, FloatingPageChrome.groupInset)
+        .frame(minHeight: FloatingPageChrome.visibleHeight(nested: true))
+        .background(expanded ? AppTheme.selectionFill(for: scheme) : AppTheme.pageBackground(for: scheme),
+                    in: FloatingPageChrome.surfaceShape(nested: true))
+        .overlay { FloatingPageChrome.surfaceShape(nested: true).strokeBorder(expanded ? Color.accentColor.opacity(0.55) : .clear, lineWidth: ContentMetrics.Optical.hairline) }
+        .animation(reduceMotion ? nil : .easeInOut(duration: ContentMetrics.Choice.motionDuration), value: expanded)
     }
 }
 
@@ -200,7 +220,7 @@ struct SettingsRowLabel: View {
     init(_ title: String, _ symbol: String) { self.title = title; self.symbol = symbol }
     var body: some View {
         HStack(spacing: FloatingPageChrome.spacing) {
-            Image(systemName: symbol).font(.system(size: 16, weight: .regular)).frame(width: 22, height: 22).accessibilityHidden(true)
+            Image(systemName: symbol).font(.system(size: ContentMetrics.Icon.primary, weight: .regular)).frame(width: 22, height: 22).accessibilityHidden(true)
             Text(title).font(.subheadline).fixedSize(horizontal: false, vertical: true)
         }.frame(minHeight: 26)
     }
@@ -210,6 +230,7 @@ private struct BlockedTagsView: View {
     @ObservedObject private var blocklist = TagBlocklist.shared
     @State private var name = ""
     @State private var error: String?
+    @State private var errorAttempt = 0
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: FloatingPageChrome.spacing) {
@@ -217,7 +238,6 @@ private struct BlockedTagsView: View {
                     TextField("输入站点标签名", text: $name)
                         .textInputAutocapitalization(.never).autocorrectionDisabled().onSubmit(add)
                         .frame(minHeight: FloatingPageChrome.controlHeight)
-                    if let error { Text(error).font(.caption).foregroundStyle(.red).padding(.bottom, 8) }
                 }
                 SettingsControlCard(blocklist.names.isEmpty ? nil : "已屏蔽 · \(blocklist.names.count)") {
                     if blocklist.names.isEmpty {
@@ -225,7 +245,7 @@ private struct BlockedTagsView: View {
                             .frame(minHeight: FloatingPageChrome.controlHeight)
                     }
                     if !blocklist.names.isEmpty {
-                        TagPillLayout(spacing: FloatingPageChrome.groupInset) {
+                        TagPillLayout() {
                             ForEach(blocklist.names.sorted(), id: \.self) { tag in
                                 Button(role: .destructive) { blocklist.remove(tag) } label: {
                                     WorkTagLabel(title: tag, selected: false, blocked: true, removable: true)
@@ -234,6 +254,7 @@ private struct BlockedTagsView: View {
                                 .accessibilityLabel("删除屏蔽标签 " + tag)
                             }
                         }
+                        .padding(.vertical, FloatingPageChrome.groupInset)
                     }
                 }
                 Text("仅在本机按站点标签名屏蔽作品。标签尚未核实的作品会暂时隐藏。")
@@ -249,10 +270,14 @@ private struct BlockedTagsView: View {
                 .disabled(TagPolicy.normalize(name).isEmpty)
         }
         .ordinaryAppearance()
+        .existingFeedbackToast(error, id: errorAttempt)
     }
     private func add() {
         if blocklist.add(name) { name = ""; error = nil }
-        else { error = "请使用 1—80 个字符，最多保存 100 个标签。" }
+        else {
+            errorAttempt += 1
+            error = "请使用 1—80 个字符，最多保存 100 个标签。"
+        }
     }
 }
 
@@ -260,7 +285,7 @@ private struct MediaRailOrderView: View {
     @AppStorage(MediaRailAction.defaultsKey) private var railOrder = ""
     @AppStorage(MediaRailAction.hiddenDefaultsKey) private var hiddenRailActions = ""
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @ScaledMetric(relativeTo: .body) private var scaledRowHeight: CGFloat = 50
+    @ScaledMetric(relativeTo: .body) private var scaledRowHeight: CGFloat = 44
     @GestureState private var drag: RailDrag?
 
     private struct RailDrag {
@@ -269,7 +294,7 @@ private struct MediaRailOrderView: View {
     }
 
     private let rowSpacing = FloatingPageChrome.groupInset
-    private var rowHeight: CGFloat { max(50, scaledRowHeight) }
+    private var rowHeight: CGFloat { max(FloatingPageChrome.controlHeight, scaledRowHeight) }
     private var rowStep: CGFloat { rowHeight + rowSpacing }
     private var actions: [MediaRailAction] { MediaRailAction.ordered(railOrder) }
     private var hidden: Set<MediaRailAction> { MediaRailAction.hidden(hiddenRailActions) }
@@ -286,18 +311,20 @@ private struct MediaRailOrderView: View {
                 }
                 .padding(FloatingPageChrome.groupInset)
                 .background(AppTheme.secondarySurface, in: FloatingPageChrome.controlShape)
-                if actions != MediaRailAction.allCases || !hidden.isEmpty {
-                    Button("恢复默认") {
-                        railOrder = ""
-                        hiddenRailActions = ""
-                    }
-                    .buttonStyle(FloatingPageButtonStyle())
-                    .accessibilityIdentifier("settings.media-rail.reset")
-                }
+
             }
             .pageScrollContentInsets()
         }
-        .floatingTitleBar("播放侧栏")
+        .floatingTitleBar("播放侧栏") {
+            Button {
+                railOrder = ""
+                hiddenRailActions = ""
+            } label: { FloatingPageIcon(symbol: "arrow.counterclockwise") }
+                .buttonStyle(FloatingPageButtonStyle(iconOnly: true))
+                .disabled(actions == MediaRailAction.allCases && hidden.isEmpty)
+                .accessibilityLabel("恢复默认")
+                .accessibilityIdentifier("settings.media-rail.reset")
+        }
         .ordinaryAppearance()
     }
 
@@ -323,7 +350,7 @@ private struct MediaRailOrderView: View {
             .accessibilityIdentifier("settings.media-rail.\(action.rawValue)")
 
             Image(systemName: "line.3.horizontal")
-                .font(.system(size: 16, weight: .medium))
+                .font(.system(size: ContentMetrics.Icon.primary, weight: .medium))
                 .foregroundStyle(.secondary)
                 .frame(width: 44, height: 44)
                 .contentShape(Rectangle())
@@ -396,7 +423,6 @@ struct SettingsView: View {
     @AppStorage("wifiVideoPrefetch") private var wifiVideoPrefetch = true
     @AppStorage("mediaPrefetchCount") private var mediaPrefetchCount = 6
     @AppStorage("mediaPrefetchConcurrency") private var mediaPrefetchConcurrency = 4
-    @State private var showsGestureHelp = false
     @AppStorage("cacheLimitGB") private var cacheLimitGB = 5
     @AppStorage("deduplicateMedia") private var deduplicateMedia = true
     @AppStorage(AppTheme.appearanceKey) private var appearanceRaw = AppAppearance.system.rawValue
@@ -416,7 +442,12 @@ struct SettingsView: View {
     var body: some View {
         List {
             Group {
-                Section {
+                Group {
+                    sectionHeading("Civitai 账号")
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
+                        .accessibilityAddTraits(.isHeader)
+
                     if let account = session.account {
                         LabeledContent {
                             Text(account.username).lineLimit(1)
@@ -425,31 +456,41 @@ struct SettingsView: View {
                         }
                         NavigationLink { AccountPreferencesView() } label: { SettingsRowLabel("账号内容偏好", "gearshape") }
                         NavigationLink { FollowingView() } label: { SettingsRowLabel("关注的作者", "person.2") }
-                        NavigationLink { CollectionsView(showsBack: true) } label: { SettingsRowLabel("我的收藏", "bookmark") }
-                        NavigationLink { OfflineStorageView() } label: { SettingsRowLabel("离线收藏与空间管理", "internaldrive") }
-                            .accessibilityIdentifier("settings.offline-library")
                         Button(role: .destructive) { Task { await session.clearLocalLogin() } } label: { SettingsRowLabel("退出此客户端", "rectangle.portrait.and.arrow.right") }
                     } else {
                         Button { session.openLogin() } label: { SettingsRowLabel("登录 Civitai", "person.crop.circle") }
-                        NavigationLink { OfflineStorageView() } label: { SettingsRowLabel("离线收藏与空间管理", "internaldrive") }
-                            .accessibilityIdentifier("settings.offline-library")
                     }
                     LabeledContent { Text("civitai.red") } label: { SettingsRowLabel("连接站点", "globe") }
-                } header: { sectionHeading("Civitai 账号") }
-                Section {
+                }
+                Group {
+                    sectionHeading("外观")
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
+                        .accessibilityAddTraits(.isHeader)
+
                     SettingsChoice(title: "显示模式", symbol: "circle.lefthalf.filled",
                                    selection: appearanceSelection, options: AppAppearance.allCases, name: { $0.title })
                         .accessibilityIdentifier("settings-appearance-picker")
-                } header: { sectionHeading("外观") }
-                Section {
+                }
+                Group {
+                    sectionHeading("下载")
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
+                        .accessibilityAddTraits(.isHeader)
+
                     NavigationLink {
                         OfflineDownloadSettingsView()
                     } label: {
                         SettingsRowLabel("下载设置", "arrow.down.circle")
                     }
                     .accessibilityIdentifier("settings.downloads")
-                } header: { sectionHeading("下载") }
-                Section {
+                }
+                Group {
+                    sectionHeading("播放")
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
+                        .accessibilityAddTraits(.isHeader)
+
                     NavigationLink { MediaRailOrderView() } label: { SettingsRowLabel("播放侧栏", "sidebar.right") }
                         .accessibilityIdentifier("settings.media-rail")
                     Toggle(isOn: $autoplay) { SettingsRowLabel("自动播放视频", "play.circle") }
@@ -462,22 +503,42 @@ struct SettingsView: View {
                         }
                         .accessibilityIdentifier("settings.rotation.toggle")
                     }
-                } header: { sectionHeading("播放") }
-                Section {
+                }
+                Group {
+                    sectionHeading("浏览记录")
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
+                        .accessibilityAddTraits(.isHeader)
+
                     NavigationLink { BrowsingHistoryView() } label: { SettingsRowLabel("最近浏览与接着看", "clock.arrow.circlepath") }
-                } header: { sectionHeading("浏览记录") }
-                Section {
+                }
+                Group {
+                    sectionHeading("诊断")
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
+                        .accessibilityAddTraits(.isHeader)
+
                     NavigationLink { LocalDiagnosticsView() } label: { SettingsRowLabel("本机错误与诊断记录", "stethoscope") }
-                } header: { sectionHeading("诊断") }
-                Section {
+                }
+                Group {
+                    sectionHeading("默认浏览设置")
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
+                        .accessibilityAddTraits(.isHeader)
+
                     Button { editDefault = 0 } label: { SettingsRowLabel("推荐时间线默认筛选", "slider.horizontal.3") }
                     Button { editDefault = 1 } label: { SettingsRowLabel("关注时间线默认筛选", "person.2") }
                     NavigationLink { BlockedTagsView() } label: { SettingsRowLabel("屏蔽标签", "tag.slash") }
                     NavigationLink { AuthorBlocklistView() } label: { SettingsRowLabel("屏蔽的作者", "person.crop.circle.badge.xmark") }
                     NavigationLink { LocalTagLibraryView() } label: { SettingsRowLabel("本地标签库与同步", "externaldrive") }
                     Toggle(isOn: $deduplicateMedia) { SettingsRowLabel("合并相同媒体", "rectangle.on.rectangle.slash") }
-                } header: { sectionHeading("默认浏览设置") }
-                Section {
+                }
+                Group {
+                    sectionHeading("时间线缓存")
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
+                        .accessibilityAddTraits(.isHeader)
+
                     Toggle(isOn: $wifiVideoPrefetch) { SettingsRowLabel("仅在 Wi-Fi 下预取视频", "wifi") }
                     SettingsChoice(title: "预加载作品", symbol: "arrow.down.circle",
                                    selection: $mediaPrefetchCount, options: [3, 6, 10], name: { "后续 \($0) 条" })
@@ -498,27 +559,17 @@ struct SettingsView: View {
                                    selection: $cacheLimitGB, options: [1, 5, 10, 20], name: { "\($0) GB" })
                     LabeledContent { Text("\(cache.cacheHits) 次") } label: { SettingsRowLabel("本次缓存复用", "arrow.triangle.2.circlepath") }
                     Button { cache.clear() } label: { SettingsRowLabel("清理媒体缓存", "trash") }
-                } header: { sectionHeading("时间线缓存") }
-                Section {
-                    DisclosureGroup(isExpanded: $showsGestureHelp) {
-                        LabeledContent("上下划", value: "上一条／下一条")
-                        LabeledContent("单击视频", value: "暂停／继续")
-                        LabeledContent("双击作品", value: "进入作者主页")
-                        LabeledContent("时间线边缘横滑", value: "上半切关注／推荐，下半切图片／视频")
-                        LabeledContent("作者作品边缘横滑", value: "退出观看")
-                        LabeledContent("视频中央左右划", value: "快退／快进")
-                        LabeledContent("边缘长按", value: "临时 2×，松手恢复")
-                        LabeledContent("中央长按", value: "清屏／恢复")
-                            .accessibilityElement(children: .combine)
-                            .accessibilityLabel("中央长按，清屏／恢复")
-                            .accessibilityIdentifier("settings.gesture.central-hold")
-                    } label: { SettingsRowLabel("手势帮助", "hand.tap") }
-                    .accessibilityIdentifier("settings.gesture-help")
-                } header: { sectionHeading("观看帮助") }
-                Section {
+                }
+
+                Group {
+                    sectionHeading("关于")
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
+                        .accessibilityAddTraits(.isHeader)
+
                     LabeledContent { Text(appVersion) } label: { SettingsRowLabel("版本", "info.circle") }
                     NavigationLink { MediaRepairLicenseView() } label: { SettingsRowLabel("开源组件", "curlybraces") }
-                } header: { sectionHeading("关于") }
+                }
             }
             .font(.subheadline)
             .toggleStyle(CompactSettingsToggleStyle())
@@ -528,7 +579,7 @@ struct SettingsView: View {
         .listRowSpacing(FloatingPageChrome.groupInset)
         .avoidOverlaidTabBar(constrainViewport: true)
         .clipped()
-        .floatingTitleBar("账号与设置") {
+        .floatingTitleBar("账号与设置", layoutIdentity: session.account != nil) {
             if session.account != nil {
                 Button {
                     guard !refreshingAccount else { return }
@@ -562,34 +613,29 @@ struct AccountPreferencesView: View {
     @State private var refreshing = false
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: FloatingPageChrome.spacing) {
-                if let identity = session.accountSessionID, let account = session.account, let level = account.browsingLevel {
-                    AccountPreferencesForm(identity: identity, level: level, blur: account.blurNsfw)
-                        .id(identity)
-                        .id(account.blurNsfw != nil)
-                } else {
-                    SettingsControlCard {
-                        HStack(spacing: FloatingPageChrome.spacing) {
-                            Text("暂未取得账号浏览偏好。").foregroundStyle(.secondary)
-                            Spacer(minLength: 0)
-                            if refreshing {
-                                ProgressView().controlSize(.small).accessibilityLabel("正在读取账号偏好")
-                            } else {
-                                StatusReloadButton(title: "重新读取账号偏好") {
-                                    refreshing = true
-                                    Task { await session.refreshAccount(); refreshing = false }
-                                }
-                            }
-                        }
-                        .frame(minHeight: FloatingPageChrome.controlHeight)
+        Group {
+            if let identity = session.accountSessionID, let account = session.account, let level = account.browsingLevel {
+                AccountPreferencesForm(identity: identity, level: level, blur: account.blurNsfw)
+                    .id(identity).id(account.blurNsfw != nil)
+            } else {
+                ScrollView {
+                    PageStatusCard(title: "暂未取得账号浏览偏好", symbol: "person.crop.circle")
+                        .pageScrollContentInsets()
+                }
+                .floatingTitleBar("账号内容偏好") {
+                    Button {
+                        guard !refreshing else { return }
+                        refreshing = true
+                        Task { await session.refreshAccount(); refreshing = false }
+                    } label: {
+                        if refreshing { ProgressView().controlSize(.small) }
+                        else { FloatingPageIcon(symbol: "arrow.clockwise") }
                     }
+                    .buttonStyle(FloatingPageButtonStyle(iconOnly: true))
+                    .disabled(refreshing).accessibilityLabel("重新读取账号偏好")
                 }
             }
-            .pageScrollContentInsets()
-        }
-        .floatingTitleBar("账号内容偏好")
-        .ordinaryAppearance()
+        }.ordinaryAppearance()
     }
 }
 
@@ -608,35 +654,47 @@ private struct AccountPreferencesForm: View {
     }
 
     var body: some View {
-        SettingsControlCard("账号浏览范围") {
-            ForEach(levels, id: \.0) { bit, title in
-                if bit != levels.first?.0 { Divider() }
-                Toggle(title, isOn: Binding(get: { level & bit != 0 }, set: { enabled in
-                    if enabled { level |= bit } else { level &= ~bit }
-                }))
-                .disabled(saving)
-            }
-        }
-        if session.account?.blurNsfw != nil {
-            SettingsControlCard {
-                Toggle("模糊成熟内容", isOn: $blur).disabled(saving)
-            }
-        }
-        SettingsControlCard {
-            Button(saving ? "正在保存并核对…" : "保存到 Civitai") {
-                let submittedLevel = level
-                let submittedBlur = session.account?.blurNsfw == nil ? nil : blur
-                saving = true
-                Task {
-                    defer { saving = false }
-                    await session.saveBrowsingPreferences(level: submittedLevel, blur: submittedBlur, for: identity)
-                    guard identity == session.accountSessionID, let account = session.account else { return }
-                    level = account.browsingLevel ?? level
-                    self.blur = account.blurNsfw ?? self.blur
+        ScrollView {
+            VStack(alignment: .leading, spacing: FloatingPageChrome.spacing) {
+                SettingsControlCard("账号浏览范围") {
+                    ForEach(levels, id: \.0) { bit, title in
+                        if bit != levels.first?.0 { Divider() }
+                        Toggle(title, isOn: Binding(get: { level & bit != 0 }, set: { enabled in
+                            if enabled { level |= bit } else { level &= ~bit }
+                        })).disabled(saving)
+                    }
+                }
+                if session.account?.blurNsfw != nil {
+                    SettingsControlCard { Toggle("模糊成熟内容", isOn: $blur).disabled(saving) }
                 }
             }
-            .frame(minHeight: FloatingPageChrome.controlHeight)
-            .disabled(saving || level == 0)
+            .font(AppTypography.rowTitle)
+            .toggleStyle(CompactSettingsToggleStyle())
+            .pageScrollContentInsets()
+        }
+        .floatingTitleBar("账号内容偏好") {
+            Button(action: save) {
+                if saving { ProgressView().controlSize(.small) }
+                else { FloatingPageIcon(symbol: "checkmark") }
+            }
+            .buttonStyle(FloatingPageButtonStyle(iconOnly: true))
+            .disabled(saving || level == 0 || identity != session.accountSessionID)
+            .accessibilityLabel(saving ? "正在保存并核对" : "保存到 Civitai")
+            .accessibilityIdentifier("account-preferences.save")
+        }
+    }
+
+    private func save() {
+        guard !saving, level != 0, identity == session.accountSessionID else { return }
+        let submittedLevel = level
+        let submittedBlur = session.account?.blurNsfw == nil ? nil : blur
+        saving = true
+        Task {
+            defer { saving = false }
+            await session.saveBrowsingPreferences(level: submittedLevel, blur: submittedBlur, for: identity)
+            guard identity == session.accountSessionID, let account = session.account else { return }
+            level = account.browsingLevel ?? level
+            blur = account.blurNsfw ?? blur
         }
     }
 }

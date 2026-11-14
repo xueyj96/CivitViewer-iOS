@@ -36,6 +36,50 @@ import Foundation
         func page(_ id: Int? = nil, video: Bool = false, cursor: String? = nil) -> MediaPage {
             .init(items: id.map { [.init(id: $0, url: "https://example.com/fixture/\($0)", width: nil, height: nil, type: video ? "video" : "image", username: "fixture", browsingLevel: 1, thumbnail: nil)] } ?? [], metadata: .init(nextCursor: cursor))
         }
+        do {
+            let source = FakeFeedSource(), initialStore = FeedStore()
+            let gate = Gate()
+            source.fetch = { _ in await gate.wait(); return page() }
+            check(initialStore.continuationState == .ready && initialStore.displayContinuationState == .loading,
+                  "An unconfigured store presents pending results without changing transport readiness")
+            let work = Task { await initialStore.activate(session: source, filter: .init(kind: .image), source: .discovery) }
+            await Task.yield()
+            check(initialStore.items.isEmpty && initialStore.displayContinuationState == .loading,
+                  "Initial debounce cannot present a confirmed empty result")
+            try await Task.sleep(nanoseconds: 320_000_000)
+            check(source.requests.count == 1 && initialStore.displayContinuationState == .loading,
+                  "Initial network wait still presents loading")
+            gate.open(); _ = await work.value
+            check(initialStore.displayContinuationState == .ended,
+                  "Only a committed terminal empty response presents genuine empty results")
+            initialStore.clear()
+            check(initialStore.displayContinuationState == .loading, "Clearing a query restores its pending initial presentation")
+            source.fetch = { _ in throw ClientError.http(503) }
+            _ = await initialStore.activate(session: source, filter: .init(kind: .image), source: .discovery)
+            check(initialStore.displayContinuationState.failure != nil,
+                  "A real initial request failure keeps its recovery state rather than spinning forever")
+        }
+        do {
+            let source = FakeFeedSource(), hidden = FeedStore()
+            source.fetch = { request in
+                switch request.cursor {
+                case nil: return page(7201, video: false, cursor: "hidden-1")
+                case "hidden-1": return page(7202, video: false, cursor: "hidden-2")
+                default: return page(7203, video: true)
+                }
+            }
+            let warmed = await hidden.activate(session: source, filter: .init(kind: .video), source: .discovery,
+                                               transportPageBudget: 1)
+            check(source.requests.count == 1 && warmed.state == .incomplete && !hidden.reachedEnd,
+                  "Hidden preparation consumes one transport page and never invents an end")
+            check(hidden.items.isEmpty && hidden.continuationState == .ready && !hidden.loading,
+                  "Budgeted empty preparation remains resumable, not failed or busy")
+            let visible = await hidden.activate(session: source, filter: .init(kind: .video), source: .discovery)
+            check(source.requests.map(\.cursor) == [nil, "hidden-1", "hidden-2"],
+                  "Visible activation resumes the accepted cursor without a first-page refetch")
+            check(visible.state == .ended && hidden.items.map(\.id) == [7203],
+                  "Visible scanning crosses filtered pages and preserves the actual final result")
+        }
         var fixtureNow = Date(timeIntervalSince1970: 1_800_000_000)
         do {
             let observed = TagObservationStore(), source = FakeFeedSource()

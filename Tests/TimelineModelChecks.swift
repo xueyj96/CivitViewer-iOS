@@ -989,6 +989,67 @@ import Foundation
         check(keyModel.feed.items.map(\.id) == [790] && keyModel.filter.kind == .video,
               "Filter-key change invalidates fill and late old-key response cannot replace the new queue")
 
+        let budgetRoot = workspace.appendingPathComponent("hidden-budget", isDirectory: true)
+        let (budgetModel, _, budgetSession, _, _) = await modelAndSession(root: budgetRoot, owner: 812, filter: FeedFilter(kind: .video))
+        budgetSession.fetch = { request in
+            if request.cursor == nil {
+                return .init(items: [media(8120)], metadata: .init(nextCursor: "budget-next"))
+            }
+            return .init(items: [media(8121, type: "video")], metadata: .init(nextCursor: nil))
+        }
+        await budgetModel.warm(session: budgetSession, blockedTags: [], otherKind: false)
+        await budgetModel.warm(session: budgetSession, blockedTags: [], otherKind: false)
+        check(budgetSession.pageRequests.count == 1 && budgetModel.feed.items.isEmpty && !budgetModel.feed.reachedEnd,
+              "Repeated hidden preparation keeps a one-page budget for the same request key")
+        await budgetModel.activate(session: budgetSession, visible: true, blockedTags: [])
+        check(budgetSession.pageRequests.map(\.cursor) == [nil, "budget-next"] && budgetModel.feed.items.map(\.id) == [8121],
+              "Entering a prepared source resumes filtered-page cursor and exposes the real work")
+
+        let emptyKindRoot = workspace.appendingPathComponent("empty-adjacent-kind", isDirectory: true)
+        let (emptyKindModel, _, emptyKindSession, _, _) = await modelAndSession(root: emptyKindRoot, owner: 813, filter: FeedFilter(kind: .image))
+        emptyKindSession.fetch = { request in
+            if request.filter.kind == .image { return .init(items: [media(8130)], metadata: .init(nextCursor: "image-tail")) }
+            if request.cursor == nil { return .init(items: [media(8132, type: "video", tags: ["blocked"])], metadata: .init(nextCursor: "kind-next")) }
+            return .init(items: [media(8131, type: "video")], metadata: .init(nextCursor: nil))
+        }
+        await emptyKindModel.activate(session: emptyKindSession, visible: true, blockedTags: ["blocked"])
+        await emptyKindModel.warm(session: emptyKindSession, blockedTags: ["blocked"], otherKind: true)
+        emptyKindModel.selectFilter(FeedFilter(kind: .video))
+        check(emptyKindModel.feed.items.isEmpty && !emptyKindModel.feed.reachedEnd,
+              "An empty filtered adjacent page transfers incomplete state rather than a fake end")
+        await emptyKindModel.activate(session: emptyKindSession, visible: true, blockedTags: ["blocked"])
+        check(emptyKindSession.pageRequests.filter { $0.filter.kind == .video }.map(\.cursor) == [nil, "kind-next"],
+              "Switching into an empty prepared kind resumes its accepted cursor without refetching page one")
+        check(emptyKindModel.feed.items.map(\.id) == [8131], "The resumed kind keeps filtering and returns the actual work")
+        emptyKindModel.applyBlockedTags([])
+        check(Set(emptyKindModel.feed.items.map(\.id)) == [8131, 8132],
+              "Session-local handoff retains hidden rows so a later policy change can reveal them")
+
+        let warmRoot = workspace.appendingPathComponent("adjacent-kind", isDirectory: true)
+        let (warmModel, _, warmSession, _, _) = await modelAndSession(root: warmRoot, owner: 801, filter: FeedFilter(kind: .image))
+        warmSession.fetch = { request in
+            .init(items: [media(request.filter.kind == .video ? 802 : 801, type: request.filter.kind == .video ? "video" : "image")],
+                  metadata: .init(nextCursor: "next"))
+        }
+        await warmModel.activate(session: warmSession, visible: true, blockedTags: [])
+        await warmModel.warm(session: warmSession, blockedTags: [], otherKind: true)
+        check(warmModel.filter.kind == .image && warmModel.feed.items.map(\.id) == [801] && warmModel.focused == 801,
+              "Preparing an adjacent kind does not select it or change current focus")
+        check(warmSession.pageRequests.filter { $0.filter.kind == .video }.count == 1,
+              "Adjacent preparation reads one metadata page, not an automatic continuation loop")
+        warmModel.selectFilter(FeedFilter(kind: .video))
+        check(warmModel.feed.items.map(\.id) == [802] && warmModel.focused == 802,
+              "Committing the prepared kind publishes its ready queue without clearing through empty")
+        let warmReads = warmSession.pageRequests.count
+        await warmModel.activate(session: warmSession, visible: true, blockedTags: [])
+        check(warmSession.pageRequests.count == warmReads, "Activation reuses the prepared request and cursor")
+        warmModel.selectFilter(FeedFilter(kind: .image))
+        check(warmModel.feed.items.map(\.id) == [801] && warmModel.focused == 801,
+              "Reverse switching retains the previous queue and focus")
+        warmModel.invalidateSession()
+        check(warmModel.previewItem(otherKind: true, identity: warmSession.feedIdentity) == nil,
+              "Session invalidation drops adjacent account data")
+
         check(fillModel.shouldFillOnAppearance,
               "Ordinary browsing exposes stable appearance-fill demand")
         print("TimelineModelChecks: \(checks) real-model assertions passed; FakeTimelineSource reads are fake")

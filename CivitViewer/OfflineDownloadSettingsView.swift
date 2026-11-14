@@ -2,7 +2,6 @@ import SwiftUI
 
 struct OfflineDownloadSettingsView: View {
     @EnvironmentObject private var session: SiteSession
-    @AppStorage("offlineAutoSave") private var autoSave = true
     @AppStorage("offlineWifiOnly") private var wifiOnly = true
     @AppStorage("offlineLimitGB") private var limitGB = 10
 
@@ -12,12 +11,6 @@ struct OfflineDownloadSettingsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: FloatingPageChrome.spacing) {
                 SettingsControlCard("下载方式") {
-                    Toggle(isOn: Binding(get: { autoSave }, set: setAutoSave)) {
-                        SettingsRowLabel("自动下载收藏", "arrow.down.circle")
-                    }
-                    .frame(minHeight: FloatingPageChrome.controlHeight)
-                    .accessibilityIdentifier("downloads.auto-save")
-                    Divider()
                     Toggle(isOn: Binding(get: { wifiOnly }, set: setWiFiOnly)) {
                         SettingsRowLabel("仅 Wi-Fi 下载", "wifi")
                     }
@@ -33,30 +26,35 @@ struct OfflineDownloadSettingsView: View {
             }
             .pageScrollContentInsets()
         }
-        .floatingTitleBar("下载设置")
+        .floatingTitleBar("下载设置") {
+            Button(action: restoreDefaults) { FloatingPageIcon(symbol: "arrow.counterclockwise") }
+                .buttonStyle(FloatingPageButtonStyle(iconOnly: true))
+                .disabled(wifiOnly && limitGB == 10)
+                .accessibilityLabel("恢复默认")
+                .accessibilityIdentifier("downloads.reset")
+        }
         .ordinaryAppearance()
     }
 
-    private func setAutoSave(_ enabled: Bool) {
-        guard enabled != autoSave else { return }
-        autoSave = enabled
-        if enabled {
-            offline.resumeAll(session: session)
-        } else {
-            offline.pause(reason: "自动保存已关闭")
-        }
+    private func restoreDefaults() {
+        guard !wifiOnly || limitGB != 10 else { return }
+        let networkChanged = !wifiOnly
+        wifiOnly = true
+        limitGB = 10
+        if networkChanged { offline.pause() }
+        offline.requestSync(session: session)
     }
 
     private func setWiFiOnly(_ enabled: Bool) {
         guard enabled != wifiOnly else { return }
         wifiOnly = enabled
         offline.pause()
-        if autoSave { offline.requestSync(session: session) }
+        offline.requestSync(session: session)
     }
 
     private func setLimit(_ value: Int) {
         guard value != limitGB else { return }
         limitGB = value
-        if autoSave { offline.requestSync(session: session) }
+        offline.requestSync(session: session)
     }
 }

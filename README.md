@@ -6,15 +6,20 @@
 
 [App 通用设计准则](docs/app-design-guidelines.md)包含外观与交互、代码设计和本项目的验收示例。
 
+[控件与尺寸标准](docs/ui-dimensions.md)维护本 App 的控件规格、例外和待收敛项，附有可重新生成的源码盘点清单。
+
 ## 下载 IPA
 
-[GitHub Release 下载](https://github.com/xueyj96/CivitViewer-iOS/releases/tag/v1.1.0-build147)提供 Release 配置的 iPhone IPA。包内不含个人设备描述文件，接收方需要用自己的 Apple 账号通过侧载工具重签安装；下载链接不能直接完成 iOS 安装。安装步骤与可复现构建命令见 [侧载说明](docs/SIDELOADING.md)。
+[GitHub Release 下载](https://github.com/xueyj96/CivitViewer-iOS/releases/tag/v1.1.0-build173)提供 Release 配置的 iPhone IPA。包内不含个人设备描述文件，接收方需要用自己的 Apple 账号通过侧载工具重签安装；下载链接不能直接完成 iOS 安装。安装步骤与可复现构建命令见 [侧载说明](docs/SIDELOADING.md)。
 
-## 1.1.0（147）
+## 1.1.0（173）
 
-- 时间线、作者榜、搜索和收藏使用同一套悬浮栏。深浅色切换时页面、顶栏和底栏一起过渡，单双行顶栏固定上沿。作品详情原位淡入。
-- 搜索在原页显示图片或视频结果。收藏优先显示本地列表，后台同步站点。播放页点书签立即更新，站点写入在后台确认，失败时恢复上次确认状态。
-- 收藏内可查看下载队列，下载偏好放在账号与设置。作品标签、紧凑卡片和播放侧栏共用样式。
+- 主页面、子页面和整页业务面板使用统一悬浮顶栏／底栏。内容延伸至整屏，从固定栏后经过；滚动让位与阅读、手势区域分开管理。
+- 统一滑动进入、返回、分栏切换和顶栏单双行变化的交接；会话内保留各页面筛选和浏览位置。选择器、菜单、尺寸及居中 Toast 使用共用组件。
+- 收藏默认下载到本地后播放，下载管理分为任务与空间管理；设置、关注、历史、屏蔽管理及详情页面统一布局。
+- 播放会话支持覆盖页面返回时保留当前播放器，下一条进行静音预热；多方向解码预热仍未实现，整体滑动性能仍需持续验证。
+
+本版已覆盖安装至原设备，安装前后离线索引及文件清单一致。模拟器验证和已知限制见 [悬浮栏与转场验证](docs/verification/floating-chrome-173.md)及 [播放与性能记录](docs/verification/performance-172.md)。兼容播放曾出现关闭后入口未恢复的测试失败，后续完整日志复测通过，早先失败原因仍未确定。
 
 ## 历史 0.3.0（69）
 
@@ -280,6 +285,7 @@ env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer bash scripts/verify
 env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer bash scripts/verify-media-dedup.sh
 env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer bash scripts/verify-conjunction.sh
 env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer bash scripts/verify-tag-library.sh
+env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer bash scripts/verify-presentation.sh
 ```
 
 UI 测试使用指定的模拟器和仓库里的无声素材。运行 `xcrun simctl list devices available` 获取模拟器 UUID，再把它传给脚本。构建缓存按模拟器复用，日志、结果和输入摘要按运行分别写入 `build/`。

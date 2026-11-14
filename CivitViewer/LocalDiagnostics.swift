@@ -28,6 +28,7 @@ enum DiagnosticCode: String, Codable, CaseIterable, Identifiable {
     case posterOpened, posterStarted, posterCancelled, posterCaptureStarted, posterDeferred
     case tagProbe, tagSearch
     case emptyMediaViewport
+    case downloadFailed
     var id: Self { self }
     var isFrameReadyMeasurement: Bool { [.frameReadyNetwork, .frameReadyCache, .frameReadyLocal].contains(self) }
     var title: String {
@@ -64,6 +65,7 @@ enum DiagnosticCode: String, Codable, CaseIterable, Identifiable {
         case .tagProbe: "标签可展示作品核对"
         case .tagSearch: "标签作品查询"
         case .emptyMediaViewport: "当前视口没有可展示作品"
+        case .downloadFailed: "离线作品下载失败"
         }
     }
 }
@@ -101,6 +103,92 @@ struct TagSearchDiagnostic: Codable, Hashable {
     }
 }
 
+/// A failed offline save carries finite operation context only. The adapter at
+/// the call site reduces app-specific errors before they reach this classifier.
+struct OfflineDownloadDiagnostic: Codable, Hashable {
+    enum Stage: String, Codable { case validate, fetch, install, persist, quota }
+    enum Kind: String, Codable { case http, client, network, storage, unknown, limit }
+    enum Failure: Error { case http(Int), client, storage, limit }
+
+    let mediaID: Int
+    let stage: Stage
+    let kind: Kind
+    let httpStatus: Int?
+    let networkCode: Int?
+
+    var isBounded: Bool {
+        mediaID > 0 && (httpStatus.map { (100...599).contains($0) } ?? true)
+            && (networkCode.map { (-4_000 ... -1).contains($0) } ?? true)
+            && (kind == .http || httpStatus == nil) && (kind == .network || networkCode == nil)
+    }
+
+    var diagnosticCode: DiagnosticCode { kind == .limit ? .limit : .downloadFailed }
+
+    var summary: String {
+        let stageTitle = switch stage {
+        case .validate: "检查来源"
+        case .fetch: "下载文件"
+        case .install: "写入文件"
+        case .persist: "保存索引"
+        case .quota: "空间检查"
+        }
+        let kindTitle = switch kind {
+        case .http: "HTTP"
+        case .client: "客户端"
+        case .network: "网络"
+        case .storage: "本地存储"
+        case .unknown: "原因未知"
+        case .limit: "额度或空间限制"
+        }
+        var parts = ["作品 #\(mediaID)", stageTitle, kindTitle]
+        if let httpStatus { parts.append("状态 \(httpStatus)") }
+        if let networkCode { parts.append("代码 \(networkCode)") }
+        return parts.joined(separator: " · ")
+    }
+
+    static func classify(mediaID: Int, stage: Stage, error: Error) -> Self? {
+        guard mediaID > 0, !isCancellation(error) else { return nil }
+        if isSpaceLimit(error) {
+            return Self(mediaID: mediaID, stage: stage, kind: .limit, httpStatus: nil, networkCode: nil)
+        }
+        let kind: Kind
+        var status: Int?
+        var network: Int?
+        switch error {
+        case Failure.http(let value):
+            kind = .http
+            status = (100...599).contains(value) ? value : nil
+        case Failure.client: kind = .client
+        case Failure.storage: kind = .storage
+        default:
+            let native = error as NSError
+            if native.domain == NSURLErrorDomain {
+                kind = .network
+                network = (-4_000 ... -1).contains(native.code) ? native.code : nil
+            } else if native.domain == NSCocoaErrorDomain {
+                kind = .storage
+            } else {
+                kind = .unknown
+            }
+        }
+        return Self(mediaID: mediaID, stage: stage, kind: kind, httpStatus: status, networkCode: network)
+    }
+
+    static func isCancellation(_ error: Error) -> Bool {
+        if error is CancellationError { return true }
+        let native = error as NSError
+        return (native.domain == NSURLErrorDomain && native.code == URLError.cancelled.rawValue)
+            || (native.domain == NSCocoaErrorDomain && native.code == CocoaError.userCancelled.rawValue)
+    }
+
+    static func isSpaceLimit(_ error: Error) -> Bool {
+        if case Failure.limit = error { return true }
+        let native = error as NSError
+        return (native.domain == NSCocoaErrorDomain && native.code == CocoaError.fileWriteOutOfSpace.rawValue)
+            || (native.domain == NSPOSIXErrorDomain && native.code == Int(POSIXError.Code.ENOSPC.rawValue))
+    }
+}
+
 struct DiagnosticEntry: Codable, Equatable, Identifiable {
     let id: UUID
     let timestamp: Date
@@ -113,6 +201,7 @@ struct DiagnosticEntry: Codable, Equatable, Identifiable {
     let suppressed: Int
     let playback: PlaybackFailureDiagnostic?
     var tagSearch: TagSearchDiagnostic? = nil
+    var download: OfflineDownloadDiagnostic? = nil
 }
 
 actor LocalDiagnosticsStore {
@@ -130,6 +219,7 @@ actor LocalDiagnosticsStore {
         let status: Int?
         let playback: PlaybackFailureDiagnostic?
         let tagSearch: TagSearchDiagnostic?
+        let download: OfflineDownloadDiagnostic?
     }
     private struct Export: Codable {
         let schemaVersion: Int
@@ -157,8 +247,8 @@ actor LocalDiagnosticsStore {
 
     static let shared = LocalDiagnosticsStore(fileURL: defaultFileURL, build: Int(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "") ?? 0)
 
-    nonisolated func note(area: DiagnosticArea, code: DiagnosticCode, httpStatus: Int? = nil, count: Int? = nil, playback: PlaybackFailureDiagnostic? = nil, tagSearch: TagSearchDiagnostic? = nil) {
-        Task { await self.record(area: area, code: code, httpStatus: httpStatus, count: count, playback: playback, tagSearch: tagSearch) }
+    nonisolated func note(area: DiagnosticArea, code: DiagnosticCode, httpStatus: Int? = nil, count: Int? = nil, playback: PlaybackFailureDiagnostic? = nil, tagSearch: TagSearchDiagnostic? = nil, download: OfflineDownloadDiagnostic? = nil) {
+        Task { await self.record(area: area, code: code, httpStatus: httpStatus, count: count, playback: playback, tagSearch: tagSearch, download: download) }
     }
 
     private static var defaultFileURL: URL {
@@ -169,7 +259,7 @@ actor LocalDiagnosticsStore {
             .appendingPathComponent("diagnostics-0.jsonl")
     }
 
-    func record(area: DiagnosticArea, code: DiagnosticCode, httpStatus: Int? = nil, count: Int? = nil, playback: PlaybackFailureDiagnostic? = nil, tagSearch: TagSearchDiagnostic? = nil) async {
+    func record(area: DiagnosticArea, code: DiagnosticCode, httpStatus: Int? = nil, count: Int? = nil, playback: PlaybackFailureDiagnostic? = nil, tagSearch: TagSearchDiagnostic? = nil, download: OfflineDownloadDiagnostic? = nil) async {
         do { try ensureLoaded() } catch { return }
         let timestamp = now()
         pruneRateState(at: timestamp)
@@ -179,7 +269,8 @@ actor LocalDiagnosticsStore {
                                    .posterStarted, .posterCancelled, .posterCaptureStarted, .posterDeferred].contains(code))
         let safePlayback = allowsContext && playback?.isBounded == true ? playback : nil
         let safeTagSearch = area == .search && [.tagProbe, .tagSearch].contains(code) && tagSearch?.isBounded == true ? tagSearch : nil
-        let rateKey = RateKey(area: area, code: code, status: safeStatus, playback: safePlayback, tagSearch: safeTagSearch)
+        let safeDownload = area == .cache && download?.isBounded == true && download?.diagnosticCode == code ? download : nil
+        let rateKey = RateKey(area: area, code: code, status: safeStatus, playback: safePlayback, tagSearch: safeTagSearch, download: safeDownload)
         if let previous = perKeyLastWrite[rateKey], timestamp.timeIntervalSince(previous) < 10 {
             suppressedCount = min(1_000_000, suppressedCount + 1)
             return
@@ -190,7 +281,7 @@ actor LocalDiagnosticsStore {
         }
         let entry = DiagnosticEntry(id: UUID(), timestamp: timestamp, processSession: Self.processSessionID,
                                     build: build, area: area, code: code, httpStatus: safeStatus,
-                                    count: count.map { min(1_000_000_000, max(0, $0)) }, suppressed: suppressedCount, playback: safePlayback, tagSearch: safeTagSearch)
+                                    count: count.map { min(1_000_000_000, max(0, $0)) }, suppressed: suppressedCount, playback: safePlayback, tagSearch: safeTagSearch, download: safeDownload)
         let previouslySuppressed = suppressedCount
         suppressedCount = 0
         do {
@@ -286,7 +377,8 @@ actor LocalDiagnosticsStore {
     private func decodeEntry(_ data: Data) throws -> DiagnosticEntry {
         let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
         let entry = try decoder.decode(DiagnosticEntry.self, from: data)
-        guard entry.playback?.isBounded != false, entry.tagSearch?.isBounded != false else { throw CocoaError(.coderReadCorrupt) }
+        guard entry.playback?.isBounded != false, entry.tagSearch?.isBounded != false,
+              entry.download?.isBounded != false else { throw CocoaError(.coderReadCorrupt) }
         return entry
     }
 

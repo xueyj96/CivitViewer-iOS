@@ -12,7 +12,18 @@ struct BlockedAuthor: Codable, Equatable, Identifiable {
         let entries: [BlockedAuthor]
     }
 
+    #if DEBUG && targetEnvironment(simulator)
+    static let shared: AuthorBlocklist = {
+        guard CollectionPagingQA.enabled else { return AuthorBlocklist() }
+        // Each synthetic UI run starts with its own author-block fixture.
+        // Production preferences and phone data never enter this domain.
+        let defaults = UserDefaults(suiteName: "CivitAuthorBlocklistQA")!
+        defaults.removeObject(forKey: storageKey)
+        return AuthorBlocklist(defaults: defaults)
+    }()
+    #else
     static let shared = AuthorBlocklist()
+    #endif
     static let storageKey = "blockedAuthors.v1"
     private static let schemaVersion = 1
     private static let maximumEntries = 200
@@ -139,9 +150,6 @@ struct AuthorBlocklistView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: FloatingPageChrome.spacing) {
-                if let error = blocklist.error {
-                    Text(error).font(.caption).foregroundStyle(.red)
-                }
                 if blocklist.entries.isEmpty {
                     SettingsControlCard {
                         SettingsRowLabel("尚未屏蔽作者", "person.crop.circle.badge.xmark")
@@ -149,13 +157,10 @@ struct AuthorBlocklistView: View {
                             .frame(minHeight: FloatingPageChrome.controlHeight)
                     }
                 } else {
-                    ForEach(blocklist.entries) { author in
+                    ForEach(Array(blocklist.entries.enumerated()), id: \.element.id) { index, author in
                         SettingsControlCard {
                             HStack(spacing: FloatingPageChrome.spacing) {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text("@" + author.username).font(.subheadline.weight(.medium))
-                                    Text("作者 ID \(author.id)").font(.caption).foregroundStyle(.secondary)
-                                }
+                                AuthorRowIdentity(name: author.username, showsHandle: true, position: index + 1)
                                 Spacer()
                                 Button(role: .destructive) { blocklist.remove(id: author.id) } label: {
                                     FloatingPageIcon(symbol: "minus.circle")
@@ -180,9 +185,10 @@ struct AuthorBlocklistView: View {
         .navigationDestination(isPresented: $choosingAuthor) {
             AuthorSearchPicker(selected: Binding(get: { nil }, set: { author in
                 if let author, !blocklist.contains(id: author.id) { _ = blocklist.add(author) }
-            }), title: "添加屏蔽作者")
+            }), title: "添加屏蔽作者", allowsClear: false)
         }
         .ordinaryAppearance()
+        .existingFeedbackToast(blocklist.error, id: blocklist.error)
     }
 }
 #endif

@@ -167,7 +167,7 @@ struct MediaIconActionLabel: View {
     let symbol: String
     let qaKey: String
     var body: some View {
-        Image(systemName: symbol).font(.system(size: 20, weight: .medium))
+        Image(systemName: symbol).font(.system(size: ContentMetrics.Icon.primary, weight: .medium))
             .foregroundStyle(.white.opacity(0.94))
             .mediaControlQAFrame(qaKey + ".icon")
             .frame(width: 44, height: 44).contentShape(Rectangle())
@@ -196,9 +196,6 @@ struct FeedContinuationStatusView: View {
                     Text(empty ? "没有符合条件的作品" : "已经看到最后啦")
                         .accessibilityIdentifier("feed.continuation.ended")
                 case .failed(let failure):
-                    Text(failure.requiresRestart ? "分页加载停滞" : "加载失败")
-                        .accessibilityIdentifier("feed.continuation.error")
-                    Text(failure.message).lineLimit(3)
                     if failure.requiresRestart {
                         if let restart {
                             StatusReloadButton(title: "重新加载", action: restart)
@@ -221,6 +218,7 @@ struct FeedContinuationStatusView: View {
             .shadow(color: darkCanvas ? .black.opacity(0.75) : .clear, radius: 2, y: 1)
             .frame(maxWidth: .infinity).fixedSize(horizontal: false, vertical: true)
         }
+        .existingFeedbackToast(state.failure?.message)
     }
 
     private var loadingIndicator: some View {
@@ -280,6 +278,7 @@ struct PlaybackNavigation<Content: View>: View {
                             selection: creator == nil ? nil : favoriteSelectionBar.entry)
         }
         .preferredColorScheme(creator == nil ? .dark : ordinaryScheme)
+        .playbackLoginPage()
         .onChange(of: creator != nil) { _, showsCreator in
             if showsCreator { chrome.prepareRailDeparture() }
             else {
@@ -322,11 +321,15 @@ struct PlaybackTabsBar: View {
 
 struct PlaybackShareButton: View {
     let workID: Int?
+    @Environment(\.isHeaderRasterPreview) private var rasterPreview
 
     var body: some View {
         if let workID, workID > 0,
            let url = URL(string: SiteSession.origin + "/images/\(workID)") {
-            ShareLink(item: url) { FloatingPageIcon(symbol: "square.and.arrow.up") }
+            Group {
+                if rasterPreview { Button {} label: { FloatingPageIcon(symbol: "square.and.arrow.up") } }
+                else { ShareLink(item: url) { FloatingPageIcon(symbol: "square.and.arrow.up") } }
+            }
                 .buttonStyle(FloatingPageButtonStyle(iconOnly: true))
                 .accessibilityLabel("分享作品")
                 .accessibilityIdentifier("playback.share")
@@ -363,6 +366,7 @@ extension View {
             PlaybackShareButton(workID: workID)
             actions()
         }
+        .pageReturnAction { onClose(); return true }
     }
 }
 
@@ -388,6 +392,7 @@ struct FeedMediaViewer: View {
     @Environment(\.exitMediaCoverToTab) private var exitToTab
     let onClose: () -> Void
     let loadMore: () async -> Void
+    @State private var authorDeparture = false
     @State private var creator: CreatorRoute?
     @ObservedObject private var chrome = ViewingChromeController.shared
 
@@ -397,16 +402,19 @@ struct FeedMediaViewer: View {
                 Color.black.ignoresSafeArea()
                 MediaDeck(items: items, focused: $focused, focusRequest: focusRequest, queueRevision: queueRevision,
                           playbackSuspended: playbackSuspended, automaticLoadingAllowed: automaticLoadingAllowed, initialID: initialID,
+                          coveredByNavigation: creator != nil || authorDeparture,
                           continuationState: continuationState, loadMoreAutomatically: loadMoreAutomatically,
                           refreshFromStart: refreshFromStart, restartRetryAvailableAt: restartRetryAvailableAt,
                           bottomBarInset: exitToTab == nil ? nil : tabs?.height,
                           onEdgeSwipe: onEdgeSwipe, onAuthor: { route in
+                              authorDeparture = true
                               if let onOpenAuthor { onOpenAuthor(route) }
                               else { openAuthor(route) }
                           }, onDetailsVisibility: onDetailsVisibility,
                           historyCheckpoint: historyCheckpoint, resumePositions: resumePositions,
                           loadMore: loadMore)
             }
+            .onAppear { authorDeparture = false }
             .tint(.white)
             .playbackTitleBar(title, workID: items.first(where: { $0.id == focused })?.id,
                               hidden: chrome.hidden, onClose: onClose)
@@ -449,6 +457,7 @@ struct MediaDeck: View {
     var continuationTopInset: CGFloat = 0
     var gestureTopExclusion: CGFloat = 110
     var gestureExcludedFrames: [CGRect] = []
+    var onCanvasReady: ((UIView) -> Void)? = nil
     var onEdgeSwipe: MediaEdgeSwipeAction? = nil
     var onEdgeDrag: MediaEdgeDragAction? = nil
     let onAuthor: (CreatorRoute) -> Void
@@ -458,8 +467,11 @@ struct MediaDeck: View {
     var endAction: (() -> Void)? = nil
     let loadMore: () async -> Void
     @EnvironmentObject private var session: SiteSession
+    @Environment(\.rootPageParticipation) private var rootParticipation
     @Environment(\.mediaTabs) private var tabs
+    @Environment(\.pageSurfaceTone) private var surfaceTone
     @Environment(\.exitMediaCoverToTab) private var exitToTab
+    @Environment(\.requestSignIn) private var requestSignIn
     @ObservedObject private var blocklist = TagBlocklist.shared
     @ObservedObject private var authorBlocks = AuthorBlocklist.shared
     @ObservedObject private var history = BrowsingHistory.shared
@@ -474,11 +486,20 @@ struct MediaDeck: View {
     @Environment(\.verticalSizeClass) private var verticalSizeClass
     @State private var advance = PlaybackAdvanceState()
     @State private var boundaryDemand: MediaContinuationIntent?
-    @State private var detailsItem: MediaItem?
+    private enum DeckPage: Identifiable, Equatable {
+        case details(MediaItem), favorite(MediaItem)
+        var id: String {
+            switch self { case .details(let item): "details-\(item.id)"; case .favorite(let item): "favorite-\(item.id)" }
+        }
+    }
+    private struct DeckPageRequest: Identifiable, Equatable {
+        let id = UUID()
+        let page: DeckPage
+    }
+    @State private var presentedPage: DeckPageRequest?
     @State private var detailsExit: MediaDetailsView.ExitAction?
-    @State private var detailTagSnapshot: Set<String>?
-    @State private var detailsHeaderCover = NativeHeaderRoute()
-    @State private var detailsReturnBlend: UUID?
+    @State private var pageTagSnapshot: Set<String>?
+    @State private var pageHeaderRoute = NativeHeaderRoute()
     @StateObject private var presentationLease = MediaDeckPresentationLease()
     @Environment(\.tabPageMotion) private var tabPageMotion
     @Environment(\.accessibilityReduceMotion) private var reduceRailMotion
@@ -494,16 +515,20 @@ struct MediaDeck: View {
     @State private var transitionFrames: [URL: UIImage] = [:]
     @State private var transitionFrameContext: String?
     @State private var transitionFrameRevision = 0
+    #if DEBUG && targetEnvironment(simulator)
+    @State private var transitionFrameDecodes = 0
+    #endif
     @State private var transitionCacheGeneration: Int?
     @Environment(\.viewingControlsReferenceInset) private var controlsReferenceInset
-    private var visibleItems: [MediaItem] { items.filter { !authorBlocks.blocks($0) && TagPolicy.verdict(names: $0.tagNames, blocked: detailTagSnapshot ?? blocklist.names) == .allowed } }
+    private var visibleItems: [MediaItem] { items.filter { !authorBlocks.blocks($0) && TagPolicy.verdict(names: $0.tagNames, blocked: pageTagSnapshot ?? blocklist.names) == .allowed } }
     private var historyContext: HistoryContext? { history.context(ownerID: session.tagLibraryOwnerID) }
     private var viewerVisible: Bool { appeared && isVisible && !session.showLogin }
-    private var isCoveredByPage: Bool { detailsItem != nil || coveredByNavigation }
+    private var pagePresentationActive: Bool { pageTagSnapshot != nil }
+    private var isCoveredByPage: Bool { pagePresentationActive || coveredByNavigation }
     private var continuationIntentContext: String { "\(session.feedIdentity):\(queueRevision):\(focusRequest)" }
     private var awaitingNextItem: Bool {
         guard let boundaryDemand, let focused else { return false }
-        return viewerVisible && scenePhase == .active && !playbackSuspended && detailsItem == nil &&
+        return viewerVisible && scenePhase == .active && !playbackSuspended && !pagePresentationActive &&
             boundaryDemand.context == continuationIntentContext &&
             (boundaryDemand.anchorID == focused || boundaryDemand.targetID == focused)
     }
@@ -520,7 +545,12 @@ struct MediaDeck: View {
         let index = focused.flatMap { id in visibleItems.firstIndex(where: { $0.id == id }) }
         let count = [3, 6, 10].contains(mediaPrefetchCount) ? mediaPrefetchCount : 6
         let concurrency = MediaPrefetchConcurrency.validated(mediaPrefetchConcurrency)
-        let window = index.map { Array(visibleItems.dropFirst($0).prefix(count + 1)) } ?? []
+        let previousVideo = index.flatMap { index -> MediaItem? in
+            guard index > 0, visibleItems[index - 1].isVideo else { return nil }
+            return visibleItems[index - 1]
+        }
+        let window = (previousVideo.map { [$0] } ?? []) +
+            (index.map { Array(visibleItems.dropFirst($0).prefix(count + 1)) } ?? [])
         return PrefetchDemand(focus: focused, context: "\(session.feedIdentity):\(queueRevision)",
             active: viewerVisible && scenePhase == .active && !playbackSuspended,
             count: count, concurrency: concurrency, wifiOnly: wifiVideoPrefetch, window: window)
@@ -532,12 +562,50 @@ struct MediaDeck: View {
         let neighbors: [URL]
     }
     private struct TransitionFrameDemand: Equatable {
+        let scope: String
         let plan: TransitionFramePlan?
+        let retention: TransitionFramePlan?
         let revision: Int
     }
     private var frameContext: String { "\(session.feedIdentity):\(queueRevision)" }
-    private var transitionFramePlan: TransitionFramePlan? {
-        guard viewerVisible, scenePhase == .active, !playbackSuspended, detailsItem == nil else { return nil }
+    @State private var foregroundPlaybackWaiting = false
+    private struct WarmPlaybackDemand: Equatable {
+        let context: String
+        let expectedCurrentWorkID: Int?
+        let itemID: Int?
+        let address: URL?
+        let source: URL?
+        let ready: Bool
+    }
+    private var warmPlaybackDemand: WarmPlaybackDemand {
+        let works = visibleItems
+        let expectedCurrentWorkID = focused
+        guard viewerVisible, scenePhase == .active, !playbackSuspended, !isCoveredByPage, !foregroundPlaybackWaiting,
+              let focused, let index = works.firstIndex(where: { $0.id == focused }),
+              works.indices.contains(index + 1), works[index + 1].isVideo,
+              let address = works[index + 1].mediaURL else {
+            return .init(context: frameContext, expectedCurrentWorkID: expectedCurrentWorkID, itemID: nil,
+                         address: nil, source: nil, ready: false)
+        }
+        return .init(context: frameContext, expectedCurrentWorkID: expectedCurrentWorkID,
+                     itemID: works[index + 1].id, address: address,
+                     source: address.isFileURL ? address : nil, ready: true)
+    }
+    private func prepareWarmPlayback(_ demand: WarmPlaybackDemand) {
+        guard !Task.isCancelled else { return }
+        let pool = VideoPlaybackSessions.shared
+        guard demand.ready, let itemID = demand.itemID, let address = demand.address,
+              let source = demand.source ?? MediaCache.shared.cached(address, video: true),
+              let expectedCurrentWorkID = demand.expectedCurrentWorkID,
+              source.isFileURL, MediaRepairStore.identity(source) != nil else { return }
+        let key = videoPlaybackKey(owner: chromeScope, scope: demand.context, workID: itemID, address: address, source: source,
+                                   rootSlot: inlinePlayback ? rootParticipation.token : nil)
+        _ = pool.prepareCandidate(key: key, expectedCurrentWorkID: expectedCurrentWorkID,
+                                  pin: { MediaCache.shared.pin(address) },
+                                  unpin: { MediaCache.shared.unpin(address) })
+    }
+
+    private var frameRetentionPlan: TransitionFramePlan? {
         let works = visibleItems
         guard let index = works.firstIndex(where: { $0.id == focused }) else { return nil }
         func videoURL(at index: Int) -> URL? {
@@ -545,25 +613,39 @@ struct MediaDeck: View {
                   (resumePositions[works[index].id] ?? 0) <= 0 else { return nil }
             return works[index].mediaURL
         }
-        // The closest pages in the native pager matter first. Keep only
-        // nearby frame images and decode one at a time from cached files.
         return .init(context: frameContext, current: videoURL(at: index),
                      neighbors: [index + 1, index - 1, index + 2].compactMap(videoURL(at:)))
     }
-    private func prepareTransitionFrames(_ plan: TransitionFramePlan?) async {
+    private var frameRetentionURLs: Set<URL> {
+        guard let plan = frameRetentionPlan else { return [] }
+        return Set(plan.neighbors + [plan.current].compactMap { $0 })
+    }
+    private var transitionFramePlan: TransitionFramePlan? {
+        guard viewerVisible, scenePhase == .active, !playbackSuspended, !pagePresentationActive else { return nil }
+        // The closest pages in the native pager matter first. Keep only
+        // nearby frame images and decode one at a time from cached files.
+        return frameRetentionPlan
+    }
+    private func prepareTransitionFrames(_ plan: TransitionFramePlan?, retaining retention: TransitionFramePlan?, scope: String) async {
         guard !Task.isCancelled else { return }
-        if transitionFrameContext != plan?.context {
+        if transitionFrameContext != scope {
             transitionFrames = [:]
-            transitionFrameContext = plan?.context
+            transitionFrameContext = scope
         }
-        guard let plan else { return }
-        let retained = Set(plan.neighbors + [plan.current].compactMap { $0 })
+        let retained = retention.map { Set($0.neighbors + [$0.current].compactMap { $0 }) } ?? []
         transitionFrames = transitionFrames.filter { retained.contains($0.key) }
+        guard let plan else { return }
         for url in plan.neighbors where transitionFrames[url] == nil {
             guard !Task.isCancelled else { return }
             let frame = await MediaCache.shared.transitionFrame(for: url)
-            guard !Task.isCancelled, plan.context == frameContext else { return }
-            if let frame { transitionFrames[url] = frame }
+            guard !Task.isCancelled, scope == frameContext, plan.context == frameContext,
+                  frameRetentionURLs.contains(url) else { return }
+            if let frame {
+                transitionFrames[url] = frame
+                #if DEBUG && targetEnvironment(simulator)
+                transitionFrameDecodes += 1
+                #endif
+            }
         }
     }
 
@@ -572,10 +654,15 @@ struct MediaDeck: View {
             deck(topInset: safeViewport.safeAreaInsets.top, bottomInset: safeViewport.safeAreaInsets.bottom)
                 .ignoresSafeArea(.container, edges: .vertical)
         }
+        .background(Color.black.ignoresSafeArea())
     }
 
     private func deck(topInset: CGFloat, bottomInset: CGFloat) -> some View {
         let framePlan = transitionFramePlan
+        let frameScope = frameContext
+        let frameRetention = frameRetentionPlan
+        let frameDemand = TransitionFrameDemand(scope: frameScope, plan: framePlan,
+                                                retention: frameRetention, revision: transitionFrameRevision)
         return GeometryReader { geometry in
             NativeMediaPager(ids: pageIDs, focused: $focused, initialID: initialID,
                              focusRequest: focusRequest &+ pageRecoveryRequest, queueRevision: queueRevision,
@@ -610,7 +697,7 @@ struct MediaDeck: View {
             }, onPageDisplayed: { id in
                 if let demand = boundaryDemand, demand.context == continuationIntentContext,
                    demand.targetID == id, focused == id, awaitingNextItem { boundaryDemand = nil }
-            }) { id, settled in
+            }, onCanvasReady: onCanvasReady) { id, settled in
                 let content = page(id: id, settled: settled, size: geometry.size, topInset: topInset)
                     // Move rendered content inside its stable native host. The
                     // pager's hit-test viewport and internal queue stay in place.
@@ -618,8 +705,11 @@ struct MediaDeck: View {
                     .allowsHitTesting(!awaitingNextItem).accessibilityHidden(awaitingNextItem)
                     .environmentObject(session).environmentObject(session.oauth)
                     .environment(\.ordinaryColorScheme, ordinaryScheme)
+                    .environment(\.pageSurfaceTone, surfaceTone)
+                    .environment(\.pageCanvasRole, .playback)
                     .environment(\.mediaTabs, tabs)
                     .environment(\.exitMediaCoverToTab, exitToTab)
+                    .environment(\.requestSignIn, requestSignIn)
                     .environment(\.dynamicTypeSize, dynamicTypeSize)
                     .environment(\.verticalSizeClass, verticalSizeClass)
                     .environment(\.playbackControlsBottomInset, (bottomBarInset ?? controlsReferenceInset) + bottomInset)
@@ -629,6 +719,7 @@ struct MediaDeck: View {
                 #endif
                 return AnyView(content)
             }
+            .id(session.feedIdentity)
             .frame(width: geometry.size.width, height: geometry.size.height)
             .clipped()
             .task(id: "\(focused ?? -1):\(viewerVisible && scenePhase == .active):\(playbackSuspended):\(automaticLoadingAllowed):\(queueRevision):\(pagedQueueRevision.map(String.init) ?? "nil")") {
@@ -646,10 +737,17 @@ struct MediaDeck: View {
                     context: prefetchDemand.context, wifiOnly: wifiVideoPrefetch,
                     concurrency: prefetchDemand.concurrency)
             }
-            .task(id: TransitionFrameDemand(plan: framePlan, revision: transitionFrameRevision)) {
-                await prepareTransitionFrames(framePlan)
+            .task(id: warmPlaybackDemand) {
+                prepareWarmPlayback(warmPlaybackDemand)
+            }
+            .task(id: frameDemand) {
+                await prepareTransitionFrames(framePlan, retaining: frameRetention, scope: frameScope)
+            }
+            .onReceive(MediaCache.shared.foregroundVideoDemands) { demand in
+                if foregroundPlaybackWaiting != demand.waiting { foregroundPlaybackWaiting = demand.waiting }
             }
             .onReceive(MediaCache.shared.videoPreloadUpdates) { url in
+                if warmPlaybackDemand.address == url { prepareWarmPlayback(warmPlaybackDemand) }
                 if framePlan?.neighbors.contains(url) == true && transitionFrames[url] == nil {
                     transitionFrameRevision &+= 1
                 }
@@ -670,6 +768,10 @@ struct MediaDeck: View {
                 if let demand = boundaryDemand, demand.anchorID != id && demand.targetID != id { boundaryDemand = nil }
                 advance.focusChanged(id)
                 if let id, id < 0, viewerVisible, chrome.activeScope == chromeScope { chrome.reveal() }
+            }
+            .onChange(of: frameContext) { _, _ in VideoPlaybackSessions.shared.retireOwner(chromeScope) }
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
+                VideoPlaybackSessions.shared.handleMemoryPressure()
             }
             .onChange(of: queueRevision) { _, _ in
                 advance = PlaybackAdvanceState(); boundaryDemand = nil
@@ -719,6 +821,9 @@ struct MediaDeck: View {
                                 performing: continuationAction != nil, restartRetryAvailableAt: restartRetryAvailableAt,
                                 retry: { startContinuationAction(loadMore) },
                                 restart: refreshFromStart.map { action in { startContinuationAction(action) } })
+                        } else if continuationState?.isLoading == true {
+                            ProgressView().tint(.white.opacity(0.8))
+                                .accessibilityIdentifier("media.empty.loading")
                         } else {
                             Text("当前没有可展示的作品").font(.callout)
                                 .accessibilityIdentifier("media.empty.message")
@@ -771,34 +876,14 @@ struct MediaDeck: View {
             .overlay(alignment: .bottomLeading) {
                 if CollectionPagingQA.enabled && viewerVisible {
                     MediaPreloadQAReadback(preloader: preloader, pagingAllowed: automaticLoadingAllowed)
-                    Text("frames=\(transitionFrames.count)")
+                    Text("frames=\(transitionFrames.count);decodes=\(transitionFrameDecodes)")
                         .font(.system(size: 1)).frame(width: 1, height: 1).opacity(0.01).allowsHitTesting(false)
-                        .accessibilityIdentifier("media.qa.transition-frames").accessibilityValue("frames=\(transitionFrames.count)")
+                        .accessibilityIdentifier("media.qa.transition-frames").accessibilityValue("frames=\(transitionFrames.count);decodes=\(transitionFrameDecodes)")
                 }
             }
             #endif
-            .overlay {
-                if let detailsReturnBlend {
-                    PageToneBlend(source: AppTheme.pageBackground(for: ordinaryScheme)) {
-                        if self.detailsReturnBlend == detailsReturnBlend { self.detailsReturnBlend = nil }
-                    }
-                    .id(detailsReturnBlend)
-                    .allowsHitTesting(false)
-                    .accessibilityHidden(true)
-                }
-            }
-            .nativeHeaderRouteBoundary(detailsHeaderCover, isPresented: false)
-            .background {
-                // Scope the modal transaction to its presenter so the player
-                // and the shared header keep their own animations.
-                Color.clear
-                    .fullScreenCover(item: $detailsItem, onDismiss: finishDetails) { item in
-                        detailsPage(item)
-                    }
-                    .transaction {
-                        $0.animation = nil
-                        $0.disablesAnimations = true
-                    }
+            .pinnedPageCover(item: $presentedPage, route: pageHeaderRoute, sourceRole: .playback, animateDismissal: detailsExit == nil, onDismiss: finishPage) { request in
+                pageContent(request.page)
             }
             .onAppear { appeared = true; syncViewingChrome() }
             .onChange(of: isVisible) { _, value in
@@ -806,16 +891,20 @@ struct MediaDeck: View {
                 syncViewingChrome()
             }
             .onChange(of: scenePhase) { _, phase in
-                if phase != .active { cancelBoundaryDemand(); cancelContinuationAction(); preloader.stop() }
+                if phase != .active {
+                    VideoPlaybackSessions.shared.suspendForBackground()
+                    cancelBoundaryDemand(); cancelContinuationAction(); preloader.stop()
+                }
                 syncViewingChrome()
             }
             .onChange(of: session.showLogin) { _, shown in
                 if shown { cancelBoundaryDemand(); cancelContinuationAction(); preloader.stop() }
                 syncViewingChrome()
             }
-            .onChange(of: detailsItem) { _, item in
+            .onChange(of: presentedPage) { _, item in
                 if item != nil { cancelBoundaryDemand(); chrome.suspend(for: detailsChromeScope) }
-                else { chrome.resume(after: detailsChromeScope) }
+                // Clearing the binding requests dismissal; finishPage owns release.
+
             }
             .onDisappear {
                 appeared = false
@@ -823,61 +912,75 @@ struct MediaDeck: View {
                 cancelContinuationAction()
                 preloader.stop()
                 chrome.end(chromeScope)
-                if !isCoveredByPage {
+                let retainedRoot = inlinePlayback && rootParticipation.token.map {
+                    VideoPlaybackSessions.shared.hasRootPaused(owner: chromeScope, rootSlot: $0)
+                } == true
+                if !isCoveredByPage && !retainedRoot {
+                    VideoPlaybackSessions.shared.retireOwner(chromeScope)
                     chrome.resume(after: detailsChromeScope)
                 }
             }
     }
 
-    private func detailsPage(_ item: MediaItem) -> some View {
-        MediaDetailsView(item: item, onClose: closeDetails)
-            .nativeHeaderRouteBoundary(detailsHeaderCover, isPresented: true)
+    @ViewBuilder private func pageContent(_ page: DeckPage) -> some View {
+        switch page {
+        case .details(let item):
+            MediaDetailsView(item: item, onClose: closePage)
+        case .favorite(let item):
+            BusinessPageSurface(fromMedia: true, onTab: { closePage(.tab($0)) }) {
+                FavoriteEditor(item: item, onClose: { closePage(nil) })
+            }
+        }
     }
 
-    private func closeDetails(_ action: MediaDetailsView.ExitAction?) {
-        guard detailsItem != nil else { return }
+    private func openPage(_ page: DeckPage) {
+        guard !pagePresentationActive else { return }
+        detailsExit = nil
+        pageTagSnapshot = blocklist.names
+        onDetailsVisibility?(true)
+        withoutPageAnimation { presentedPage = DeckPageRequest(page: page) }
+    }
+
+    private func closePage(_ action: MediaDetailsView.ExitAction?) {
+        guard presentedPage != nil else { return }
+        detailsExit = action
         if case .tab(let exit) = action {
             // All covers unwind in the same selection transaction, so an
             // intermediate player or grid never becomes the destination.
             withoutPageAnimation {
-                detailsHeaderCover.dismissed(animate: false)
-                clearDetailsPresentation()
+                clearPagePresentation()
                 (exitToTab ?? tabs?.select)?(exit)
-                detailsItem = nil
+                presentedPage = nil
             }
         } else {
-            detailsExit = action
-            detailsHeaderCover.prepareDismissal()
             withoutPageAnimation {
-                if action == nil, ordinaryScheme == .light, !reduceRailMotion {
-                    detailsReturnBlend = UUID()
-                }
-                detailsItem = nil
+                presentedPage = nil
             }
         }
     }
 
-    private func finishDetails() {
-        guard detailTagSnapshot != nil else { return }
-        detailsHeaderCover.dismissed(animate: detailsExit == nil)
-        clearDetailsPresentation()
-        let action = detailsExit; detailsExit = nil
+    private func finishPage() {
+        let action = detailsExit
+        detailsExit = nil
+        guard pageTagSnapshot != nil else { return }
+        clearPagePresentation()
         switch action {
         case .author(let route): onAuthor(route)
-        case .signIn: session.openLogin()
+        case .signIn:
+            if let requestSignIn { requestSignIn(false) } else { session.openLogin() }
         case .tab, nil: break
         }
     }
 
-    private func clearDetailsPresentation() {
-        detailTagSnapshot = nil
+    private func clearPagePresentation() {
+        pageTagSnapshot = nil
         onDetailsVisibility?(false)
         chrome.resume(after: detailsChromeScope)
     }
 
     private func resolveBoundaryDemand() {
         guard let demand = boundaryDemand else { return }
-        let active = viewerVisible && scenePhase == .active && !playbackSuspended && detailsItem == nil
+        let active = viewerVisible && scenePhase == .active && !playbackSuspended && !pagePresentationActive
         let ids = visibleItems.map(\.id)
         guard active, demand.context == continuationIntentContext, let current = focused,
               current == demand.anchorID || current == demand.targetID,
@@ -941,9 +1044,9 @@ struct MediaDeck: View {
 
     @ViewBuilder private func page(id: Int, settled: Bool, size: CGSize, topInset: CGFloat) -> some View {
         if let item = visibleItems.first(where: { $0.id == id }) {
-            let allowsTransitionPreview = viewerVisible && scenePhase == .active && !playbackSuspended && detailsItem == nil
-            let warmFrame = transitionFrameContext == frameContext && allowsTransitionPreview
-                ? item.mediaURL.flatMap { transitionFrames[$0] } : nil
+            let allowsTransitionPreview = viewerVisible && scenePhase == .active && !playbackSuspended && !pagePresentationActive
+            let warmFrame = transitionFrameContext == frameContext
+                ? item.mediaURL.flatMap { frameRetentionURLs.contains($0) ? transitionFrames[$0] : nil } : nil
             MediaPageView(item: item, active: settled && (focused == item.id || (awaitingNextItem && boundaryDemand?.anchorID == item.id)) && viewerVisible && !playbackSuspended && scenePhase == .active,
                           transitionFrame: warmFrame,
                           usesTransitionPreview: allowsTransitionPreview && (!settled || pagedQueueRevision == queueRevision || boundaryDemand?.targetID == id),
@@ -953,14 +1056,10 @@ struct MediaDeck: View {
                           gestureTopExclusion: topInset + gestureTopExclusion,
                           gestureExcludedFrames: gestureExcludedFrames.map { $0.offsetBy(dx: 0, dy: topInset) } +
                               (continuationStatusFrame.isEmpty ? [] : [continuationStatusFrame]),
-                          onEdgeSwipe: onEdgeSwipe, onEdgeDrag: onEdgeDrag, onAuthor: onAuthor, pausedForDetails: detailsItem != nil || awaitingNextItem, onDetails: { value in
-                guard detailsItem == nil else { return }
-                detailsHeaderCover.preparePresentation()
-                detailTagSnapshot = blocklist.names
-                onDetailsVisibility?(true)
-                withoutPageAnimation { detailsItem = value }
-            }, onUnavailable: { id in
-                guard viewerVisible, !playbackSuspended, scenePhase == .active, detailsItem == nil,
+                          onEdgeSwipe: onEdgeSwipe, onEdgeDrag: onEdgeDrag, onAuthor: onAuthor, pausedForDetails: pagePresentationActive || awaitingNextItem, onDetails: { value in
+                openPage(.details(value))
+            }, onFavoriteManagement: { value in openPage(.favorite(value)) }, onUnavailable: { id in
+                guard viewerVisible, !playbackSuspended, scenePhase == .active, !pagePresentationActive,
                       advance.canAdvance(failedID: id, focused: focused, active: true),
                       boundaryDemand?.anchorID != id else { return }
                 let ids = visibleItems.map(\.id)
@@ -973,7 +1072,11 @@ struct MediaDeck: View {
                     startContinuationAction(loadMoreAutomatically ?? loadMore)
                 }
             }, historyContext: historyContext, resumePosition: resumePositions[item.id],
-                retainDuringInterruption: (focused == item.id || boundaryDemand?.anchorID == item.id) && (isVisible || isCoveredByPage),
+                retainDuringInterruption: (focused == item.id || boundaryDemand?.anchorID == item.id) && (isVisible || isCoveredByPage || rootParticipation.token != nil),
+                playbackOwner: chromeScope, playbackScope: frameContext,
+                playbackRootSlot: inlinePlayback ? rootParticipation.token : nil,
+                preserveForPageCover: focused == item.id && isCoveredByPage && scenePhase == .active,
+                onPlaybackPrepared: { prepareWarmPlayback(warmPlaybackDemand) },
                 onQualifiedExposure: { item, context in
                 history.record(item, context: context, checkpoint: historyCheckpoint?(item))
             }).id("\(item.id):queue:\(queueRevision)")
@@ -1063,10 +1166,16 @@ struct MediaPageView: View {
     let onAuthor: (CreatorRoute) -> Void
     var pausedForDetails = false
     var onDetails: ((MediaItem) -> Void)? = nil
+    var onFavoriteManagement: ((MediaItem) -> Void)? = nil
     var onUnavailable: ((Int) -> Void)? = nil
     var historyContext: HistoryContext? = nil
     var resumePosition: Double? = nil
     var retainDuringInterruption = false
+    var playbackOwner: UUID? = nil
+    var playbackScope: String? = nil
+    var playbackRootSlot: UUID? = nil
+    var preserveForPageCover = false
+    var onPlaybackPrepared: (() -> Void)? = nil
     var onQualifiedExposure: ((MediaItem, HistoryContext) -> Void)? = nil
     @EnvironmentObject private var session: SiteSession
     @ObservedObject private var chrome = ViewingChromeController.shared
@@ -1090,10 +1199,8 @@ struct MediaPageView: View {
     @AppStorage(MediaRailAction.hiddenDefaultsKey) private var hiddenRailActions = ""
     private var hiddenActions: Set<MediaRailAction> { MediaRailAction.hidden(hiddenRailActions) }
     private var chromeHidden: Bool { chromeScope.map { chrome.isHidden(for: $0) } ?? false }
-    @Environment(\.tabPageMotion) private var tabPageMotion
     private var railVisible: Bool {
-        let waitingForTab = inlinePlayback && tabPageMotion?.holdsInlineRail == true
-        return !waitingForTab && presentationLease.railHasAppeared
+        presentationLease.railHasAppeared
             && (chromeScope.map { chrome.showsRail(for: $0) } ?? true)
     }
     private var chromeAvailable: Bool { chromeScope.map { chrome.activeScope == $0 } ?? false }
@@ -1117,7 +1224,9 @@ struct MediaPageView: View {
                 if let url = item.mediaURL {
                     if displaysVideo {
                         VideoSurface(url: url, poster: item.posterURL, active: active && (!shouldBlur || revealed), diagnosticWorkID: item.id, diagnosticOffline: item.offlineMediaURL != nil, gesturesActive: active, gestureTopExclusion: chromeHidden ? 0 : gestureTopExclusion, gestureExcludedFrames: chromeHidden ? [] : gestureExcludedFrames + actionHitFrames,
-                                     chromeHidden: chromeHidden, onChromeHold: chromeAvailable ? toggleChrome : nil, pausedForOverlay: pausedForDetails, retainDuringInterruption: retainDuringInterruption, mediaBlurred: shouldBlur && !revealed,
+                                     chromeHidden: chromeHidden, onChromeHold: chromeAvailable ? toggleChrome : nil, pausedForOverlay: pausedForDetails, retainDuringInterruption: retainDuringInterruption,
+                                     playbackOwner: playbackOwner, playbackScope: playbackScope, playbackRootSlot: playbackRootSlot,
+                                     preserveForPageCover: preserveForPageCover, mediaBlurred: shouldBlur && !revealed,
                                      onEdgeSwipe: onEdgeSwipe, onEdgeDrag: onEdgeDrag, onDoubleTap: openAuthor,
                                      refreshURL: {
                             if item.offlineMediaURL != nil { return item.mediaURL }
@@ -1132,7 +1241,10 @@ struct MediaPageView: View {
                                       existingVideo: history.records.contains { $0.id == item.id && $0.kind == .video },
                                       contextIsCurrent: history.accepts(context), recordingEnabled: history.recordingEnabled) else { return }
                             history.progress(id: item.id, position: position, duration: duration, flush: flush, context: context)
-                        }, onDisplayReady: { mediaReady = $0 }, onImageContent: { actualDisplayType = .image },
+                        }, onDisplayReady: { ready in
+                            mediaReady = ready
+                            if ready, active { onPlaybackPrepared?() }
+                        }, onImageContent: { actualDisplayType = .image },
                                      transitionFrame: transitionFrame, usesTransitionPreview: usesTransitionPreview && (!shouldBlur || revealed),
                                      caption: { mediaCaption }, actionRail: { muted in mediaActionRail(muted: muted) })
                     }
@@ -1155,7 +1267,7 @@ struct MediaPageView: View {
                 }
             }
             if shouldBlur && !revealed {
-                Button { revealed = true } label: { Label("显示这条作品", systemImage: "eye").padding(14).background(.ultraThinMaterial, in: Capsule()) }
+                Button { revealed = true } label: { Label("显示这条作品", systemImage: "eye").padding(FloatingPageChrome.cardInset).background(.ultraThinMaterial, in: FloatingPageChrome.controlShape) }
                     .frame(maxWidth: .infinity, maxHeight: .infinity).viewingChromeHidden(chromeHidden)
             }
             if !displaysVideo || item.mediaURL == nil {
@@ -1174,6 +1286,15 @@ struct MediaPageView: View {
             }
         }
         .clipped()
+        #if DEBUG && targetEnvironment(simulator)
+        .overlay(alignment: .topLeading) {
+            if CollectionPagingQA.enabled && active {
+                Text("ready=\(mediaReady)").font(.system(size: 1)).frame(width: 1, height: 1)
+                    .opacity(0.01).allowsHitTesting(false).accessibilityIdentifier("media.qa.parent-ready")
+                    .accessibilityValue("ready=\(mediaReady)")
+            }
+        }
+        #endif
         .coordinateSpace(name: actionSpace)
         .onPreferenceChange(MediaActionHitFramesKey.self) { actionHitFrames = $0 }
         .environment(\.viewingChromeToggle, chromeAvailable && active && !pausedForDetails ? toggleChrome : nil)
@@ -1196,7 +1317,7 @@ struct MediaPageView: View {
             }
             // Metadata is enough for most works. Resolve a missing ID only
             // for the foreground work, never for the preloaded pages.
-            if current.active, item.offlineMediaURL == nil, followAuthor == nil {
+            if current.active, !item.isStandaloneOfflineCopy, followAuthor == nil {
                 loadAuthor()
             }
         }
@@ -1211,7 +1332,6 @@ struct MediaPageView: View {
 
     private var mediaCaption: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if let error { Text(error).font(.caption2).lineLimit(2) }
             if let title = item.postTitle {
                 Text(title).font(.system(size: captionSize, weight: .semibold)).lineLimit(2)
                     .allowsHitTesting(false)
@@ -1224,6 +1344,7 @@ struct MediaPageView: View {
             }
         }
         .foregroundStyle(.white).shadow(color: .black.opacity(0.8), radius: 2, y: 1)
+        .existingFeedbackToast(error, active: active && !chrome.hidden && !pausedForDetails, scope: item.id)
         .frame(maxWidth: .infinity, alignment: .leading)
         #if DEBUG && targetEnvironment(simulator)
         .playbackQAFrame("actions")
@@ -1239,7 +1360,7 @@ struct MediaPageView: View {
             case .favorite, .rotate: return true
             case .details: return onDetails != nil
             case .mute: return muted != nil
-            case .cleanImage: return !displaysVideo && item.mediaURL != nil && chromeAvailable
+            case .cleanImage: return !displaysVideo && item.mediaURL != nil && chromeScope != nil && onToggleChrome != nil
             }
         }
         if !actions.isEmpty {
@@ -1274,9 +1395,9 @@ struct MediaPageView: View {
     private func mediaRailControl(_ action: MediaRailAction, muted: Binding<Bool>?) -> some View {
         switch action {
         case .favorite:
-            if item.offlineMediaURL != nil {
+            if item.isStandaloneOfflineCopy {
                 MediaIconActionLabel(title: "离线", symbol: "internaldrive.fill", qaKey: "control.\(item.id).offline")
-            } else { FavoriteButton(item: item, active: active) }
+            } else { FavoriteButton(item: item, active: active, onManage: { onFavoriteManagement?($0) }) }
         case .details:
             if let onDetails {
                 Button { onDetails(effectiveItem) } label: {
@@ -1321,7 +1442,7 @@ struct MediaPageView: View {
             }.buttonStyle(.plain).accessibilityIdentifier("media.author.\(item.id)")
             .mediaControlQAFrame("control.\(item.id).author")
             .mediaActionHitFrame(in: actionSpace)
-            if item.offlineMediaURL == nil {
+            if !item.isStandaloneOfflineCopy {
                 if let followAuthor {
                     FollowButton(creator: followAuthor, mediaItemID: item.id)
                         .fixedSize(horizontal: true, vertical: false)
@@ -1403,14 +1524,13 @@ struct MediaLoadFailureContent: View {
         VStack(spacing: 8) {
             Image(systemName: symbol).font(.title3).foregroundStyle(.secondary)
             if let workTitle { Text(workTitle).font(.caption.weight(.medium)).lineLimit(1).foregroundStyle(.secondary) }
-            Text(message).font(.caption).multilineTextAlignment(.center).lineLimit(3)
-                .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             if let retry {
                 Button(action: retry) { Label(retryLabel, systemImage: "arrow.clockwise").font(.caption) }
                     .buttonStyle(AppActionButtonStyle()).fixedSize(horizontal: true, vertical: false)
                     .accessibilityIdentifier(retryIdentifier)
             }
         }.padding(12).frame(maxWidth: 260)
+            .existingFeedbackToast(message)
     }
 }
 

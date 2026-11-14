@@ -25,7 +25,10 @@ struct OfflineRepairAccess: Sendable {
     static let shared = OfflineLibrary()
     @Published private(set) var accountID: Int?
     @Published private(set) var bindingID = UUID()
-    @Published private(set) var records: [OfflineRecord] = []
+    @Published private(set) var records: [OfflineRecord] = [] {
+        didSet { recordsByID = Dictionary(records.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first }) }
+    }
+    private var recordsByID: [Int: OfflineRecord] = [:]
     @Published private(set) var diskBytes: Int64 = 0
     @Published private(set) var diskUsageKnown = false
     @Published private(set) var busy = false
@@ -38,6 +41,7 @@ struct OfflineRepairAccess: Sendable {
     @Published private(set) var lastScan: Date?
     @Published private(set) var posterIDs = Set<Int>()
     private var omittedIDs = Set<Int>()
+    private var pendingCollectionDownloadID: Int?
     private var worker: Task<Void, Never>?
     private var generation = 0
     private var bindingIdentity: String?
@@ -62,7 +66,7 @@ struct OfflineRepairAccess: Sendable {
     private let files = OfflineFileStore()
     private let root: URL
     private(set) var directory: URL?
-    var autoEnabled: Bool { UserDefaults.standard.object(forKey: "offlineAutoSave") as? Bool ?? true }
+    var autoEnabled: Bool { true }
     var wifiOnly: Bool { UserDefaults.standard.object(forKey: "offlineWifiOnly") as? Bool ?? true }
     var capacity: Int64 {
         let value = UserDefaults.standard.object(forKey: "offlineLimitGB") as? Int ?? 10
@@ -142,7 +146,7 @@ struct OfflineRepairAccess: Sendable {
         rescanRequested = false
         pause(reason: "切换账号")
         pausedTaskID = nil
-        self.accountID = accountID; records = []; omittedIDs = []; lastScan = nil; diskBytes = 0; indexBytes = 0; directory = nil; healthy = true; lastPersisted = .distantPast
+        self.accountID = accountID; records = []; omittedIDs = []; pendingCollectionDownloadID = nil; lastScan = nil; diskBytes = 0; indexBytes = 0; directory = nil; healthy = true; lastPersisted = .distantPast
         diskUsageKnown = false; repairFamilyBytes = [:]; posterIDs = []
         guard let accountID else { status = "登录后可管理当前账号的离线收藏"; return }
         status = "正在读取离线收藏…"
@@ -196,6 +200,8 @@ struct OfflineRepairAccess: Sendable {
         if !cleaning { busy = false; self.activity = activity }
     }
     func pauseDownloads() {
+        pendingCollectionDownloadID = nil
+        rescanRequested = false
         pausedByUser = true
         pause()
     }
@@ -206,12 +212,49 @@ struct OfflineRepairAccess: Sendable {
         requestSync(session: session, manual: true)
     }
 
+    enum CollectionDownloadState: Equatable {
+        case waiting, downloading(Double?), paused, failed
+    }
+
+    func collectionDownloadState(_ id: Int, owner: Int?) -> CollectionDownloadState? {
+        guard let owner, accountID == owner, !loading else { return nil }
+        guard let record = recordsByID[id] else { return .waiting }
+        if record.fileState == .ready { return nil }
+        if currentID == id && busy { return .downloading(progress) }
+        if record.fileState == .failed { return .failed }
+        if pausedByUser || pausedTaskID == id { return .paused }
+        return .waiting
+    }
+
+    func localCollectionItem(_ item: MediaItem, owner: Int?, verifyFile: Bool = false) -> MediaItem? {
+        guard let owner, accountID == owner, !loading, let directory,
+              let record = recordsByID[item.id], record.fileState == .ready else { return nil }
+        let file = directory.appendingPathComponent(record.fileName)
+        guard !verifyFile || FileManager.default.fileExists(atPath: file.path) else { return nil }
+        var local = item
+        local.offlineMediaURL = file
+        if record.video && posterIDs.contains(record.id) {
+            local.offlinePosterURL = directory.appendingPathComponent(record.posterName)
+        }
+        local.collectionLocalPlayback = true
+        return local
+    }
+
+    func requestCollectionItem(_ id: Int, session: SiteSession) {
+        guard accountID == session.account?.id, !loading, !cleaning else { return }
+        if omittedIDs.remove(id) != nil { schedulePersist(force: true) }
+        pausedByUser = false
+        requestSync(session: session, manual: true, only: id)
+    }
+
     func download(_ id: Int, session: SiteSession) {
         guard !busy, downloadRecords.contains(where: { $0.id == id }) else { return }
         requestSync(session: session, manual: true, only: id)
     }
 
-    func requestSync(session: SiteSession, manual: Bool = false, only targetID: Int? = nil) {
+    func requestSync(session: SiteSession, manual: Bool = false, only explicitTargetID: Int? = nil) {
+        let targetID = explicitTargetID ?? pendingCollectionDownloadID
+        let manual = manual || pendingCollectionDownloadID != nil
         #if DEBUG && targetEnvironment(simulator)
         if ViewportAuditQA.enabled {
             if ViewportAuditQA.downloadTasksEnabled, manual, !busy, targetID == nil, let pausedTaskID {
@@ -225,8 +268,10 @@ struct OfflineRepairAccess: Sendable {
         guard manual || (autoEnabled && !pausedByUser) else { return }
         guard active, healthy, acceptsBinding(bindingID), let owner = accountID,
               session.account?.id == owner, session.hasCollectionAccess else { return }
+        if manual, let targetID { pendingCollectionDownloadID = targetID }
         guard canNetwork else { activity = .waitingForNetwork(networkWaitMessage); return }
         if busy { rescanRequested = true; return }
+        if pendingCollectionDownloadID == targetID { pendingCollectionDownloadID = nil }
         let revision = generation
         let permit = downloadPermit
         let resumedID = targetID == nil ? pausedTaskID : nil
@@ -237,7 +282,9 @@ struct OfflineRepairAccess: Sendable {
             defer {
                 if revision == self.generation {
                     self.busy = false; self.currentID = nil; self.progress = nil; self.downloadedBytes = 0; self.worker = nil
-                    if self.rescanRequested { self.rescanRequested = false; self.requestSync(session: session) }
+                    if let id = self.pendingCollectionDownloadID {
+                        self.requestSync(session: session, manual: true, only: id)
+                    } else if self.rescanRequested { self.rescanRequested = false; self.requestSync(session: session) }
                 }
             }
             do {
@@ -258,8 +305,16 @@ struct OfflineRepairAccess: Sendable {
 
     #if DEBUG && targetEnvironment(simulator)
     /// Drive the real card controls with a cancellable local fixture, without fetching media.
+    func seedCollectionCornersForQA() {
+        guard ViewportAuditQA.enabled, ProcessInfo.processInfo.arguments.contains("--qa-collection-corners162"), worker == nil,
+              let first = records.firstIndex(where: { $0.id == 28_037_100 }),
+              let second = records.firstIndex(where: { $0.id == 28_037_101 }) else { return }
+        records[first].fileState = .pending
+        records[second].fileState = .failed
+        seedDownloadProgressForQA(28_037_100)
+    }
     func seedDownloadProgressForQA(_ id: Int) {
-        guard ViewportAuditQA.downloadTasksEnabled, worker == nil, downloadRecords.contains(where: { $0.id == id }) else { return }
+        guard (ViewportAuditQA.downloadTasksEnabled || ProcessInfo.processInfo.arguments.contains("--qa-collection-corners162")), worker == nil, downloadRecords.contains(where: { $0.id == id }) else { return }
         pausedTaskID = nil; currentID = id; progress = 0.42; busy = true
         worker = Task { _ = try? await Task.sleep(for: .seconds(600)) }
     }
@@ -362,21 +417,25 @@ struct OfflineRepairAccess: Sendable {
             let budget = await downloadBudget()
             try check(owner, revision)
             guard budget > 1024 else {
+                recordDownloadFailure(OfflineDownloadDiagnostic.Failure.limit, mediaID: id, stage: .quota)
                 activity = .attention("离线空间已满或可用空间不足，整理后继续")
                 try await persist(force: true)
                 return
             }
             currentID = id; progress = nil; downloadedBytes = 0; status = "正在保存 \(item.isVideo ? "视频" : "图片") #\(id)…"
-            do { try await save(item, owner: owner, revision: revision, budget: budget, permit: permit) }
-            catch is CancellationError { throw CancellationError() }
-            catch MediaDownloadError.limitExceeded, OfflineFileStoreError.limitExceeded {
+            var stage = OfflineDownloadDiagnostic.Stage.validate
+            do { try await save(item, owner: owner, revision: revision, budget: budget, permit: permit, stage: { stage = $0 }) }
+            catch let error where OfflineDownloadDiagnostic.isCancellation(error) { throw CancellationError() }
+            catch let error where OfflineDownloadDiagnostic.isSpaceLimit(downloadDiagnosticError(error)) {
                 try check(owner, revision)
+                recordDownloadFailure(OfflineDownloadDiagnostic.Failure.limit, mediaID: id, stage: stage)
                 activity = .attention("当前作品超过剩余离线空间，扩大上限或整理后继续")
                 try await persist(force: true)
                 return
             }
             catch {
                 try check(owner, revision)
+                recordDownloadFailure(error, mediaID: id, stage: stage)
                 if let index = records.firstIndex(where: { $0.id == id }), records[index].fileState != .ready {
                     records[index].fileState = .failed
                 }
@@ -398,7 +457,31 @@ struct OfflineRepairAccess: Sendable {
         status = failed == 0 ? (skipped == 0 ? "已保存全部可访问收藏" : "已保存 \(readyCount) 项，按你的设置跳过 \(skipped) 项") : "已保存 \(readyCount) 项，\(failed) 项失败，可重试"
     }
 
-    private func save(_ item: MediaItem, owner: Int, revision: Int, budget: Int64, permit: OfflineWritePermit) async throws {
+    private func downloadDiagnosticError(_ error: Error) -> Error {
+        switch error {
+        case ClientError.http(let status), MediaDownloadError.http(let status):
+            return OfflineDownloadDiagnostic.Failure.http(status)
+        case is ClientError, MediaDownloadError.notImage, MediaDownloadError.videoContent:
+            return OfflineDownloadDiagnostic.Failure.client
+        case MediaDownloadError.limitExceeded, OfflineFileStoreError.limitExceeded,
+             MediaRepairError.lowSpace, ImageLoadError.lowSpace:
+            return OfflineDownloadDiagnostic.Failure.limit
+        case MediaRepairError.storageUnknown, MediaRepairError.output:
+            return OfflineDownloadDiagnostic.Failure.storage
+        default: return error
+        }
+    }
+
+    private func recordDownloadFailure(_ error: Error, mediaID: Int, stage: OfflineDownloadDiagnostic.Stage) {
+        guard let context = OfflineDownloadDiagnostic.classify(mediaID: mediaID, stage: stage,
+                                                               error: downloadDiagnosticError(error)) else { return }
+        LocalDiagnosticsStore.shared.note(area: .cache, code: context.diagnosticCode,
+                                          httpStatus: context.httpStatus, download: context)
+    }
+
+    private func save(_ item: MediaItem, owner: Int, revision: Int, budget: Int64, permit: OfflineWritePermit,
+                      stage: (OfflineDownloadDiagnostic.Stage) -> Void) async throws {
+        stage(.validate)
         guard diskUsageKnown else { throw MediaRepairError.storageUnknown }
         guard let directory, let source = item.mediaURL, source.scheme == "https", source.pathExtension.lowercased() != "m3u8",
               let record = records.first(where: { $0.id == item.id }) else { throw ClientError.invalidResponse }
@@ -408,12 +491,13 @@ struct OfflineRepairAccess: Sendable {
             if item.isVideo { MediaCache.shared.pin(source) }
             defer { if item.isVideo { MediaCache.shared.unpin(source) } }
             do {
+                stage(.install)
                 _ = try await files.enqueue {
                     try OfflineFileStore.install(cached, at: target, copying: true, limit: budget, permit: permit)
                 }.value
                 copied = true
-            } catch is CancellationError { throw CancellationError() }
-            catch OfflineFileStoreError.limitExceeded { throw OfflineFileStoreError.limitExceeded }
+            } catch let error where OfflineDownloadDiagnostic.isCancellation(error) { throw CancellationError() }
+            catch let error where OfflineDownloadDiagnostic.isSpaceLimit(downloadDiagnosticError(error)) { throw error }
             catch {
                 // The browsing cache may evict the file between lookup and
                 // copy. Retry from the source without touching the destination.
@@ -421,6 +505,7 @@ struct OfflineRepairAccess: Sendable {
             }
         }
         if !copied {
+            stage(.fetch)
             let temporary = try await BoundedDownload.fetch(source, maxBytes: budget, reserveBytes: 1_000_000_000) { [weak self] bytes, total in
                 Task { @MainActor in
                     guard let self, self.generation == revision, self.currentID == item.id else { return }
@@ -431,6 +516,7 @@ struct OfflineRepairAccess: Sendable {
             defer { discardTemporary(temporary) }
             try check(owner, revision)
             let limit = min(budget, max(0, capacity - diskBytes))
+            stage(.install)
             _ = try await files.enqueue {
                 try OfflineFileStore.install(temporary, at: target, copying: false, limit: limit, permit: permit)
             }.value
@@ -441,6 +527,7 @@ struct OfflineRepairAccess: Sendable {
         }
         await refreshFileSize(item.id)
         try check(owner, revision)
+        stage(.persist)
         try await persist()
         try check(owner, revision)
         if item.isVideo, let poster = item.posterURL, !posterIDs.contains(item.id) {
@@ -459,12 +546,18 @@ struct OfflineRepairAccess: Sendable {
         try check(owner, revision)
         await refreshFileSize(item.id)
         try check(owner, revision)
+        stage(.persist)
         try await persist()
     }
 
     func accept(_ update: SavedMembershipUpdate) {
-        guard acceptsBinding(bindingID), update.accountID == accountID,
-              let index = records.firstIndex(where: { $0.id == update.imageID }) else { return }
+        guard acceptsBinding(bindingID), update.accountID == accountID else { return }
+        if !update.collectionIDs.isEmpty {
+            pausedByUser = false
+            omittedIDs.remove(update.imageID)
+            pendingCollectionDownloadID = update.imageID
+        }
+        guard let index = records.firstIndex(where: { $0.id == update.imageID }) else { return }
         records[index].collectionIDs = update.collectionIDs
         records[index].cloudState = update.collectionIDs.isEmpty ? .unknown : .saved
         records[index].checkedAt = Date()
@@ -510,11 +603,11 @@ struct OfflineRepairAccess: Sendable {
                 if let removed = value.removed { self.records.removeAll { removed.contains($0.id) } }
                 if let snapshot = value.snapshot { self.apply(snapshot, directory: directory) }
                 else { self.diskUsageKnown = false }
-                self.status = value.removed?.count == ids.count
-                    ? "已清理 \(ids.count) 项本地副本，云端收藏保留"
-                    : "部分文件暂时无法清理，请稍后重试"
+                self.activity = value.removed?.count == ids.count
+                    ? .normal("已清理 \(ids.count) 项本地副本，云端收藏保留")
+                    : .attention("部分文件暂时无法清理，请稍后重试")
             case .failure(let error):
-                self.status = error is CancellationError ? "收藏状态已更新，请重新核对" : "本地目录未能保存，清理已停止"
+                self.activity = .attention(error is CancellationError ? "收藏状态已更新，请重新核对" : "本地目录未能保存，清理已停止")
             }
             self.schedulePersist(force: true)
         })
@@ -523,7 +616,7 @@ struct OfflineRepairAccess: Sendable {
     func cleanUnfavorited(session: SiteSession, ids: Set<Int>? = nil) {
         guard !busy, !loading, !cleaning, acceptsBinding(bindingID), canNetwork,
               let owner = accountID, session.account?.id == owner, session.hasCollectionAccess else {
-            status = "请联网后核对并清理"
+            activity = .attention("请联网后核对并清理")
             return
         }
         let candidates = records.filter { ids?.contains($0.id) ?? true }.map(\.id)
@@ -556,14 +649,14 @@ struct OfflineRepairAccess: Sendable {
             guard (try? check(owner, revision)) != nil else { return }
             if confirmed.isEmpty {
                 schedulePersist(force: true)
-                status = "没有确认可清理的已取消收藏；待核对文件保留"
+                activity = .attention("没有确认可清理的已取消收藏；待核对文件保留")
             } else {
                 // A membership event can supersede a prior successful check.
                 let stillConfirmed = Set(records.filter { $0.cloudState == .localOnly }.map(\.id))
                 let removable = confirmed.intersection(stillConfirmed)
                 if removable.isEmpty {
                     schedulePersist(force: true)
-                    status = "没有确认可清理的已取消收藏；待核对文件保留"
+                    activity = .attention("没有确认可清理的已取消收藏；待核对文件保留")
                 } else { removeLocal(removable, ifUnfavorited: true) }
             }
         }
@@ -571,7 +664,9 @@ struct OfflineRepairAccess: Sendable {
 
     func clearAll() {
         guard acceptsBinding(bindingID), !loading, !cleaning, let directory, let accountID else { return }
-        UserDefaults.standard.set(false, forKey: "offlineAutoSave")
+        pendingCollectionDownloadID = nil
+        rescanRequested = false
+        pausedByUser = true
         if healthy {
             removeLocal(Set(records.map(\.id)))
             return
@@ -607,7 +702,7 @@ struct OfflineRepairAccess: Sendable {
                 self.status = "离线目录已清理，自动保存已关闭"
             case .failure:
                 self.diskUsageKnown = false
-                self.status = "部分本地文件无法清理，请稍后重试"
+                self.activity = .attention("部分本地文件无法清理，请稍后重试")
             }
         })
     }

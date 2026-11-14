@@ -199,7 +199,7 @@ struct VideoSeekControl: UIViewRepresentable {
         override func draw(_ rect: CGRect) {
             guard let context = UIGraphicsGetCurrentContext() else { return }
             context.clear(rect)
-            let trackHeight: CGFloat = 2.5
+            let trackHeight = ContentMetrics.Media.trackHeight
             let trackCenterY = min(bounds.midY, 18)
             let trackRect = CGRect(x: 0, y: trackCenterY - trackHeight / 2,
                                    width: bounds.width, height: trackHeight)

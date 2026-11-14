@@ -68,7 +68,7 @@ import CryptoKit
         guard manual || autoEnabled else { return }
         guard manual || !pausedByUser else { return }
         guard canNetwork else { status = wifiOnly ? "等待 Wi-Fi 同步标签" : "离线，仍可查询本地标签"; return }
-        guard Date() >= retryAfter else { status = "同步冷却中，已有标签仍可查询"; return }
+        guard Date() >= retryAfter else { status = error == nil ? "等待下次更新" : "同步暂时中断"; return }
         if manual { pausedByUser = false }
         guard ownerKey == Self.key(source.tagLibraryOwnerID), database != nil else { status = "正在准备当前账号的标签库"; return }
         if busy {
@@ -153,7 +153,8 @@ import CryptoKit
         } catch is CancellationError { /* The completed page checkpoint is durable. */ }
         catch {
             guard run == generation else { return }
-            self.error = error.localizedDescription; status = "同步暂停，已有标签仍可查询"
+            self.error = error.localizedDescription; status = "同步暂时中断"
+            LocalDiagnosticsStore.shared.note(area: .search, code: error is LocalTagError ? .invalidResponse : .network)
             if case ClientError.http(429) = error { retryAfter = Date().addingTimeInterval(300) }
             else { retryAfter = Date().addingTimeInterval(60) }
         }

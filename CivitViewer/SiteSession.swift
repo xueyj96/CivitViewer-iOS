@@ -94,6 +94,18 @@ final class SiteSession: NSObject, ObservableObject, PublicationSource, MediaSea
         return account != nil && oauth.hasCollectionAccess
     }
     #if DEBUG && targetEnvironment(simulator)
+    func invalidateVisualIdentityForQA() {
+        guard CollectionPagingQA.enabled, ProcessInfo.processInfo.arguments.contains("--qa-body-identity164") else { return }
+        objectWillChange.send(); authGeneration += 1
+    }
+
+    func invalidateFeedIdentityForPagerQA() {
+        guard CollectionPagingQA.enabled, NativePagerIdentityQA.enabled else { return }
+        objectWillChange.send()
+        authGeneration += 1
+        NativePagerIdentityQA.shared.invalidated = true
+    }
+
     func configureForCollectionPagingQA() {
         guard CollectionPagingQA.enabled else { return }
         if ProcessInfo.processInfo.arguments.contains("--qa-tag-availability55") {
@@ -133,6 +145,10 @@ final class SiteSession: NSObject, ObservableObject, PublicationSource, MediaSea
             }
         }
         if ViewportAuditQA.enabled { following = [CollectionPagingQA.ownerID]; followsKnown = true }
+        if ProcessInfo.processInfo.arguments.contains("--qa-anonymous-navigation") {
+            // Keep prepared synthetic media intact while exercising signed-out navigation.
+            account = nil; following = []; followsKnown = true
+        }
     }
     #endif
     var defaultCollectionIDs: Set<Int> {
@@ -262,10 +278,22 @@ final class SiteSession: NSObject, ObservableObject, PublicationSource, MediaSea
 
     func mediaPage(filter: FeedFilter, cursor: String?, creator: Creator?, followed: Bool = false, includeTags: Bool = false) async throws -> MediaPage {
         #if DEBUG && targetEnvironment(simulator)
-        if AutoContinuationQA.enabled { return try await AutoContinuationQA.page(filter: filter, cursor: cursor) }
+        if AutoContinuationQA.enabled { return try await AutoContinuationQA.page(filter: filter, cursor: cursor, followed: followed, isCreator: creator != nil) }
         if ViewportAuditQA.enabled { return ViewportAuditQA.page(filter: filter, cursor: cursor, creator: creator) }
         if CollectionPagingQA.enabled {
-            return MediaPage(items: cursor == nil ? CollectionPagingQA.items.filter { filter.effectiveKind == .all || $0.isVideo == (filter.effectiveKind == .video) } : [], metadata: .init(nextCursor: nil))
+            var items = CollectionPagingQA.items
+            if creator != nil, ProcessInfo.processInfo.arguments.contains("--qa-author-scroll162") {
+                items = (0..<4).flatMap { page in CollectionPagingQA.items.map { original in
+                    var item = MediaItem(id: original.id + page * 100, url: original.url + "?qa-copy=\(page)",
+                                         width: original.width, height: original.height, type: original.type,
+                                         username: original.username, browsingLevel: original.browsingLevel,
+                                         thumbnail: original.thumbnail, creatorID: original.creatorID, tags: original.tags)
+                    item.offlineMediaURL = original.offlineMediaURL
+                    item.offlinePosterURL = original.offlinePosterURL
+                    return item
+                } }
+            }
+            return MediaPage(items: cursor == nil ? items.filter { filter.effectiveKind == .all || $0.isVideo == (filter.effectiveKind == .video) } : [], metadata: .init(nextCursor: nil))
         }
         if ResumePromptQA.enabled {
             ResumePromptQA.recordPageRequest(filter: filter, cursor: cursor, creator: creator, followed: followed)

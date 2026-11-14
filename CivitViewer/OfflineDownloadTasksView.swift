@@ -1,6 +1,55 @@
 import SwiftUI
 
 struct OfflineDownloadTasksView: View {
+    enum Section: String, CaseIterable { case tasks = "任务", space = "空间" }
+    @State private var section: Section = .tasks
+    @State private var showSettings = false
+    @EnvironmentObject private var session: SiteSession
+    @ObservedObject private var library = OfflineLibrary.shared
+
+    var body: some View {
+        SegmentedContentPager(selection: section, options: Section.allCases,
+                              identifier: "downloads.section") { section, _ in
+            switch section {
+            case .tasks: OfflineDownloadTaskContent().pageContentViewport(active: self.section == .tasks)
+            case .space: OfflineStorageView(embedded: true).pageContentViewport(active: self.section == .space)
+            }
+        }
+        .floatingPageBar("page-title.下载管理", layout: .doubleRow) {
+            VStack(spacing: 0) {
+                HStack(spacing: FloatingPageChrome.groupInset) {
+                    FloatingPageBackButton()
+                    Text("下载管理")
+                        .font(FloatingPageChrome.controlFont)
+                        .frame(maxWidth: .infinity, minHeight: FloatingPageChrome.controlHeight)
+                        .background { FloatingSegmentedTrack(nested: true, overMedia: false) }
+                        .accessibilityAddTraits(.isHeader)
+                    AppMenu {
+                        Button("检查待下载收藏", systemImage: "arrow.clockwise") {
+                            library.resumeAll(session: session)
+                        }
+                        .disabled(!session.hasCollectionAccess || library.busy)
+                        Button("下载设置", systemImage: "gearshape") { showSettings = true }
+                    } label: { FloatingPageIcon(symbol: "ellipsis") }
+                    .buttonStyle(FloatingPageButtonStyle(iconOnly: true))
+                    .accessibilityLabel("下载操作")
+                    .accessibilityIdentifier("downloads.menu")
+                }
+                FloatingSegmentedControl(title: "下载管理分类", selection: $section,
+                                         options: Section.allCases, optionTitle: { $0.rawValue },
+                                         identifier: "downloads.section")
+            }
+        }
+        .edgeSwitchingSegments(selection: $section, options: Section.allCases,
+                               identifier: "downloads.section", reservesPageEdges: false,
+                               leftEdge: false, rightEdge: false, centerSwipe: false)
+        .navigationDestination(isPresented: $showSettings) { OfflineDownloadSettingsView() }
+        .ordinaryAppearance()
+    }
+}
+
+/// Queue content shares the management page chrome with the capacity pane.
+private struct OfflineDownloadTaskContent: View {
     private enum TaskAction {
         case download, pause, resume, retry
 
@@ -41,19 +90,13 @@ struct OfflineDownloadTasksView: View {
         }
     }
 
-    private var queueAction: (symbol: String, title: String) {
-        if library.canPauseWork { ("pause", "暂停下载") }
-        else if library.pausedByUser || library.pausedTaskID != nil { ("play", "继续下载") }
-        else { ("arrow.clockwise", "同步收藏") }
-    }
-
     private var checkingQueue: Bool { ownsQueue && library.busy && library.currentID == nil }
 
     private var emptyState: (title: String, symbol: String?) {
         if !session.hasCollectionAccess { return ("启用账号收藏后可同步下载", "person") }
         if !ownsQueue || library.loading { return ("正在读取下载任务…", nil) }
         if checkingQueue { return (library.status, nil) }
-        if let notice = library.queueNotice, library.networkWaitNotice == nil { return (notice, "exclamationmark.circle") }
+        if library.queueNotice != nil, library.networkWaitNotice == nil { return ("", "exclamationmark.circle") }
         if library.pausedByUser { return ("下载已暂停", "pause") }
         return ("暂无下载任务", "arrow.down.to.line")
     }
@@ -63,40 +106,42 @@ struct OfflineDownloadTasksView: View {
         let front = tasks.first { $0.id == (library.currentID ?? library.pausedTaskID) }
         let networkNotice = ownsQueue && !library.loading && session.hasCollectionAccess && !library.busy
             ? library.networkWaitNotice : nil
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: FloatingPageChrome.spacing) {
-                if tasks.isEmpty {
-                    let state = emptyState
-                    queueStatus(state.title, symbol: state.symbol, detail: networkNotice)
-                } else {
-                    if let networkNotice {
-                        queueStatus(networkNotice, symbol: "wifi")
-                    } else if checkingQueue {
-                        queueStatus(library.status, symbol: nil)
-                    } else if session.hasCollectionAccess && !library.busy, let notice = library.queueNotice {
-                        queueStatus(notice, symbol: "exclamationmark.circle")
+        Group {
+            if tasks.isEmpty && (!ownsQueue || library.loading) && session.hasCollectionAccess {
+                ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .accessibilityLabel("正在读取下载任务")
+            } else if tasks.isEmpty && ownsQueue && !library.loading && !checkingQueue
+                        && library.queueNotice == nil && networkNotice == nil && !library.pausedByUser {
+                VStack(spacing: FloatingPageChrome.spacing) {
+                    FloatingPageIcon(symbol: "arrow.down.to.line").foregroundStyle(.secondary)
+                    Text("暂无下载任务").font(AppTypography.rowTitle)
+                    Text("收藏作品后自动下载").font(AppTypography.supportingText).foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .accessibilityIdentifier("downloads.empty")
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: FloatingPageChrome.spacing) {
+                        if tasks.isEmpty {
+                            let state = emptyState
+                            queueStatus(state.title, symbol: state.symbol, detail: networkNotice)
+                        } else {
+                            if let networkNotice {
+                                queueStatus(networkNotice, symbol: "wifi")
+                            } else if checkingQueue {
+                                queueStatus(library.status, symbol: nil)
+                            }
+                            if let front { taskRow(front) }
+                            ForEach(tasks.filter { $0.id != front?.id }, content: taskRow)
+                        }
                     }
-                    if let front { taskRow(front) }
-                    ForEach(tasks.filter { $0.id != front?.id }, content: taskRow)
+                    .pageScrollContentInsets()
                 }
             }
-            .pageScrollContentInsets()
         }
-        .floatingTitleBar("下载管理") {
-            if front == nil || (library.busy && library.currentID == nil) {
-                Button {
-                    if library.canPauseWork { library.pauseDownloads() }
-                    else { library.resumeAll(session: session) }
-                } label: {
-                    FloatingPageIcon(symbol: queueAction.symbol)
-                }
-                .buttonStyle(FloatingPageButtonStyle(iconOnly: true))
-                .disabled(!ownsQueue || !session.hasCollectionAccess || (library.busy && !library.canPauseWork))
-                .accessibilityLabel(queueAction.title)
-                .accessibilityIdentifier("downloads.queue-action")
-            }
-        }
-        .ordinaryAppearance()
+        .existingFeedbackToast(ownsQueue && session.hasCollectionAccess && !library.loading && !checkingQueue
+                               && library.networkWaitNotice == nil && (tasks.isEmpty || !library.busy) ? library.queueNotice : nil,
+                               scope: library.bindingID)
     }
 
     @ViewBuilder private func queueStatus(_ title: String, symbol: String?, detail: String? = nil) -> some View {
@@ -123,7 +168,7 @@ struct OfflineDownloadTasksView: View {
         let enabled = active ? library.canPauseWork : (!library.busy && session.hasCollectionAccess)
 
         return VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 10) {
+            HStack(spacing: FloatingPageChrome.spacing) {
                 Image(systemName: record.video ? "play.rectangle" : "photo")
                     .font(.subheadline).foregroundStyle(.secondary).frame(width: 24)
                     .accessibilityHidden(true)
@@ -151,11 +196,7 @@ struct OfflineDownloadTasksView: View {
             }
             if active {
                 HStack(spacing: 8) {
-                    ProgressView(value: progress)
-                        .progressViewStyle(.linear)
-                        .tint(.blue)
-                        .scaleEffect(x: 1, y: 0.55, anchor: .center)
-                        .accessibilityLabel("下载进度")
+                    DownloadTaskProgress(value: progress)
                         .accessibilityIdentifier("downloads.progress.\(record.id)")
                     if let progress {
                         Text(progress, format: .percent.precision(.fractionLength(0))).accessibilityHidden(true)
@@ -169,5 +210,33 @@ struct OfflineDownloadTasksView: View {
         .padding(.horizontal, FloatingPageChrome.cardInset)
         .padding(.vertical, FloatingPageChrome.groupInset)
         .background(AppTheme.secondarySurface, in: FloatingPageChrome.controlShape)
+    }
+}
+
+
+/// Explicit track geometry; an unknown total stays indeterminate.
+private struct DownloadTaskProgress: View {
+    let value: Double?
+    var body: some View {
+        Group {
+            if let value, value.isFinite {
+                let fraction = min(1, max(0, value))
+                GeometryReader { geometry in
+                    Capsule().fill(Color.primary.opacity(0.12))
+                        .overlay(alignment: .leading) {
+                            Capsule().fill(Color.accentColor)
+                                .frame(width: geometry.size.width * fraction)
+                        }
+                }
+                .frame(height: ContentMetrics.Media.trackHeight)
+                .accessibilityElement(children: .ignore)
+                .accessibilityValue(fraction.formatted(.percent.precision(.fractionLength(0))))
+            } else {
+                ProgressView().controlSize(.mini)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityValue("总大小未知")
+            }
+        }
+        .accessibilityLabel("下载进度")
     }
 }

@@ -1,0 +1,85 @@
+{
+  "schemaVersion": 1,
+  "application": "CivitViewer",
+  "status": "proposal-not-runtime-source",
+  "units": {
+    "geometry": "pt",
+    "motion": "ms"
+  },
+  "roles": {
+    "spacing": {
+      "sameRowGap": 4,
+      "pageInset": 16,
+      "cardInset": 12,
+      "sectionGap": 8
+    },
+    "control": {
+      "standardTargetHeight": 44,
+      "compactSearchRowHeight": 32,
+      "iconGlyph": 16,
+      "outerRadius": 8,
+      "innerRadius": 4,
+      "outerVisibleHeight": 36,
+      "nestedVisibleHeight": 28,
+      "nestedVisibleHeightFormula": "outerVisibleHeight - 2 * sameRowGap"
+    },
+    "preview": {
+      "width": 60,
+      "height": 80
+    },
+    "ordinal": {
+      "reservedDigits": 4,
+      "zeroPadding": false,
+      "alignment": "center",
+      "radius": 4
+    },
+    "typography": {
+      "control": "footnote.medium",
+      "row": "subheadline",
+      "supporting": "caption",
+      "tab": "caption2",
+      "overflow": "tail-truncate",
+      "scaleTextToFit": false
+    },
+    "motion": {
+      "headerResize": 180,
+      "headerContentReplace": 140,
+      "appearanceBlend": 300,
+      "bodySettleReference": 260,
+      "reduceMotion": "skip-displacement-preserve-outcomes"
+    },
+    "safeArea": {
+      "source": "owning-window-and-local-view",
+      "doubleApply": false
+    },
+    "tag": {
+      "targetHeight": 32,
+      "minimumVisibleHeight": 26,
+      "accessibilityTargetHeight": 44,
+      "horizontalInset": 8,
+      "verticalInset": 4,
+      "gap": 4,
+      "textStyle": "caption",
+      "lineLimit": 2,
+      "removableLineLimit": 1,
+      "overflow": "tail-truncate"
+    }
+  },
+  "exceptions": [
+    {
+      "role": "search.compactRow",
+      "regularHeight": 32,
+      "accessibilityHeight": 44
+    },
+    {
+      "role": "tag.target",
+      "regularHeight": 32,
+      "minimumVisibleHeight": 26,
+      "accessibilityHeight": 44
+    }
+  ],
+  "productionSources": [
+    "CivitViewer/AppTheme.swift",
+    "CivitViewer/HeaderHandoff.swift"
+  ]
+}

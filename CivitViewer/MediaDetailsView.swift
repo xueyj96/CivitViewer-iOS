@@ -9,8 +9,7 @@ struct MediaDetailsView: View {
     @Environment(\.dynamicTypeSize) private var typeSize
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.ordinaryColorScheme) private var ordinaryScheme
-    @State private var contentRevealed = false
-    @State private var bottomTone = PageToneTransition(source: .black)
+    @Environment(\.floatingPageSafeInsets) private var floatingPageSafeInsets
     @Environment(\.mediaTabs) private var tabs
     @ObservedObject private var blocklist = TagBlocklist.shared
     @ObservedObject private var authorBlocklist = AuthorBlocklist.shared
@@ -20,6 +19,7 @@ struct MediaDetailsView: View {
     @State private var searchTask: Task<Void, Never>?
     @State private var searchDraft: MediaSearchCriteria?
     @State private var error: String?
+    @State private var errorEvent = 0
     @State private var authorBlockError: String?
     @State private var authorBlockWorking = false
     @State private var authorBlockTask: Task<Void, Never>?
@@ -27,6 +27,7 @@ struct MediaDetailsView: View {
     @State private var displayedItemID: Int
     @State private var imageFailure: String?
     @State private var posterRetry = 0
+    @State private var searchBarHeight: CGFloat = 0
     @State private var authorRetry = 0
     @State private var resolvedDuration: (workID: Int, identity: String, seconds: Double)?
     @State private var resolvedAuthor: (request: AuthorRequest, creator: Creator)?
@@ -84,36 +85,38 @@ struct MediaDetailsView: View {
                                                     retry: { posterRetry += 1 })
                                 .frame(maxWidth: .infinity)
                         }
-                        if let authorBlockError {
-                            Text(authorBlockError).font(.caption).foregroundStyle(.red)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
                     }
                     .padding(FloatingPageChrome.cardInset)
                     .background(cardSurface)
                     .accessibilityElement(children: .contain)
                     .accessibilityIdentifier("details.work-card")
 
-                    if !eligibleTags.isEmpty { tagsCard }
-                    if let error { Text(error).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
+                    if !eligibleTags.isEmpty {
+                        tagsCard.transition(.modifier(active: DetailsTagsReveal(progress: 0),
+                                                       identity: DetailsTagsReveal(progress: 1)))
+                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, FloatingPageChrome.pageInset)
                 .padding(.bottom, 16)
             }
-                .opacity(contentRevealed || reduceMotion || onClose == nil ? 1 : 0.68)
-                .task {
-                    guard onClose != nil, !reduceMotion else { return }
-                    withAnimation(.easeOut(duration: 0.16)) { contentRevealed = true }
-                }
-                .overlay {
-                    if onClose != nil, ordinaryScheme == .light { PageToneBlend(source: .black) }
-                }
+                .floatingScrollCanvas(additionalBottom: selected.isEmpty ? 0 : searchBarHeight)
                 .disabled(preparingSearch)
-                .safeAreaInset(edge: .bottom, spacing: 0) {
-                    if !selected.isEmpty { searchBar }
+                .existingFeedbackToast(error, id: errorEvent, scope: session.feedIdentity)
+                .existingFeedbackToast(authorBlockError, scope: session.feedIdentity)
+                .overlay(alignment: .bottom) {
+                    if !selected.isEmpty {
+                        searchBar
+                            .background {
+                                GeometryReader { geometry in
+                                    Color.clear.onChange(of: geometry.size.height, initial: true) { _, height in
+                                        searchBarHeight = height
+                                    }
+                                }
+                            }
+                            .padding(.bottom, floatingPageSafeInsets.bottom + tabBarHeight)
+                    }
                 }
-                .avoidOverlaidTabBar()
                 .floatingTitleBar("作品详情", leading: {
                     Button { closeDetails() } label: { FloatingPageIcon(symbol: "chevron.left") }
                         .buttonStyle(FloatingPageButtonStyle(iconOnly: true))
@@ -122,6 +125,11 @@ struct MediaDetailsView: View {
                 }) {
                     authorActions.disabled(preparingSearch)
                 }
+                .pageReturnAction(enabled: onClose != nil && !preparingSearch) {
+                    guard !preparingSearch, onClose != nil else { return false }
+                    closeDetails()
+                    return true
+                }
                 .navigationDestination(item: $searchDraft) { SearchView(initialCriteria: $0, showsBack: true) }
                 .task(id: tagRequest) { [tagRequest] in await refreshTags(for: tagRequest) }
                 .task(id: authorRequest) { await loadAuthor(authorRequest) }
@@ -129,12 +137,12 @@ struct MediaDetailsView: View {
         }
         .environment(\.overlaidTabBarHeight, tabBarHeight)
         .environment(\.exitMediaCoverToTab, onClose.map { _ in { exit in closeDetails(.tab(exit)) } })
+        .ordinaryPresentationAppearance()
         .overlay(alignment: .bottom) {
             if let tabs, onClose != nil {
-                tabs.render(false, "details.tabs", nil, ordinaryScheme == .light ? bottomTone : nil, requestTab)
+                tabs.render(false, "details.tabs", nil, nil, requestTab)
             }
         }
-        .ordinaryPresentationAppearance()
             .onAppear { notePosterRoute() }
             .onChange(of: session.feedIdentity) { _, _ in
                 searchTask?.cancel(); authorBlockTask?.cancel(); authorBlockRequestID = nil; authorBlockWorking = false
@@ -246,7 +254,7 @@ struct MediaDetailsView: View {
     }
 
     @ViewBuilder private var authorFollowAction: some View {
-        if item.offlineMediaURL == nil {
+        if !item.isStandaloneOfflineCopy {
             if let author {
                 FollowButton(creator: author, onSignIn: onClose.map { _ in
                     { closeDetails(.signIn) }
@@ -263,11 +271,10 @@ struct MediaDetailsView: View {
     }
 
     private var authorActions: some View {
-        Menu {
-            if let blocked = blockedAuthorForItem {
-                Button("取消本机屏蔽", role: .destructive) {
-                    authorBlocklist.remove(id: blocked.id); authorBlockError = nil
-                }
+        AppMenu {
+            if blockedAuthorForItem != nil {
+                Button("已屏蔽此作者", systemImage: "person.crop.circle.badge.xmark") {}
+                    .disabled(true)
             } else if item.username != nil {
                 Button(authorBlockWorking ? "正在核验…" : "屏蔽此作者", systemImage: "person.crop.circle.badge.xmark") {
                     guard !authorBlockWorking else { return }
@@ -289,7 +296,7 @@ struct MediaDetailsView: View {
     }
 
     private var tagsCard: some View {
-        TagPillLayout(spacing: FloatingPageChrome.groupInset, rowSpacing: 2) {
+        TagPillLayout() {
             ForEach(eligibleTags, id: \.self) { tag in tagButton(tag) }
         }
         .padding(FloatingPageChrome.cardInset)
@@ -322,7 +329,7 @@ struct MediaDetailsView: View {
     }
 
     private func loadAuthor(_ request: AuthorRequest) async {
-        guard item.offlineMediaURL == nil, item.attributedCreator == nil,
+        guard !item.isStandaloneOfflineCopy, item.attributedCreator == nil,
               let username = item.username else { return }
         do {
             let creator = try await session.creator(username: username)
@@ -358,8 +365,8 @@ struct MediaDetailsView: View {
             }
             if imageFailure != nil { Image(systemName: "photo").foregroundStyle(.secondary) }
         }
-        .frame(width: 76, height: 76)
-        .clipShape(FloatingPageChrome.surfaceShape(nested: true))
+        .frame(width: ContentMetrics.Preview.width, height: ContentMetrics.Preview.height)
+        .clipShape(FloatingPageChrome.controlShape)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(item.isVideo ? "视频封面" : "作品预览")
         .accessibilityIdentifier("details.preview")
@@ -446,26 +453,26 @@ struct MediaDetailsView: View {
     private func tagButton(_ tag: String) -> some View {
         let chosen = selected.contains(tag)
         let blocked = blocklist.names.contains(tag)
-        return Button {
+        return AppContextButton {
             guard !preparingSearch else { return }
             if selected.contains(tag) { selected.remove(tag); error = nil }
             else if selected.count < 8 { selected.insert(tag); error = nil }
-            else { error = "最多组合 8 个标签，可先取消已有选择。" }
+            else { errorEvent += 1; error = "最多组合 8 个标签，可先取消已有选择。" }
         } label: {
-            WorkTagLabel(title: tag, selected: chosen, blocked: blocked, compact: true)
-        }.buttonStyle(.plain).accessibilityIdentifier("details.tag.\(tag)")
-            .accessibilityLabel(tag).accessibilityValue(chosen ? "已选入组合搜索" : "未选择")
-            .contextMenu {
-                Button(blocked ? "撤销屏蔽" : "屏蔽此标签", systemImage: blocked ? "tag" : "tag.slash") {
-                    guard !preparingSearch else { return }
-                    if blocked { blocklist.remove(tag); error = nil }
-                    else if !blocklist.add(tag) { error = "无法加入屏蔽列表：最多 100 个标签，每个最多 80 字。" }
-                }.disabled(preparingSearch)
-                Button("仅用此标签组合搜索", systemImage: "magnifyingglass") {
-                    guard !preparingSearch else { return }
-                    selected = [tag]; searchTask?.cancel(); searchTask = Task { await prepareSearch() }
-                }.disabled(preparingSearch)
-            }
+            WorkTagLabel(title: tag, selected: chosen, blocked: blocked)
+        } menu: {
+            Button(blocked ? "撤销屏蔽" : "屏蔽此标签", systemImage: blocked ? "tag" : "tag.slash") {
+                guard !preparingSearch else { return }
+                if blocked { blocklist.remove(tag); error = nil }
+                else if !blocklist.add(tag) { errorEvent += 1; error = "无法加入屏蔽列表：最多 100 个标签，每个最多 80 字。" }
+            }.disabled(preparingSearch)
+            Button("仅用此标签组合搜索", systemImage: "magnifyingglass") {
+                guard !preparingSearch else { return }
+                selected = [tag]; searchTask?.cancel(); searchTask = Task { await prepareSearch() }
+            }.disabled(preparingSearch)
+        }
+        .buttonStyle(.plain).accessibilityIdentifier("details.tag.\(tag)")
+        .accessibilityLabel(tag).accessibilityValue(chosen ? "已选入组合搜索" : "未选择")
     }
     private func prepareSearch() async {
         guard !Task.isCancelled, !preparingSearch, !selected.isEmpty else { return }
@@ -496,14 +503,16 @@ struct MediaDetailsView: View {
         guard !Task.isCancelled, request == tagRequest else { return }
 
         let names = (value?.tagNames ?? []).filter { TagDirectoryQuality.includes($0) }.sorted()
-        resolvedTags = (request, names, Self.ids(value?.tags))
-        selected.formIntersection(names)
+        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.26)) {
+            resolvedTags = (request, names, Self.ids(value?.tags))
+            selected.formIntersection(names)
+        }
     }
 }
 
 struct TagPillLayout: Layout {
-    var spacing: CGFloat = 8
-    var rowSpacing: CGFloat? = nil
+    var spacing: CGFloat = ContentMetrics.Tag.gap
+    var rowSpacing: CGFloat = ContentMetrics.Tag.gap
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
         let width = proposal.width.flatMap { $0.isFinite ? $0 : nil } ?? 320
         return CGSize(width: width, height: arrangement(width: width, subviews: subviews).height)
@@ -520,7 +529,7 @@ struct TagPillLayout: Layout {
         for view in subviews {
             let ideal = view.sizeThatFits(.unspecified)
             let size = view.sizeThatFits(ProposedViewSize(width: min(width, ideal.width), height: nil))
-            if x > 0 && x + size.width > width { x = 0; y += rowHeight + (rowSpacing ?? spacing); rowHeight = 0 }
+            if x > 0 && x + size.width > width { x = 0; y += rowHeight + rowSpacing; rowHeight = 0 }
             frames.append(CGRect(origin: CGPoint(x: x, y: y), size: size))
             x += size.width + spacing; rowHeight = max(rowHeight, size.height)
         }
@@ -546,13 +555,14 @@ struct CreatorBiographyView: View {
             if loading { ProgressView("读取简介…").font(.caption) }
             else if error != nil || value == nil {
                 HStack(spacing: 8) {
-                    Text(error ?? "简介尚未取得").font(.caption).foregroundStyle(.secondary)
+                    if error == nil { Text("简介尚未取得").font(.caption).foregroundStyle(.secondary) }
                     StatusReloadButton(title: error == nil ? "读取简介" : "重试简介") { Task { await load() } }
                 }
             }
             else if value?.blockedByThem == true { Text("作者简介当前不可见").font(.caption).foregroundStyle(.secondary) }
             else { CreatorBiographyContent(text: text, collapsedLines: collapsedLines, onCollapse: onCollapse) }
         }.frame(maxWidth: .infinity, alignment: .leading)
+            .existingFeedbackToast(error, scope: session.feedIdentity)
             .task(id: session.feedIdentity) { if loadedIdentity != session.feedIdentity { await load() } }
     }
     private func load() async {
@@ -698,5 +708,28 @@ private struct BiographyHeightKey: PreferenceKey {
     static var defaultValue: [String: CGFloat] = [:]
     static func reduce(value: inout [String: CGFloat], nextValue: () -> [String: CGFloat]) {
         value.merge(nextValue(), uniquingKeysWith: { _, latest in latest })
+    }
+}
+
+/// Reveal the full tag card from its fixed top edge, including its padding.
+/// The content keeps its natural layout; only the allocated height expands.
+private struct DetailsTagsReveal: AnimatableModifier {
+    var progress: CGFloat
+    var animatableData: CGFloat { get { progress } set { progress = newValue } }
+    func body(content: Content) -> some View {
+        DetailsTagsRevealLayout(progress: progress) { content }.clipped()
+            .allowsHitTesting(progress >= 0.999).accessibilityHidden(progress < 0.999)
+    }
+}
+private struct DetailsTagsRevealLayout: Layout {
+    var progress: CGFloat
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard let content = subviews.first else { return .zero }
+        let size = content.sizeThatFits(.init(width: proposal.width, height: nil))
+        return .init(width: size.width, height: size.height * min(1, max(0, progress)))
+    }
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        subviews.first?.place(at: bounds.origin, anchor: .topLeading,
+                             proposal: .init(width: bounds.width, height: nil))
     }
 }

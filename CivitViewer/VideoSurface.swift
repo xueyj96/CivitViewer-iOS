@@ -120,8 +120,7 @@ struct VideoProgressChrome: View {
                 Text(Self.clock(position))
                     .font(.system(size: 12, weight: .semibold).monospacedDigit())
                     .foregroundStyle(.white)
-                    .padding(.horizontal, 9).padding(.vertical, 4)
-                    .background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 6))
+                    .modifier(MediaHUDSurface())
                     .offset(y: -10)
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
@@ -179,6 +178,10 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
     var onChromeHold: (() -> Void)? = nil
     var pausedForOverlay = false
     var retainDuringInterruption = false
+    var playbackOwner: UUID? = nil
+    var playbackScope: String? = nil
+    var playbackRootSlot: UUID? = nil
+    var preserveForPageCover = false
     var mediaBlurred = false
     var onEdgeSwipe: MediaEdgeSwipeAction? = nil
     var onEdgeDrag: MediaEdgeDragAction? = nil
@@ -200,7 +203,14 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.playbackControlsBottomInset) private var bottomBarHeight
     @Environment(\.verticalSizeClass) private var verticalSizeClass
-    @State private var player: AVPlayer?
+    @State private var playbackEntry: VideoPlaybackSessions.Entry?
+    @State private var observersAttached = false
+    @State private var boundInputURL: URL?
+    @State private var standalonePlaybackOwner = UUID()
+    private var player: AVPlayer? {
+        guard let entry = playbackEntry, entry.valid, entry.player.currentItem === entry.item else { return nil }
+        return entry.player
+    }
     @State private var actualSourceURL: URL?
     @State private var preloadDemandOwner = UUID()
     #if DEBUG
@@ -216,6 +226,7 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
     @State private var posterRetry = 0
     @State private var availablePosterSource: URL?
     @State private var delayedPoster: FirstFrameWait?
+    @State private var preservesPreparedCover = false
     @State private var posterNeedsFrame = false
     @State private var posterCaptureTried = false
     @State private var posterVideoOutput: AVPlayerItemVideoOutput?
@@ -237,7 +248,6 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
             !qaPreparationCancelled && active
     }
     #endif
-    @State private var repairedPinnedURL: URL?
     @State private var repairPlayingRecorded = false
     @State private var repairFirstPosition: Double?
     private struct CompatibilityRequest: Identifiable {
@@ -252,6 +262,8 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
     @State private var qaPlayerID: UUID?
     @State private var qaPrepareCount = 0
     @State private var qaCreationCount = 0
+    @State private var qaFirstFrameMS: Int?
+
     @State private var qaTapCount = 0
     @State private var qaRateHoldCount = 0
     @State private var qaSeekStartCount = 0
@@ -265,13 +277,31 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
     @State private var currentTime = 0.0
     @State private var duration = 0.0
     @State private var bufferedRanges: [SeekTimeRange] = []
-    @State private var statusObserver: NSKeyValueObservation?
-    @State private var playbackObserver: NSKeyValueObservation?
-    @State private var bufferObserver: NSKeyValueObservation?
-    @State private var durationObserver: NSKeyValueObservation?
-    @State private var seekableObserver: NSKeyValueObservation?
+    private var statusObserver: NSKeyValueObservation? {
+        get { playbackEntry?.statusObserver }
+        nonmutating set { playbackEntry?.statusObserver = newValue }
+    }
+    private var playbackObserver: NSKeyValueObservation? {
+        get { playbackEntry?.playbackObserver }
+        nonmutating set { playbackEntry?.playbackObserver = newValue }
+    }
+    private var bufferObserver: NSKeyValueObservation? {
+        get { playbackEntry?.bufferObserver }
+        nonmutating set { playbackEntry?.bufferObserver = newValue }
+    }
+    private var durationObserver: NSKeyValueObservation? {
+        get { playbackEntry?.durationObserver }
+        nonmutating set { playbackEntry?.durationObserver = newValue }
+    }
+    private var seekableObserver: NSKeyValueObservation? {
+        get { playbackEntry?.seekableObserver }
+        nonmutating set { playbackEntry?.seekableObserver = newValue }
+    }
     @State private var seekRanges: [SeekTimeRange] = []
-    @State private var timeObserver: Any?
+    private var timeObserver: Any? {
+        get { playbackEntry?.timeObserver }
+        nonmutating set { playbackEntry?.timeObserver = newValue }
+    }
     private struct PlayerEventToken: Equatable {
         let id = UUID()
         let item: ObjectIdentifier
@@ -285,7 +315,6 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
     @State private var holdingRate = false
     @State private var wasPlayingBeforeHold = false
     @State private var resolvedURL: URL?
-    @State private var pinnedURL: URL?
     @State private var recoveryAttempted = false
     @State private var recovering = false
     @State private var recoveryMessage = "视频暂时无法播放"
@@ -363,12 +392,16 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
     }
     private var posterPresentation: CachedPoster.Presentation {
         guard waitingForFirstFrame, !showsTransitionFrame else { return .hidden }
+        // A prepared page has no active player. Keep its cached cover or
+        // placeholder visible while it participates in a page transition.
+        if !active || preservesPreparedCover { return .preview }
         if !wantsPlayback { return .preview }
         if needsTransitionFallback { return .imageOnly }
         guard let firstFrameWait, delayedPoster == firstFrameWait else { return .hidden }
         return .imageOnly
     }
-    private var canScrub: Bool { active && itemReady && duration > 0 && !resumeInFlight && !playbackFailed && !seekRanges.isEmpty }
+    private var ownsPlaybackLease: Bool { playbackEntry.map(VideoPlaybackSessions.shared.isActive) == true }
+    private var canScrub: Bool { active && ownsPlaybackLease && itemReady && duration > 0 && !resumeInFlight && !playbackFailed && !seekRanges.isEmpty }
     private var loading: Bool {
         #if DEBUG && targetEnvironment(simulator)
         if PlaybackLayoutQA.enabled && PlaybackLayoutQA.variant != "live" { return PlaybackLayoutQA.variant == "buffering" }
@@ -442,7 +475,6 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
                 .accessibilityHidden(!active)
             if playbackFailed && !recovering && !repreparePending {
                 VStack(spacing: 12) {
-                    Text(recoveryMessage).foregroundStyle(.white)
                     Button("重试") { nativeRetrySuspended = false; repairAttempted = false; release(); prepare() }
                         .buttonStyle(AppActionButtonStyle(tone: .neutral))
                     if compatibilityAvailable {
@@ -452,16 +484,18 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
                     }
                 }
                 .font(.caption)
-                .padding()
-                .background(Color.black.opacity(0.76), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .padding(FloatingPageChrome.cardInset)
+                .frame(maxWidth: 260)
+                .modifier(MediaFeedbackSurface())
                 .viewingChromeHidden(chromeHidden)
+                .existingFeedbackToast(recoveryMessage, active: active && !chromeHidden)
             } else if active && !playbackFailed && !playing && !holdingRate && !currentVideoWaiting && seekTarget == nil {
                 Image(systemName: "play.fill").font(.title).foregroundStyle(.white)
                     .frame(width: 64, height: 64).background(.black.opacity(0.35), in: Circle())
                     .allowsHitTesting(false).accessibilityHidden(true).viewingChromeHidden(chromeHidden)
             }
             if holdingRate && seekTarget == nil {
-                VStack { Text("2× 播放").font(.headline).padding(12).background(.black.opacity(0.65), in: Capsule()).padding(.top, 120); Spacer() }.allowsHitTesting(false).viewingChromeHidden(chromeHidden)
+                VStack { Text("2× 播放").modifier(MediaHUDSurface()).padding(.top, 120); Spacer() }.allowsHitTesting(false).viewingChromeHidden(chromeHidden)
             }
             VStack(spacing: 0) {
                 caption().padding(.leading, PlaybackChrome.horizontalInset).padding(.trailing, 72)
@@ -535,7 +569,7 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
                     .padding(.top, 92)
             }
             if (CollectionPagingQA.enabled || PlaybackLayoutQA.enabled) && active {
-                let state = "player=\(qaPlayerID?.uuidString ?? "none");prepare=\(qaPrepareCount);created=\(qaCreationCount);position=\(String(format: "%.3f", currentTime));muted=\(player?.isMuted ?? muted);rate=\(player?.rate ?? 0);chrome=\(chromeHidden);toggles=\(chrome.qaToggleCount);taps=\(qaTapCount);rateHolds=\(qaRateHoldCount);seekStarts=\(qaSeekStartCount)"
+                let state = "player=\(qaPlayerID?.uuidString ?? "none");prepare=\(qaPrepareCount);created=\(qaCreationCount);position=\(String(format: "%.3f", currentTime));muted=\(player?.isMuted ?? muted);rate=\(player?.rate ?? 0);chrome=\(chromeHidden);toggles=\(chrome.qaToggleCount);taps=\(qaTapCount);rateHolds=\(qaRateHoldCount);seekStarts=\(qaSeekStartCount);poolCount=\(VideoPlaybackSessions.shared.entries.count);poolPlaying=\(VideoPlaybackSessions.shared.entries.filter { $0.player.rate != 0 }.count);firstFrameMS=\(qaFirstFrameMS.map(String.init) ?? "pending");candidate=\(VideoPlaybackSessions.shared.entries.first { $0.state == .candidate }.map { "\($0.key.workID):\($0.token.uuidString):\($0.prerollFinished)" } ?? "none")"
                 let seekState = ";intent=\(playing);inFlight=\(resumeInFlight);interactivePending=\(interactiveSeekID != nil);seekBase=\(seekingBase != nil);resumeApplied=\(resumeApplied);hasResume=\(requestedResume != nil);active=\(active);overlay=\(pausedForOverlay);ready=\(itemReady);failed=\(playbackFailed);gen=\(playbackGeneration);seekCallbacks=\(qaSeekEvents.callbacks);seekCommits=\(qaSeekEvents.commits);seekFinished=\(qaSeekEvents.lastFinished.map { String($0) } ?? "none");nativePosition=\(String(format: "%.3f", player?.currentTime().seconds ?? -1));timeStatus=\(player?.timeControlStatus.rawValue ?? -1)"
                 let nativeState = ";itemStatus=\(player?.currentItem?.status.rawValue ?? -1);itemErrorCode=\((player?.currentItem?.error as NSError?)?.code ?? 0);source=\(actualSourceKind.rawValue);posterMode=\(posterPresentation);coverReady=\(availablePosterSource == url);transitionFrame=\(showsTransitionFrame)"
                 Text(state + seekState + nativeState).font(.system(size: 1)).frame(width: 1, height: 1).opacity(0.01).allowsHitTesting(false)
@@ -551,15 +585,22 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
             delayedPoster = wait
         }
         .accessibilityAction(named: Text(playing ? "暂停视频" : "播放视频"), togglePlayback)
-        .onAppear { if active { prepare() } }
+        .onAppear {
+            preservesPreparedCover = !active
+            if active { prepare() }
+        }
         .onChange(of: active) { _, value in
             if value { prepare() }
             else {
+                // Activating a prepared page must not withdraw its existing
+                // cover before AVPlayerLayer has a drawable native frame.
+                preservesPreparedCover = true
                 if !retainDuringInterruption && resumePosition == nil { resumeCursor.reset(); userIntent.reset() }
                 release(interrupted: retainDuringInterruption)
             }
         }
         .onChange(of: url) { _, _ in
+            preservesPreparedCover = !active
             posterNeedsFrame = false
             nativeRetrySuspended = false; compatibilityPosition = nil; compatibilityAvailable = false
             repairedSource = nil; bypassRepaired = false; repairAttempted = false
@@ -572,9 +613,24 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
             updatePreloadDemand()
         }
         .onChange(of: preparingVideo) { _, _ in updatePreloadDemand() }
+        .onChange(of: waitingForData) { _, waiting in
+            guard active else { return }
+            updatePreloadDemand()
+            if waiting { VideoPlaybackSessions.shared.removeCandidates(owner: playbackOwner ?? standalonePlaybackOwner) }
+            else if readyForDisplay && itemReady { onDisplayReady?(true) }
+        }
+        .onChange(of: seekingBase) { _, base in
+            updatePreloadDemand()
+            if base != nil { VideoPlaybackSessions.shared.removeCandidates(owner: playbackOwner ?? standalonePlaybackOwner) }
+        }
+        .onChange(of: interactiveSeekID) { _, _ in updatePreloadDemand() }
+        .onChange(of: repairingVideo) { _, busy in
+            updatePreloadDemand()
+            if busy { VideoPlaybackSessions.shared.removeCandidates(owner: playbackOwner ?? standalonePlaybackOwner) }
+        }
         .onChange(of: muted) { _, value in player?.isMuted = value }
         .onChange(of: readyForDisplay) { _, value in
-            onDisplayReady?(value && itemReady && !awaitingResume)
+            publishDisplayReadiness()
             recordMeasuredFirstFrame()
             if value, let player, let item = player.currentItem { capturePosterFrame(player, item: item) }
         }
@@ -585,15 +641,18 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
             if item.status == .failed { handleFailure(item) }
             updateBuffer(item)
             if itemReady && !pausedForOverlay { applyResume(item) }
+            // Reattaching an already-ready paused layer may not emit another
+            // readiness edge. Publish its current identity-bound state now.
+            publishDisplayReadiness()
         }
         .onChange(of: playerReprepareEvent) { _, event in
-            guard active, currentItem(matching: event) != nil else { return }
+            guard active, ownsPlaybackLease, currentItem(matching: event) != nil else { return }
             playerReprepareEvent = nil
             retirePlayer(); prepare()
         }
         .onChange(of: playerSyncEvent) { _, event in
             guard currentItem(matching: event) != nil else { return }
-            syncPlayback(); onDisplayReady?(readyForDisplay && itemReady)
+            syncPlayback(); publishDisplayReadiness()
         }
         .onChange(of: duration) { _, _ in
             if itemReady, !pausedForOverlay, let item = player?.currentItem { applyResume(item) }
@@ -614,7 +673,7 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
             }
         }
         .onDisappear { release(interrupted: retainDuringInterruption) }
-        .mediaCover(item: $compatibilityRequest, onDismiss: {
+        .mediaCover(item: $compatibilityRequest, source: .playback, onDismiss: {
             onDisplayReady?(false)
         }) { request in
             CompatibilityVideoView(url: request.sourceURL, workID: request.workID, initialPosition: request.initialPosition,
@@ -628,15 +687,18 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
                 }, onFailure: { code in
                     let context = compatibilityDiagnostic(request, code: code)
                     LocalDiagnosticsStore.shared.note(area: .playback, code: .playbackFailed, count: 2, playback: context)
+                }, onClose: {
+                    guard compatibilityRequest?.id == request.id else { return }
+                    compatibilityRequest = nil
                 })
         }
         .onReceive(NotificationCenter.default.publisher(for: .AVPlayerItemDidPlayToEndTime)) { note in
-            guard let current = player?.currentItem, let ended = note.object as? AVPlayerItem, current === ended, active else { return }
+            guard let current = player?.currentItem, let ended = note.object as? AVPlayerItem, current === ended, active, ownsPlaybackLease else { return }
             onProgress?(0, duration, true)
             player?.seek(to: .zero); syncPlayback()
         }
         .onReceive(NotificationCenter.default.publisher(for: .AVPlayerItemFailedToPlayToEndTime)) { note in
-            guard let current = player?.currentItem, let failed = note.object as? AVPlayerItem, current === failed, active else { return }
+            guard let current = player?.currentItem, let failed = note.object as? AVPlayerItem, current === failed, active, ownsPlaybackLease else { return }
             handleFailure(failed, notificationError: note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? NSError)
         }
     }
@@ -650,31 +712,59 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
         #if DEBUG && targetEnvironment(simulator)
         qaPrepareCount += 1
         #endif
-        if player == nil {
+        if player == nil || !observersAttached {
+            let previousLayerReady = readyForDisplay && player != nil
+            #if DEBUG && targetEnvironment(simulator)
+            qaFirstFrameMS = nil
+            #endif
             #if DEBUG
             measuredStartupAt = ProcessInfo.processInfo.systemUptime; measuredFirstFrame = false
             #endif
-            playbackFailed = false; compatibilityAvailable = false; failureHandled = false; itemReady = false; readyForDisplay = false; waitingForData = true
+            playbackFailed = false; compatibilityAvailable = false; failureHandled = false; itemReady = false; readyForDisplay = previousLayerReady; waitingForData = true
             repairPlayingRecorded = false; repairFirstPosition = nil
             resumeApplied = false; resumeInFlight = false; onDisplayReady?(false)
             currentTime = 0; duration = 0; bufferedRanges = []; playing = userIntent.shouldPlay(autoplay: autoplay)
             let address = resolvedURL ?? url
-            MediaCache.shared.pin(address); pinnedURL = address
             if repairedSource == nil && !bypassRepaired { repairedSource = MediaRepair.shared.cached(address, offline: diagnosticOffline) }
-            let source = repairedSource?.url ?? (recoveryAttempted ? address : (MediaCache.shared.cached(address, video: true) ?? address))
-            if repairedSource != nil { MediaCache.shared.protectRepairFile(source); repairedPinnedURL = source }
+            let owner = playbackOwner ?? standalonePlaybackOwner
+            let scope = playbackScope ?? "standalone"
+            let retained = playbackEntry.flatMap { entry -> VideoPlaybackSessions.Entry? in
+                guard entry.valid, entry.key.owner == owner, entry.key.scope == scope,
+                      entry.key.workID == (diagnosticWorkID ?? 0), entry.key.requestedURL == address,
+                      entry.key == videoPlaybackKey(owner: owner, scope: scope, workID: diagnosticWorkID ?? 0,
+                                                    address: address, source: entry.key.sourceURL, rootSlot: playbackRootSlot) else { return nil }
+                return entry
+            }
+            let source = retained?.key.sourceURL ?? repairedSource?.url ??
+                (recoveryAttempted ? address : (MediaCache.shared.cached(address, video: true) ?? address))
             actualSourceURL = source
             actualSourceKind = diagnosticOffline && address.isFileURL && source.isFileURL &&
                 source.deletingLastPathComponent() == address.deletingLastPathComponent() ? .offline : (source != address && source.isFileURL ? .cache :
                 (source.isFileURL ? (diagnosticOffline ? .offline : .local) : .network)
             )
             updatePreloadDemand(waiting: true)
-            let item = AVPlayerItem(url: source); item.preferredForwardBufferDuration = 4
-            let value = AVPlayer(playerItem: item); value.automaticallyWaitsToMinimizeStalling = true
-            value.isMuted = muted; player = value
+            let key = videoPlaybackKey(owner: owner, scope: scope, workID: diagnosticWorkID ?? 0,
+                                       address: address, source: source, rootSlot: playbackRootSlot)
+            let existing = VideoPlaybackSessions.shared.lookup(key: key)
+            let repairPin = repairedSource == nil ? nil : source
+            guard let entry = VideoPlaybackSessions.shared.acquireCurrent(key: key, pin: {
+                MediaCache.shared.pin(address)
+                if let repairPin { MediaCache.shared.protectRepairFile(repairPin) }
+            }, unpin: {
+                MediaCache.shared.unpin(address)
+                if let repairPin { MediaCache.shared.unprotectRepairFile(repairPin) }
+            }) else { return }
+            playbackEntry = entry; observersAttached = true; boundInputURL = url
+            let item = entry.item, value = entry.player
+            value.isMuted = muted
+            let nativeTime = value.currentTime().seconds
+            if existing != nil, nativeTime.isFinite { currentTime = max(0, nativeTime) }
+            if retained != nil, let target = requestedResume,
+               nativeTime.isFinite, abs(target - nativeTime) < 0.1 { resumeApplied = true }
             posterCaptureTried = false; installPosterOutput()
             #if DEBUG && targetEnvironment(simulator)
-            qaPlayerID = UUID(); qaCreationCount += 1
+            qaPlayerID = entry.token
+            if existing == nil { qaCreationCount += 1 }
             #endif
             let observedGeneration = playbackGeneration
             statusObserver = item.observe(\.status, options: [.initial, .new]) { item, _ in
@@ -688,24 +778,24 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
             }
             playbackObserver = value.observe(\.timeControlStatus, options: [.initial, .new]) { value, _ in
                 Task { @MainActor in
-                    guard player === value else { return }
+                    guard player === value, observedGeneration == playbackGeneration else { return }
                     waitingForData = value.timeControlStatus == .waitingToPlayAtSpecifiedRate
                 }
             }
             bufferObserver = item.observe(\.loadedTimeRanges, options: [.initial, .new]) { item, _ in
                 Task { @MainActor in
-                    guard player?.currentItem === item else { return }
+                    guard player?.currentItem === item, observedGeneration == playbackGeneration else { return }
                     updateBuffer(item)
                 }
             }
             durationObserver = item.observe(\.duration, options: [.initial, .new]) { item, _ in
-                Task { @MainActor in guard player?.currentItem === item else { return }; updateBuffer(item) }
+                Task { @MainActor in guard player?.currentItem === item, observedGeneration == playbackGeneration else { return }; updateBuffer(item) }
             }
             seekableObserver = item.observe(\.seekableTimeRanges, options: [.initial, .new]) { item, _ in
-                Task { @MainActor in guard player?.currentItem === item else { return }; updateBuffer(item) }
+                Task { @MainActor in guard player?.currentItem === item, observedGeneration == playbackGeneration else { return }; updateBuffer(item) }
             }
             timeObserver = value.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: .main) { time in
-                guard player === value else { return }
+                guard player === value, observedGeneration == playbackGeneration else { return }
                 currentTime = time.seconds.isFinite ? max(0, time.seconds) : 0
                 updateBuffer(item)
             }
@@ -811,14 +901,26 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
         if let output = posterVideoOutput { posterOutputItem?.remove(output) }
         posterVideoOutput = nil; posterOutputItem = nil
     }
+    private func publishDisplayReadiness() {
+        updatePreloadDemand()
+        let ready = active && ownsPlaybackLease && readyForDisplay && itemReady && !awaitingResume
+        #if DEBUG && targetEnvironment(simulator)
+        if ready, qaFirstFrameMS == nil, let measuredStartupAt {
+            qaFirstFrameMS = Int(max(0, ProcessInfo.processInfo.systemUptime - measuredStartupAt) * 1000)
+        }
+        #endif
+        onDisplayReady?(ready)
+    }
+
     private func syncPlayback() {
+        updatePreloadDemand()
         let awaitingResume = requestedResume != nil && !resumeApplied
-        if active && !pausedForOverlay && !resumeInFlight && !awaitingResume && seekingBase == nil && (playing || holdingRate) {
+        if active && scenePhase == .active && ownsPlaybackLease && !pausedForOverlay && !resumeInFlight && !awaitingResume && seekingBase == nil && (playing || holdingRate) {
             player?.rate = holdingRate ? 2 : 1
         } else { captureProgress(flush: true); player?.pause() }
     }
     private func applyResume(_ item: AVPlayerItem) {
-        guard !resumeApplied, let value = player, value.currentItem === item else { return }
+        guard active, ownsPlaybackLease, !resumeApplied, let value = player, value.currentItem === item else { return }
         // A ready item can publish its finite duration later. Keep the seed
         // pending until that value is known instead of silently dropping it.
         if PlaybackResumePolicy.waitsForDuration(position: requestedResume, duration: duration) { return }
@@ -830,7 +932,7 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
         let generation = playbackGeneration
         value.seek(to: CMTime(seconds: target, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { finished in
             Task { @MainActor in
-                guard player === value, value.currentItem === item, generation == playbackGeneration else { return }
+                guard player === value, value.currentItem === item, generation == playbackGeneration, ownsPlaybackLease else { return }
                 #if DEBUG && targetEnvironment(simulator)
                 if ProcessInfo.processInfo.arguments.contains("--qa-history-screen") {
                     HistoryQA.seekReadback(requested: target, actual: value.currentTime().seconds, finished: finished)
@@ -864,7 +966,7 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
         }
     }
     private func observePlaybackProgress() {
-        guard active, let value = player, let item = value.currentItem else { return }
+        guard active, ownsPlaybackLease, let value = player, let item = value.currentItem else { return }
         capturePosterFrame(value, item: item)
         guard itemReady, !resumeInFlight, !pausedForOverlay, !playbackFailed else { return }
         onProgress?(min(currentTime, duration), duration, false)
@@ -879,14 +981,26 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
         if readyForDisplay && (repairFirstPosition == nil || currentTime < (repairFirstPosition ?? 0)) { repairFirstPosition = currentTime }
     }
     private func release(interrupted: Bool = false) {
+        let expectedOwner = playbackOwner ?? standalonePlaybackOwner
+        let expectedScope = playbackScope ?? "standalone"
+        let matchingEntry = playbackEntry.map { entry in
+            entry.key.owner == expectedOwner && entry.key.scope == expectedScope &&
+            entry.key.workID == (diagnosticWorkID ?? 0) && boundInputURL == url &&
+            entry.key == videoPlaybackKey(owner: expectedOwner, scope: expectedScope, workID: diagnosticWorkID ?? 0,
+                                          address: resolvedURL ?? url, source: entry.key.sourceURL, rootSlot: playbackRootSlot)
+        } == true
+        let preserve = matchingEntry && (preserveForPageCover || playbackEntry?.state == .rootPaused) && scenePhase == .active && !playbackFailed && !recovering &&
+            repairStage == nil && !resumeInFlight && interactiveSeekID == nil &&
+            playbackEntry?.valid == true && player?.currentItem?.status == .readyToPlay
         recoveryTask?.cancel(); recoveryTask = nil; playbackGeneration += 1
-        recoveryAttempted = false; recovering = false; resolvedURL = nil
+        recoveryAttempted = false; recovering = false
+        if !preserve { resolvedURL = nil }
         repairStage = nil; repairProgress = nil
         repairAttempted = false
-        retirePlayer(interrupted: interrupted)
+        retirePlayer(interrupted: interrupted, preserveSession: preserve)
         recoveryPosition = nil
     }
-    private func retirePlayer(interrupted: Bool = false) {
+    private func retirePlayer(interrupted: Bool = false, preserveSession: Bool = false) {
         MediaCache.shared.removeForegroundVideoDemand(owner: preloadDemandOwner)
         stopPosterCapture()
         interactiveSeekID = nil
@@ -896,17 +1010,31 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
         captureProgress(flush: true); onDisplayReady?(false)
         statusObserver = nil; playbackObserver = nil; bufferObserver = nil; durationObserver = nil; seekableObserver = nil
         if let timeObserver { player?.removeTimeObserver(timeObserver) }; timeObserver = nil
-        player?.pause(); player?.replaceCurrentItem(with: nil); player = nil
+        if let entry = playbackEntry {
+            if preserveSession {
+                if entry.state == .rootPaused { VideoPlaybackSessions.shared.retainRootPaused(entry) }
+                else { VideoPlaybackSessions.shared.retainCovered(entry) }
+            }
+            else { VideoPlaybackSessions.shared.release(entry); playbackEntry = nil; boundInputURL = nil }
+        }
+        observersAttached = false
+        playerStatusEvent = nil; playerSyncEvent = nil; playerReprepareEvent = nil
+        if preserveSession {
+            holdingRate = false; seekingBase = nil; seekTarget = nil
+            return
+        }
         actualSourceURL = nil
         playing = false; itemReady = false; readyForDisplay = false; waitingForData = true
         resumeApplied = false; resumeInFlight = false
         currentTime = 0; duration = 0; bufferedRanges = []
         seekRanges = []
         holdingRate = false; seekingBase = nil; seekTarget = nil
-        if let pinnedURL { MediaCache.shared.unpin(pinnedURL) }; pinnedURL = nil
-        if let repairedPinnedURL { MediaCache.shared.unprotectRepairFile(repairedPinnedURL) }; repairedPinnedURL = nil
     }
     private func updatePreloadDemand(waiting: Bool? = nil) {
+        if let entry = playbackEntry {
+            VideoPlaybackSessions.shared.setForegroundBusy(entry,
+                preparingVideo || resumeInFlight || seekingBase != nil || interactiveSeekID != nil || repairingVideo || holdingRate)
+        }
         guard active, scenePhase == .active, let source = actualSourceURL, !source.isFileURL else {
             MediaCache.shared.removeForegroundVideoDemand(owner: preloadDemandOwner); return
         }
@@ -926,7 +1054,7 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
         #endif
     }
     private func handleFailure(_ item: AVPlayerItem, notificationError: NSError? = nil) {
-        guard active, !pausedForOverlay, player?.currentItem === item, !failureHandled else { return }
+        guard active, ownsPlaybackLease, !pausedForOverlay, player?.currentItem === item, !failureHandled else { return }
         failureHandled = true; playbackFailed = true; playing = false
         let generation = playbackGeneration
         let address = resolvedURL ?? url
@@ -952,17 +1080,18 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
         if decision == .skip { confirmUnavailable(); return }
         recovering = true; recoveryMessage = recoveryAttempted ? "正在确认播放状态…" : "正在更新播放地址并重试…"
         recoveryTask = Task {
+            guard !Task.isCancelled, active, ownsPlaybackLease, generation == playbackGeneration else { return }
             defer { if generation == playbackGeneration { recovering = false; repairStage = nil; repairProgress = nil; recoveryTask = nil } }
             if onImageContent != nil && (initial == .unknown || initial == .decoderMissing) {
                 // Some site "video" records actually deliver animated GIF/WebP.
                 // Probe only this failed, focused item with the image size bound.
                 do {
                     _ = try await MediaCache.shared.imageResource(address)
-                    guard !Task.isCancelled, active, generation == playbackGeneration else { return }
+                    guard !Task.isCancelled, active, generation == playbackGeneration, ownsPlaybackLease else { return }
                     onImageContent?(); return
                 } catch is CancellationError { return }
                 catch {
-                    guard !Task.isCancelled, active, generation == playbackGeneration else { return }
+                    guard !Task.isCancelled, active, generation == playbackGeneration, ownsPlaybackLease else { return }
                     if Self.blocksFailureAdvance(error) {
                         recoveryMessage = error.localizedDescription
                         return
@@ -973,10 +1102,10 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
                 repairAttempted = true
                 do {
                     let result = try await MediaRepair.shared.repair(address, offline: diagnosticOffline, forceTranscode: bypassRepaired, diagnosticWorkID: diagnosticWorkID) { stage, fraction in
-                        guard !Task.isCancelled, active, generation == playbackGeneration else { return }
+                        guard !Task.isCancelled, active, generation == playbackGeneration, ownsPlaybackLease else { return }
                         repairStage = stage; repairProgress = fraction
                     }
-                    guard !Task.isCancelled, active, generation == playbackGeneration else { return }
+                    guard !Task.isCancelled, active, generation == playbackGeneration, ownsPlaybackLease else { return }
                     posterRetry += 1
                     recoveryPosition = requestedResume ?? PlaybackResumePolicy.position(position: currentTime, duration: duration)
                     repairedSource = result
@@ -985,7 +1114,7 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
                     return
                 } catch is CancellationError { return }
                 catch {
-                    guard active, generation == playbackGeneration else { return }
+                    guard active, generation == playbackGeneration, ownsPlaybackLease else { return }
                     if actualSourceKind == .cache && decision == .recover {
                         // A failed conversion must not swallow the existing
                         // one-time bypass of a broken disposable browser cache.
@@ -1004,10 +1133,11 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
             if decision == .recover {
                 do {
                     try await Task.sleep(for: .seconds(1))
+                    guard !Task.isCancelled, active, ownsPlaybackLease, generation == playbackGeneration else { return }
                     let fresh: URL?
                     if let refreshURL { fresh = try await refreshURL() }
                     else { fresh = address }
-                    guard !Task.isCancelled, active, generation == playbackGeneration else { return }
+                    guard !Task.isCancelled, active, generation == playbackGeneration, ownsPlaybackLease else { return }
                     // A failed retry can move to another work without treating
                     // missing metadata as proof that this work was deleted.
                     guard let fresh else { confirmUnavailable(); return }
@@ -1015,14 +1145,14 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
                     recoveryAttempted = true; resolvedURL = fresh
                     playerReprepareEvent = .init(item: ObjectIdentifier(item), generation: generation)
                 } catch {
-                    guard !Task.isCancelled, active, generation == playbackGeneration else { return }
+                    guard !Task.isCancelled, active, generation == playbackGeneration, ownsPlaybackLease else { return }
                     if Self.blocksFailureAdvance(error) { recoveryMessage = "连接或授权暂不可用，请稍后重试" }
                     else { confirmUnavailable() }
                 }
             } else {
                 var failure = initial
                 if initial == .unknown, !address.isFileURL, let status = await Self.probeStatus(address) { failure = .http(status) }
-                guard !Task.isCancelled, active, generation == playbackGeneration else { return }
+                guard !Task.isCancelled, active, generation == playbackGeneration, ownsPlaybackLease else { return }
                 if VideoRecoveryPolicy.decide(failed: true, failure: failure, recoveryAttempted: true) == .skip { confirmUnavailable() }
                 else { recoveryMessage = "视频暂时无法播放，可稍后重试或手动划到下一条" }
             }
@@ -1141,7 +1271,7 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
                 qaSeekEvents.callbacks += 1; qaSeekEvents.lastFinished = finished
                 #endif
                 guard interactiveSeekID == operation, player === value, value.currentItem === item,
-                      generation == playbackGeneration else { return }
+                      generation == playbackGeneration, ownsPlaybackLease else { return }
                 #if DEBUG && targetEnvironment(simulator)
                 qaSeekEvents.commits += 1
                 #endif
@@ -1170,4 +1300,13 @@ struct VideoSurface<Caption: View, ActionRail: View>: View {
         else { holdingRate = false; playing = wasPlayingBeforeHold }
         syncPlayback()
     }
+}
+
+@MainActor func videoPlaybackKey(owner: UUID, scope: String, workID: Int, address: URL, source: URL, rootSlot: UUID? = nil) -> VideoPlaybackSessionKey {
+    let revision: String
+    if let identity = MediaRepairStore.identity(source) {
+        revision = "\(MediaCache.shared.repairGeneration):\(identity.size):\(identity.inode):\(identity.created)"
+    } else { revision = "\(MediaCache.shared.repairGeneration):remote" }
+    return .init(owner: owner, scope: scope, workID: workID, requestedURL: address,
+                 sourceURL: source, sourceRevision: revision, rootSlot: rootSlot)
 }

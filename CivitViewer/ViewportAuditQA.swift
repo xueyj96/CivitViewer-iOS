@@ -89,6 +89,7 @@ import CryptoKit
         OfflineLibrary.shared.setActive(false)
         guard OfflineLibrary.shared.readyCount == 6 else { throw ClientError.invalidResponse }
         if downloadTasksEnabled { OfflineLibrary.shared.seedDownloadProgressForQA(28_037_601) }
+        OfflineLibrary.shared.seedCollectionCornersForQA()
     }
 
     private static func copyLocalFixture(_ source: URL, to destination: URL) throws -> Int64 {
@@ -114,6 +115,20 @@ import CryptoKit
         return MediaPage(items: items, metadata: .init(nextCursor: nil))
     }
     static func searchPage(target: MediaSearchTarget, filter: FeedFilter, cursor: String?) throws -> MediaPage {
+        if ProcessInfo.processInfo.arguments.contains("--qa-search-viewport166"),
+           filter.effectiveKind == .image, cursor == nil,
+           let template = CollectionPagingQA.items.first(where: { !$0.isVideo }) {
+            let items = (0..<60).map { offset in
+                var item = MediaItem(id: 28_039_000 + offset,
+                                     url: "https://example.invalid/viewport166-\(offset).png",
+                                     width: template.width, height: template.height, type: "image",
+                                     username: template.username, browsingLevel: 1, thumbnail: nil,
+                                     creatorID: template.creatorID, tags: template.tags)
+                item.offlineMediaURL = template.offlineMediaURL
+                return item
+            }
+            return .init(items: items, metadata: .init(nextCursor: nil))
+        }
         let page = page(filter: filter, cursor: cursor)
         let matches: [MediaItem]
         switch target {

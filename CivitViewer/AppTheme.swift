@@ -17,6 +17,10 @@ enum AppTheme {
     static let spacing: CGFloat = 16
     static let secondarySurface = Color(uiColor: .secondarySystemBackground)
 
+    static func selectionFill(for scheme: ColorScheme) -> Color {
+        Color.accentColor.opacity(scheme == .dark ? 0.20 : 0.10)
+    }
+
     static func storageSize(_ bytes: Int64) -> String {
         if bytes == 0 { return "0 KB" }
         let formatter = ByteCountFormatter()
@@ -29,6 +33,53 @@ enum AppTheme {
         let traits = UITraitCollection(userInterfaceStyle: scheme == .dark ? .dark : .light)
         return Color(uiColor: UIColor.systemBackground.resolvedColor(with: traits))
     }
+}
+
+/// Content roles; navigation geometry remains owned by FloatingPageChrome.
+enum ContentMetrics {
+    enum Tag {
+        static let minimumFaceHeight: CGFloat = 26
+        static let targetHeight: CGFloat = 32
+        static let horizontalInset: CGFloat = 8
+        static let verticalInset: CGFloat = 4
+        static let gap = FloatingPageChrome.groupInset
+    }
+    enum Card {
+        static let rowVerticalInset = FloatingPageChrome.groupInset
+        static let summaryInset = FloatingPageChrome.cardInset
+    }
+    enum Choice {
+        static let width: CGFloat = 240
+        static let visibleRows = 6
+        static let motionDuration: TimeInterval = 0.2
+    }
+    enum Preview {
+        static let width: CGFloat = 60
+        static let height: CGFloat = 80
+    }
+    enum Icon {
+        static let primary: CGFloat = 16
+    }
+    enum Action {
+        static let faceHeight: CGFloat = 32
+    }
+    enum Media {
+        static let trackHeight: CGFloat = 3
+        static let statusHeight: CGFloat = 26
+    }
+    enum Optical {
+        static let iconTextGap: CGFloat = 2
+        static let hairline: CGFloat = 0.5
+    }
+}
+
+enum AppTypography {
+    static let controlLabel = Font.footnote.weight(.medium)
+    static let rowTitle = Font.subheadline
+    static let supportingText = Font.caption
+    static let tag = Font.caption
+    static let tabLabel = Font.caption2
+    static let statistics = Font.system(size: 29, weight: .semibold, design: .rounded)
 }
 
 /// Small, flat controls share a 44-point hit area across sheets and lists.
@@ -47,7 +98,7 @@ struct AppActionButtonStyle: ButtonStyle {
     private var fill: Color {
         switch tone {
         case .neutral: scheme == .dark ? .white.opacity(0.09) : .black.opacity(0.05)
-        case .accent: .blue.opacity(scheme == .dark ? 0.20 : 0.10)
+        case .accent: AppTheme.selectionFill(for: scheme)
         case .destructive: .red.opacity(scheme == .dark ? 0.18 : 0.09)
         }
     }
@@ -57,10 +108,10 @@ struct AppActionButtonStyle: ButtonStyle {
             .foregroundStyle(ink)
         return Group {
             if circular {
-                label.frame(width: 32, height: 32).background(fill, in: Circle())
+                label.frame(width: ContentMetrics.Action.faceHeight, height: ContentMetrics.Action.faceHeight).background(fill, in: Circle())
             } else {
-                label.padding(.horizontal, 8).frame(minHeight: 32)
-                    .background(fill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                label.padding(.horizontal, FloatingPageChrome.spacing).frame(minHeight: ContentMetrics.Action.faceHeight)
+                    .background(fill, in: FloatingPageChrome.controlShape)
             }
         }
         .opacity(enabled ? (configuration.isPressed ? 0.65 : 1) : 0.38)
@@ -86,12 +137,17 @@ struct StatusReloadButton: View {
 struct AppFilterLabel: View {
     let title: String
     let symbol: String
+    @Environment(\.valueSelectorExpanded) private var expanded
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
-        HStack(spacing: 7) {
-            Image(systemName: symbol).font(.system(size: 13, weight: .medium))
+        HStack(spacing: FloatingPageChrome.spacing) {
+            Image(systemName: symbol).font(.system(size: ContentMetrics.Icon.primary, weight: .medium))
             Text(title).lineLimit(1)
             Image(systemName: "chevron.down").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+                .rotationEffect(.degrees(expanded ? 180 : 0))
         }
+        .foregroundStyle(expanded ? Color.accentColor : Color.primary)
+        .animation(reduceMotion ? nil : .easeInOut(duration: ContentMetrics.Choice.motionDuration), value: expanded)
     }
 }
 
@@ -101,6 +157,25 @@ enum PlaybackChrome {
     static let panelStroke = Color.white.opacity(0.12)
     // Keep the rail centered below the trailing button inside the top panel.
     static let railHitInset = horizontalInset + FloatingPageChrome.groupInset
+}
+
+/// Shared visible surface for the main tab bar and its standalone batch fallback.
+struct FloatingBottomBarSurface: View {
+    var overMedia = false
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    var body: some View {
+        Group {
+            if overMedia { PlaybackChromeSurface() }
+            else {
+                let shape = FloatingPageChrome.controlShape
+                shape.fill(Color(uiColor: .systemBackground).opacity(reduceTransparency ? 1 : FloatingPageChrome.ordinaryPanelOpacity))
+                    .overlay { shape.strokeBorder(Color.primary.opacity(0.06), lineWidth: ContentMetrics.Optical.hairline) }
+            }
+        }
+        .frame(height: FloatingPageChrome.surfaceHeight)
+        .allowsHitTesting(false)
+    }
 }
 
 struct PlaybackChromeSurface: View {
@@ -117,13 +192,14 @@ struct PlaybackChromeSurface: View {
 enum FloatingPageChrome {
     private static let unit: CGFloat = 4
     static let pageInset = AppTheme.spacing
+    static let ordinaryPanelOpacity: Double = 0.86
     static let cardInset: CGFloat = 12
     static let spacing = 2 * unit
     static let controlHeight = 11 * unit
     static let surfaceInset = unit
     static let surfaceHeight = controlHeight - 2 * surfaceInset
     static let iconSurfaceWidth = surfaceHeight
-    static let iconGlyphSize: CGFloat = 15
+    static let iconGlyphSize = ContentMetrics.Icon.primary
     static let topInset = unit
     static let bottomInset: CGFloat = 6
     static let segmentInset = unit
@@ -131,7 +207,7 @@ enum FloatingPageChrome {
     static let compactRowHeight = surfaceHeight - groupInset
     static let controlRadius = 2 * unit
     static let controlShape = RoundedRectangle(cornerRadius: controlRadius, style: .circular)
-    static let controlFont = Font.footnote.weight(.medium)
+    static let controlFont = AppTypography.controlLabel
     static let filterSymbol = "line.3.horizontal.decrease"
 
     static func surfaceShape(nested: Bool) -> RoundedRectangle {
@@ -190,7 +266,7 @@ struct FloatingPageFieldSurface: View {
 
     var body: some View {
         let shape = FloatingPageChrome.surfaceShape(nested: nested)
-        shape.fill(Color(uiColor: .systemBackground).opacity(reduceTransparency ? 1 : 0.90))
+        shape.fill(nested ? Color.primary.opacity(0.035) : Color(uiColor: .systemBackground).opacity(reduceTransparency ? 1 : 0.90))
             .overlay { shape.strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5) }
             .frame(height: FloatingPageChrome.visibleHeight(nested: nested))
     }
@@ -221,15 +297,16 @@ struct FloatingPageButtonStyle: ButtonStyle {
         let media = overMedia || insidePlaybackPanel
         let surface = insidePlaybackPanel ? Color.white.opacity(0.06)
             : media ? (reduceTransparency ? Color.black : PlaybackChrome.panelFill)
+            : nested ? Color.primary.opacity(0.035)
             : Color(uiColor: .systemBackground).opacity(reduceTransparency ? 1 : 0.90)
         configuration.label
             .font(FloatingPageChrome.controlFont)
             .lineLimit(1)
-            .minimumScaleFactor(0.50)
+            .truncationMode(.tail)
             .foregroundStyle(selected ? Color.accentColor : (media ? .white : .primary))
             .padding(.horizontal, iconOnly ? 0 : 8)
             .frame(minWidth: FloatingPageChrome.controlHeight)
-            .frame(height: rowHeight)
+            .frame(width: iconOnly ? FloatingPageChrome.controlHeight : nil, height: rowHeight)
             .background {
                 shape.fill(surface)
                     .overlay { if selected { shape.fill(Color.accentColor.opacity(0.08)) } }
@@ -268,6 +345,58 @@ struct PageContentCard<Content: View>: View {
     }
 }
 
+/// Ordinary page message with a real action, kept at content size rather than a
+/// system full-screen empty-state size. Callers provide the action's semantics.
+struct PageMessageCard<Actions: View>: View {
+    let title: String
+    let symbol: String
+    let detail: String
+    @ViewBuilder let actions: () -> Actions
+
+    var body: some View {
+        PageContentCard {
+            VStack(alignment: .leading, spacing: FloatingPageChrome.spacing) {
+                HStack(alignment: .top, spacing: FloatingPageChrome.spacing) {
+                    FloatingPageIcon(symbol: symbol).accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: FloatingPageChrome.groupInset) {
+                        Text(title).font(AppTypography.rowTitle)
+                        Text(detail).font(AppTypography.supportingText).foregroundStyle(.secondary)
+                    }.fixedSize(horizontal: false, vertical: true)
+                }
+                actions()
+            }
+            .padding(.vertical, FloatingPageChrome.groupInset)
+            .frame(maxWidth: .infinity, minHeight: FloatingPageChrome.controlHeight, alignment: .leading)
+        }
+        .accessibilityElement(children: .contain)
+    }
+}
+
+/// Media messages share the card geometry while retaining readable dark material.
+/// Read-only short media status, distinct from a 44-point action target.
+struct MediaHUDSurface: ViewModifier {
+    func body(content: Content) -> some View {
+        content.font(.caption.weight(.semibold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, FloatingPageChrome.spacing)
+            .padding(.vertical, FloatingPageChrome.groupInset)
+            .frame(minHeight: ContentMetrics.Media.statusHeight)
+            .background(Color.black.opacity(0.72), in: FloatingPageChrome.surfaceShape(nested: true))
+    }
+}
+
+struct MediaFeedbackSurface: ViewModifier {
+    var verticalInset: CGFloat = 0
+    func body(content: Content) -> some View {
+        content.foregroundStyle(.white)
+            .background {
+                FloatingPageChrome.controlShape.fill(Color.black.opacity(0.76))
+                    .padding(.vertical, verticalInset)
+            }
+            .environment(\.colorScheme, .dark)
+    }
+}
+
 struct PageStatusCard: View {
     let title: String
     let symbol: String
@@ -280,8 +409,8 @@ struct PageStatusCard: View {
             HStack(spacing: FloatingPageChrome.spacing) {
                 FloatingPageIcon(symbol: symbol).accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: FloatingPageChrome.groupInset) {
-                    Text(title).font(.subheadline)
-                    if let detail { Text(detail).font(.caption) }
+                    Text(title).font(AppTypography.rowTitle)
+                    if let detail { Text(detail).font(AppTypography.supportingText) }
                 }
                 .fixedSize(horizontal: false, vertical: true)
                 if let retry {
@@ -302,22 +431,21 @@ struct WorkTagLabel: View {
     var blocked = false
     var fillsHitColumn = false
     var removable = false
-    var compact = false
     @Environment(\.dynamicTypeSize) private var typeSize
 
     var body: some View {
-        let hitHeight: CGFloat = compact && !typeSize.isAccessibilitySize ? 32 : FloatingPageChrome.controlHeight
+        let hitHeight = typeSize.isAccessibilitySize ? FloatingPageChrome.controlHeight : ContentMetrics.Tag.targetHeight
         return
         HStack(spacing: FloatingPageChrome.groupInset) {
             Text(title).lineLimit(removable ? 1 : 2).truncationMode(.tail).fixedSize(horizontal: false, vertical: true)
             if removable { Image(systemName: "xmark").font(.caption2).accessibilityHidden(true) }
             else if blocked { Image(systemName: "tag.slash").font(.caption2).accessibilityHidden(true) }
         }
-        .font(.caption)
+        .font(AppTypography.tag)
         .foregroundStyle(blocked && !selected ? Color.secondary : Color.primary)
-        .padding(.horizontal, 7)
-        .padding(.vertical, 3)
-        .frame(minHeight: 26)
+        .padding(.horizontal, ContentMetrics.Tag.horizontalInset)
+        .padding(.vertical, ContentMetrics.Tag.verticalInset)
+        .frame(minHeight: ContentMetrics.Tag.minimumFaceHeight)
         .background {
             let shape = FloatingPageChrome.surfaceShape(nested: true)
             shape.fill(selected ? Color.accentColor.opacity(0.16) : Color.primary.opacity(0.075))
@@ -325,9 +453,9 @@ struct WorkTagLabel: View {
                     if selected { shape.strokeBorder(Color.accentColor.opacity(0.75), lineWidth: 1) }
                 }
         }
-        .frame(minWidth: FloatingPageChrome.controlHeight, maxWidth: fillsHitColumn ? .infinity : nil,
+        .frame(minWidth: hitHeight, maxWidth: fillsHitColumn ? .infinity : nil,
                minHeight: hitHeight,
-               alignment: fillsHitColumn || compact ? .leading : .center)
+               alignment: .leading)
         .contentShape(Rectangle())
     }
 }
@@ -336,6 +464,7 @@ struct FloatingSegmentedTrack: View {
     let nested: Bool
     let overMedia: Bool
     @Environment(\.insidePlaybackPanel) private var insidePlaybackPanel
+    @Environment(\.insideFloatingPagePanel) private var insidePanel
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
@@ -343,11 +472,37 @@ struct FloatingSegmentedTrack: View {
         let foreground = overMedia ? Color.white : Color.primary
         let fill = insidePlaybackPanel ? Color.white.opacity(0.06)
             : overMedia ? (reduceTransparency ? Color.black : PlaybackChrome.panelFill)
-            : Color(uiColor: .systemBackground)
+            : insidePanel ? Color.primary.opacity(0.035) : Color(uiColor: .systemBackground)
         shape.fill(fill)
             .overlay { shape.strokeBorder(foreground.opacity(0.12), lineWidth: 0.5) }
             .frame(height: FloatingPageChrome.visibleHeight(nested: nested))
             .allowsHitTesting(false)
+    }
+}
+
+/// A single clipped drawing keeps wrap copies out of layout and accessibility
+/// bounds, while animatable position supports both taps and live edge drags.
+private struct SegmentedSelectionShape: Shape {
+    var position: Double
+    let count: Int
+    let inset: CGFloat
+    let height: CGFloat
+    let radius: CGFloat
+    var animatableData: Double {
+        get { position }
+        set { position = newValue }
+    }
+    func path(in rect: CGRect) -> Path {
+        guard count > 0 else { return Path() }
+        let slot = rect.width / CGFloat(count)
+        let width = max(0, slot - 2 * inset)
+        var path = Path()
+        for copy in [-1, 0, 1] {
+            let x = (CGFloat(position) + CGFloat(copy * count) + 0.5) * slot - width / 2
+            let box = CGRect(x: x, y: rect.midY - height / 2, width: width, height: height)
+            path.addPath(RoundedRectangle(cornerRadius: radius, style: .circular).path(in: box))
+        }
+        return path.intersection(Path(rect))
     }
 }
 
@@ -363,44 +518,49 @@ struct FloatingSegmentedControl<Value: Hashable>: View {
     @Environment(\.insideFloatingPagePanel) private var insideFloatingPagePanel
     @Environment(\.isEnabled) private var enabled
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Namespace private var selectionAnimation
+    @Environment(\.segmentedPageMotion) private var pageMotion
 
     var body: some View {
         let isNested = nested || insideFloatingPagePanel
         let outerInset = isNested ? FloatingPageChrome.groupInset : 0
         let selectionInset = isNested ? FloatingPageChrome.segmentInset / 2 : FloatingPageChrome.segmentInset
         let trackHeight = FloatingPageChrome.visibleHeight(nested: isNested)
-        let selectionShape = RoundedRectangle(
-            cornerRadius: FloatingPageChrome.controlRadius - outerInset - selectionInset, style: .circular
-        )
         let foreground = overMedia ? Color.white : Color.primary
+        let selectedIndex = Double(options.firstIndex(of: selection) ?? 0)
+        let position = pageMotion?.identifier == identifier ? (pageMotion?.position ?? selectedIndex) : selectedIndex
         HStack(spacing: 0) {
             ForEach(options, id: \.self) { option in
                 let selected = option == selection
                 Button {
-                    selection = option
+                    guard option != selection else { return }
+                    if let pageMotion, pageMotion.identifier == identifier,
+                       let from = options.firstIndex(of: selection), let to = options.firstIndex(of: option) {
+                        pageMotion.select(from: from, to: to, reduceMotion: reduceMotion) { selection = option }
+                    } else { selection = option }
                 } label: {
                     Text(optionTitle(option))
                         .font(FloatingPageChrome.controlFont)
                         .lineLimit(1)
-                        .minimumScaleFactor(0.50)
+                        .truncationMode(.tail)
                         .foregroundStyle(foreground.opacity(selected ? 1 : 0.78))
                         .shadow(color: .black.opacity(overMedia ? 0.55 : 0), radius: 1, y: 1)
                         .padding(.horizontal, FloatingPageChrome.segmentInset)
                         .frame(maxWidth: .infinity, minHeight: FloatingPageChrome.controlHeight)
-                        .background {
-                            if selected {
-                                selectionShape
-                                    .fill(foreground.opacity(overMedia ? 0.26 : 0.14))
-                                    .frame(height: trackHeight - 2 * selectionInset)
-                                    .padding(.horizontal, showsTrack ? 0 : selectionInset)
-                                    .matchedGeometryEffect(id: "selection", in: selectionAnimation)
-                            }
-                        }
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .disabled(pageMotion?.identifier == identifier && pageMotion?.isInteracting == true)
                 .accessibilityAddTraits(selected ? [.isSelected] : [])
+            }
+        }
+        .background {
+            if !options.isEmpty {
+                SegmentedSelectionShape(position: position, count: options.count,
+                                        inset: showsTrack ? 0 : selectionInset,
+                                        height: trackHeight - 2 * selectionInset,
+                                        radius: FloatingPageChrome.controlRadius - outerInset - selectionInset)
+                    .fill(foreground.opacity(overMedia ? 0.26 : 0.14))
+                    .allowsHitTesting(false).accessibilityHidden(true)
             }
         }
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: selection)
@@ -429,7 +589,7 @@ struct FloatingMediaPicker: View {
     }
 }
 
-private struct FloatingTitleRow: Layout {
+struct FloatingTitleRow: Layout {
     private let height = FloatingPageChrome.controlHeight
     private let gap = FloatingPageChrome.groupInset
 
@@ -465,21 +625,19 @@ struct FloatingPageBackButton: View {
     var action: (() -> Void)? = nil
     var identifier = "navigation.back"
     @Environment(\.dismiss) private var dismiss
-    @State private var canGoBack = false
-    @Environment(\.headerPreviewCanGoBack) private var previewCanGoBack
+    @Environment(\.isHeaderRasterPreview) private var rasterPreview
 
     var body: some View {
         ZStack {
-            if action == nil && previewCanGoBack == nil {
-                FlatBackNavigationSupport(canGoBack: $canGoBack)
+            if action == nil && !rasterPreview {
+                FlatBackNavigationSupport()
                     .frame(width: 0, height: 0).allowsHitTesting(false).accessibilityHidden(true)
             }
-            if (previewCanGoBack ?? canGoBack) || action != nil {
-                Button { if let action { action() } else { dismiss() } } label: { FloatingPageIcon(symbol: "chevron.left") }
-                    .buttonStyle(FloatingPageButtonStyle(iconOnly: true))
-                    .accessibilityLabel("返回")
-                    .accessibilityIdentifier(identifier)
-            }
+            // The page explicitly owns this action; UIKit only arbitrates gestures.
+            Button { if let action { action() } else { dismiss() } } label: { FloatingPageIcon(symbol: "chevron.left") }
+                .buttonStyle(FloatingPageButtonStyle(iconOnly: true))
+                .accessibilityLabel("返回")
+                .accessibilityIdentifier(identifier)
         }
     }
 }
@@ -606,7 +764,6 @@ private struct OrdinaryPresentationAppearance: ViewModifier {
 }
 
 private struct FlatBackNavigationSupport: UIViewControllerRepresentable {
-    @Binding var canGoBack: Bool
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeUIViewController(context: Context) -> Probe {
@@ -614,7 +771,6 @@ private struct FlatBackNavigationSupport: UIViewControllerRepresentable {
         controller.view.backgroundColor = .clear
         controller.view.isUserInteractionEnabled = false
         let coordinator = context.coordinator
-        coordinator.setCanGoBack = { canGoBack = $0 }
         controller.onAttach = { [weak controller, weak coordinator] in
             guard let controller else { return }; coordinator?.apply(from: controller)
         }
@@ -623,7 +779,6 @@ private struct FlatBackNavigationSupport: UIViewControllerRepresentable {
 
     func updateUIViewController(_ controller: Probe, context: Context) {
         let coordinator = context.coordinator
-        coordinator.setCanGoBack = { canGoBack = $0 }
         DispatchQueue.main.async { [weak controller] in
             guard let controller else { return }
             coordinator.apply(from: controller)
@@ -632,6 +787,7 @@ private struct FlatBackNavigationSupport: UIViewControllerRepresentable {
 
     static func dismantleUIViewController(_ controller: Probe, coordinator: Coordinator) {
         controller.onAttach = nil
+        coordinator.recordLifecycle("dismantle")
         coordinator.restoreGesture()
     }
 
@@ -651,7 +807,6 @@ private struct FlatBackNavigationSupport: UIViewControllerRepresentable {
         }
     }
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {
-        var setCanGoBack: ((Bool) -> Void)?
         private weak var navigationController: UINavigationController?
         private weak var owner: UIViewController?
         private final class PopBinding {
@@ -681,7 +836,6 @@ private struct FlatBackNavigationSupport: UIViewControllerRepresentable {
                 return
             }
             let hasPrevious = navigation.viewControllers.count > 1
-            setCanGoBack?(hasPrevious)
             if let transition = navigation.transitionCoordinator {
                 transition.animate(alongsideTransition: nil) { [weak self, weak controller] _ in
                     guard let controller else { return }; self?.apply(from: controller)
@@ -692,9 +846,8 @@ private struct FlatBackNavigationSupport: UIViewControllerRepresentable {
                 if navigationController !== navigation { restoreGesture() }
                 self.navigationController = navigation
                 owner = host
-                // iOS 26 also routes return pans through the content recognizer.
-                // Keep both UIKit recognizers/actions; constrain the content
-                // recognizer to the same leading edge as the classic gesture.
+                // Preserve UIKit's two native return actions and their mutual
+                // failure precedence; only our page/edge eligibility is custom.
                 var gestures = [navigation.interactivePopGestureRecognizer].compactMap { $0 }
                 if #available(iOS 26.0, *), let content = navigation.interactiveContentPopGestureRecognizer {
                     gestures.append(content)
@@ -706,6 +859,9 @@ private struct FlatBackNavigationSupport: UIViewControllerRepresentable {
                         let original = prior != nil ? prior?.delegate : gesture.delegate
                         bindings.append(PopBinding(gesture, delegate: original, enabled: prior?.enabled ?? gesture.isEnabled))
                         gesture.delegate = self
+                        #if DEBUG && targetEnvironment(simulator)
+                        gesture.addTarget(self, action: #selector(traceNativeReturn(_:)))
+                        #endif
                     }
                     gesture.isEnabled = true
                 }
@@ -713,9 +869,25 @@ private struct FlatBackNavigationSupport: UIViewControllerRepresentable {
             recordQA(navigation)
         }
 
+        func recordLifecycle(_ event: String) {
+            #if DEBUG && targetEnvironment(simulator)
+            guard ProcessInfo.processInfo.arguments.contains("--qa-style49") else { return }
+            let detail = bindings.map { binding in
+                "state=\(binding.gesture?.state.rawValue ?? -1),restoreEnabled=\(binding.enabled),own=\(binding.gesture?.delegate === self)"
+            }.joined(separator: "|")
+            let entry = event + "[transition=\(navigationController?.transitionCoordinator != nil);\(detail)]"
+            NativeBack49State.shared.events.append(entry)
+            NativeBack49State.shared.events = Array(NativeBack49State.shared.events.suffix(8))
+            #endif
+        }
+
         func restoreGesture() {
+            if !bindings.isEmpty { recordLifecycle("restore") }
             for binding in bindings {
                 if let gesture = binding.gesture, gesture.delegate === self {
+                    #if DEBUG && targetEnvironment(simulator)
+                    gesture.removeTarget(self, action: #selector(traceNativeReturn(_:)))
+                    #endif
                     gesture.delegate = binding.delegate
                     gesture.isEnabled = binding.enabled
                 }
@@ -725,17 +897,47 @@ private struct FlatBackNavigationSupport: UIViewControllerRepresentable {
             owner = nil
         }
 
+        private func nativeKind(_ gesture: UIGestureRecognizer) -> String {
+            if gesture === navigationController?.interactivePopGestureRecognizer { return "edge-property" }
+            if #available(iOS 26.0, *), gesture === navigationController?.interactiveContentPopGestureRecognizer { return "content-property" }
+            return "other"
+        }
+
+        #if DEBUG && targetEnvironment(simulator)
+        @objc private func traceNativeReturn(_ gesture: UIPanGestureRecognizer) {
+            guard ProcessInfo.processInfo.arguments.contains("--qa-segment-edge"),
+                  gesture.state != .changed else { return }
+            let point = gesture.translation(in: gesture.view)
+            let velocity = gesture.velocity(in: gesture.view)
+            NSLog("NATIVE_RETURN kind=%@ state=%ld dx=%.1f vx=%.1f", nativeKind(gesture), gesture.state.rawValue, point.x, velocity.x)
+            if gesture.state == .began {
+                DispatchQueue.main.async { [weak self] in
+                    self?.navigationController?.transitionCoordinator?.notifyWhenInteractionChanges { context in
+                        NSLog("NATIVE_RETURN interaction cancelled=%@ percent=%.3f", context.isCancelled ? "true" : "false", context.percentComplete)
+                    }
+                }
+            }
+        }
+        #endif
+
         private func eligible(_ gesture: UIGestureRecognizer) -> Bool {
             guard bindings.contains(where: { $0.gesture === gesture }),
+                  let owner,
                   let navigation = navigationController, navigation.topViewController === owner,
                   navigation.viewControllers.count > 1, navigation.transitionCoordinator == nil,
                   navigation.presentedViewController == nil else { return false }
-            return true
+            return !PageEdgeReturnPolicy.isSegmentedBrowsing(owner: owner)
+                && !PageEdgeReturnPolicy.ownsReturnGesture(owner: owner)
         }
 
         func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
             #if DEBUG && targetEnvironment(simulator)
             NativeBack49State.shared.beginCalls += 1
+            #endif
+            #if DEBUG && targetEnvironment(simulator)
+            if ProcessInfo.processInfo.arguments.contains("--qa-segment-edge") {
+                NSLog("NATIVE_GATE begin kind=%@ driver=%@ eligible=%@ transition=%@", String(describing: type(of: gestureRecognizer)), nativeKind(gestureRecognizer), eligible(gestureRecognizer) ? "true" : "false", navigationController?.transitionCoordinator != nil ? "true" : "false")
+            }
             #endif
             guard eligible(gestureRecognizer) else { return false }
             if let pan = gestureRecognizer as? UIPanGestureRecognizer, let view = pan.view {
@@ -749,6 +951,14 @@ private struct FlatBackNavigationSupport: UIViewControllerRepresentable {
         }
 
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+            #if DEBUG && targetEnvironment(simulator)
+            NativeBack49State.shared.lastGate = "nav=\(navigationController.map { String(describing: ObjectIdentifier($0)) } ?? "nil"),top=\(navigationController?.topViewController === owner),transition=\(navigationController?.transitionCoordinator != nil),eligible=\(eligible(gestureRecognizer))"
+            #endif
+            #if DEBUG && targetEnvironment(simulator)
+            if ProcessInfo.processInfo.arguments.contains("--qa-segment-edge") {
+                NSLog("NATIVE_GATE receive kind=%@ driver=%@ eligible=%@ transition=%@", String(describing: type(of: gestureRecognizer)), nativeKind(gestureRecognizer), eligible(gestureRecognizer) ? "true" : "false", navigationController?.transitionCoordinator != nil ? "true" : "false")
+            }
+            #endif
             guard eligible(gestureRecognizer), let view = gestureRecognizer.view,
                   touch.type == .direct, touch.view?.isDescendant(of: view) == true else { return false }
             let point = touch.location(in: view)
@@ -774,9 +984,15 @@ private struct FlatBackNavigationSupport: UIViewControllerRepresentable {
             false
         }
         func gestureRecognizer(_ gesture: UIGestureRecognizer, shouldRequireFailureOf other: UIGestureRecognizer) -> Bool {
-            false
+            guard let binding = bindings.first(where: { $0.gesture === gesture }),
+                  bindings.contains(where: { $0.gesture === other }) else { return false }
+            return binding.delegate?.gestureRecognizer?(gesture, shouldRequireFailureOf: other) ?? false
         }
         func gestureRecognizer(_ gesture: UIGestureRecognizer, shouldBeRequiredToFailBy other: UIGestureRecognizer) -> Bool {
+            if let binding = bindings.first(where: { $0.gesture === gesture }),
+               bindings.contains(where: { $0.gesture === other }) {
+                return binding.delegate?.gestureRecognizer?(gesture, shouldBeRequiredToFailBy: other) ?? false
+            }
             // Once the leading-edge touch is accepted, grid taps/scrolling
             // wait for the return pan. Center touches never enter this path.
             guard eligible(gesture), !bindings.contains(where: { $0.gesture === other }),
@@ -791,7 +1007,7 @@ private struct FlatBackNavigationSupport: UIViewControllerRepresentable {
                 guard let controller, #available(iOS 26.0, *) else { return }
                 let state = NativeBack49State.shared
                 let edge = controller.interactivePopGestureRecognizer
-                let value = "depth=\(controller.viewControllers.count);nativeBackHidden=\(controller.topViewController?.navigationItem.hidesBackButton == true);edgeSwipe=\(edge?.isEnabled == true);ownDelegate=\(edge?.delegate === self);gestureState=\(edge?.state.rawValue ?? -1);beginCalls=\(state.beginCalls);receiveCalls=\(state.receiveCalls);receiveAllowed=\(state.lastReceiveAllowed);eventCalls=\(state.eventCalls);eventAllowed=\(state.lastEventAllowed);transition=\(controller.transitionCoordinator != nil);gestureView=\(edge?.view != nil);gestureInWindow=\(edge?.view?.window != nil);gestureWidth=\(Int(edge?.view?.bounds.width ?? -1));gestureViewEnabled=\(edge?.view?.isUserInteractionEnabled == true);navInWindow=\(controller.view.window != nil);edgeKind=\(edge is UIScreenEdgePanGestureRecognizer);edges=\((edge as? UIScreenEdgePanGestureRecognizer)?.edges.rawValue ?? 0);contentEnabled=\(controller.interactiveContentPopGestureRecognizer?.isEnabled == true);contentState=\(controller.interactiveContentPopGestureRecognizer?.state.rawValue ?? -1);gestureViewHidden=\(edge?.view?.isHidden == true);navHidden=\(controller.view.isHidden)"
+                let value = "navID=\(ObjectIdentifier(controller));lastGate=\(state.lastGate);depth=\(controller.viewControllers.count);nativeBackHidden=\(controller.topViewController?.navigationItem.hidesBackButton == true);edgeSwipe=\(edge?.isEnabled == true);ownDelegate=\(edge?.delegate === self);gestureState=\(edge?.state.rawValue ?? -1);beginCalls=\(state.beginCalls);receiveCalls=\(state.receiveCalls);receiveAllowed=\(state.lastReceiveAllowed);eventCalls=\(state.eventCalls);eventAllowed=\(state.lastEventAllowed);transition=\(controller.transitionCoordinator != nil);gestureView=\(edge?.view != nil);gestureInWindow=\(edge?.view?.window != nil);gestureWidth=\(Int(edge?.view?.bounds.width ?? -1));gestureViewEnabled=\(edge?.view?.isUserInteractionEnabled == true);navInWindow=\(controller.view.window != nil);edgeKind=\(edge is UIScreenEdgePanGestureRecognizer);edges=\((edge as? UIScreenEdgePanGestureRecognizer)?.edges.rawValue ?? 0);contentEnabled=\(controller.interactiveContentPopGestureRecognizer?.isEnabled == true);contentState=\(controller.interactiveContentPopGestureRecognizer?.state.rawValue ?? -1);gestureViewHidden=\(edge?.view?.isHidden == true);navHidden=\(controller.view.isHidden)"
                 if NativeBack49State.shared.value != value { NativeBack49State.shared.value = value }
             }
             #endif
@@ -803,7 +1019,9 @@ private struct FlatBackNavigationSupport: UIViewControllerRepresentable {
 @MainActor private final class NativeBack49State: ObservableObject {
     static let shared = NativeBack49State()
     @Published var value = "notObserved"
+    @Published var events: [String] = []
     var snapshot: (() -> Void)?
+    var lastGate = "none"
     var beginCalls = 0
     var receiveCalls = 0
     var lastReceiveAllowed = false
@@ -814,7 +1032,7 @@ private struct NativeBack49Readback: View {
     @ObservedObject private var state = NativeBack49State.shared
     var body: some View {
         Text(state.value).font(.system(size: 1)).frame(width: 1, height: 1).opacity(0.01).allowsHitTesting(false)
-            .accessibilityIdentifier("navigation.qa49").accessibilityValue(state.value)
+            .accessibilityIdentifier("navigation.qa49").accessibilityValue(state.value + ";lifecycle=" + state.events.joined(separator: ">"))
             .task {
                 while !Task.isCancelled {
                     state.snapshot?()
@@ -837,13 +1055,45 @@ extension EnvironmentValues {
     }
 }
 
+private struct FloatingPageSafeInsetsKey: EnvironmentKey {
+    static let defaultValue = EdgeInsets()
+}
+private struct FloatingPageContentInsetsKey: EnvironmentKey {
+    static let defaultValue = EdgeInsets()
+}
+extension EnvironmentValues {
+    var floatingPageSafeInsets: EdgeInsets {
+        get { self[FloatingPageSafeInsetsKey.self] }
+        set { self[FloatingPageSafeInsetsKey.self] = newValue }
+    }
+    var floatingPageContentInsets: EdgeInsets {
+        get { self[FloatingPageContentInsetsKey.self] }
+        set { self[FloatingPageContentInsetsKey.self] = newValue }
+    }
+}
+
+/// The scrolling viewport fills its canvas. Only the scrollable content owns
+/// clearance for fixed chrome, including when hosted by a native list pane.
+private struct FloatingScrollCanvas: ViewModifier {
+    var additionalBottom: CGFloat = 0
+    @Environment(\.floatingPageContentInsets) private var insets
+    func body(content: Content) -> some View {
+        content
+            .contentMargins(.top, insets.top, for: .scrollContent)
+            .contentMargins(.bottom, insets.bottom + additionalBottom, for: .scrollContent)
+            .contentMargins(.top, insets.top, for: .scrollIndicators)
+            .contentMargins(.bottom, insets.bottom + additionalBottom, for: .scrollIndicators)
+            .ignoresSafeArea(.container, edges: .vertical)
+    }
+}
+
 private struct PageScrollContentInsets: ViewModifier {
     @Environment(\.overlaidTabBarHeight) private var overlap
 
     func body(content: Content) -> some View {
         content
             .padding(.horizontal, FloatingPageChrome.pageInset)
-            .padding(.bottom, FloatingPageChrome.pageInset + overlap)
+            .padding(.bottom, FloatingPageChrome.pageInset)
     }
 }
 
@@ -852,12 +1102,14 @@ private struct AvoidOverlaidTabBar: ViewModifier {
     @Environment(\.overlaidTabBarHeight) private var overlap
 
     func body(content: Content) -> some View {
-        if constrainViewport { content.padding(.bottom, overlap) }
-        else { content.safeAreaPadding(.bottom, overlap) }
+        content.floatingScrollCanvas()
     }
 }
 
 extension View {
+    func floatingScrollCanvas(additionalBottom: CGFloat = 0) -> some View {
+        modifier(FloatingScrollCanvas(additionalBottom: additionalBottom))
+    }
     func pageScrollContentInsets() -> some View { modifier(PageScrollContentInsets()) }
     func avoidOverlaidTabBar(constrainViewport: Bool = false) -> some View {
         modifier(AvoidOverlaidTabBar(constrainViewport: constrainViewport))
@@ -869,6 +1121,7 @@ extension View {
         let outer = FloatingPageChrome.pageInset
         let inner = outer + FloatingPageChrome.cardInset
         return self
+            .font(AppTypography.rowTitle)
             .listRowInsets(EdgeInsets(top: 0, leading: inner, bottom: 0, trailing: inner))
             .listRowBackground(FloatingPageChrome.controlShape.fill(AppTheme.secondarySurface).padding(.horizontal, outer))
             .listRowSeparator(.hidden)
@@ -887,25 +1140,33 @@ extension View {
 
     func floatingTitleBar<Leading: View, Actions: View>(
         _ title: String,
+        count: Int? = nil,
         overMedia: Bool = false,
         hidden: Bool = false,
+        layoutIdentity: AnyHashable? = nil,
+        observesContentViewport: Bool = true,
         @ViewBuilder leading: @escaping () -> Leading,
         @ViewBuilder actions: @escaping () -> Actions
     ) -> some View {
-        contentMargins(.top, 0, for: .scrollContent)
-            .navigationTitle(title)
-            .floatingPageBar("page-title." + title, overMedia: overMedia, hidden: hidden) {
+        self.navigationTitle(title)
+            .pageContentViewport(observes: observesContentViewport && !overMedia)
+            .floatingPageBar("page-title." + title, overMedia: overMedia, hidden: hidden, layoutIdentity: layoutIdentity) {
                 FloatingTitleRow {
                     FloatingSegmentedTrack(nested: true, overMedia: overMedia).accessibilityHidden(true)
                     ZStack {
                         Color.clear.frame(width: 0, height: 0).accessibilityHidden(true)
                         leading()
                     }
-                    Text(title)
+                    HStack(spacing: FloatingPageChrome.groupInset) {
+                        Text(title)
+                        if let count { Text("· \(count)").foregroundStyle(.secondary).monospacedDigit() }
+                    }
                         .font(FloatingPageChrome.controlFont)
                         .lineLimit(1)
-                        .minimumScaleFactor(0.70)
+                        .truncationMode(.tail)
                         .frame(maxWidth: .infinity)
+                        .accessibilityElement(children: .combine)
+                        .accessibilityIdentifier("page-header.title")
                         .accessibilityAddTraits(.isHeader)
                     ZStack {
                         Color.clear.frame(width: 0, height: 0).accessibilityHidden(true)
@@ -916,12 +1177,168 @@ extension View {
     }
 
     func floatingTitleBar<Actions: View>(
-        _ title: String, @ViewBuilder actions: @escaping () -> Actions
+        _ title: String, count: Int? = nil, layoutIdentity: AnyHashable? = nil,
+        observesContentViewport: Bool = true, @ViewBuilder actions: @escaping () -> Actions
     ) -> some View {
-        floatingTitleBar(title, leading: { FloatingPageBackButton() }, actions: actions)
+        floatingTitleBar(title, count: count, layoutIdentity: layoutIdentity, observesContentViewport: observesContentViewport,
+                         leading: { FloatingPageBackButton() }, actions: actions)
     }
 
     func floatingTitleBar(_ title: String) -> some View {
         floatingTitleBar(title) { EmptyView() }
+    }
+}
+
+private struct ValueSelectorExpandedKey: EnvironmentKey { static let defaultValue = false }
+extension EnvironmentValues {
+    var valueSelectorExpanded: Bool {
+        get { self[ValueSelectorExpandedKey.self] }
+        set { self[ValueSelectorExpandedKey.self] = newValue }
+    }
+}
+
+
+/// Fixed bar palettes interpolate actual fill, border and ink endpoints. No
+/// full-bar opacity and no partially transparent color curtain on first mount.
+@MainActor enum PageBarPalette {
+    static func traits(_ scheme: ColorScheme) -> UITraitCollection {
+        UITraitCollection(userInterfaceStyle: scheme == .dark ? .dark : .light)
+    }
+    static func fill(_ media: Bool, _ scheme: ColorScheme, _ opaque: Bool) -> UIColor {
+        media ? UIColor.black.withAlphaComponent(opaque ? 1 : 0.48)
+            : UIColor.systemBackground.resolvedColor(with: traits(scheme)).withAlphaComponent(opaque ? 1 : CGFloat(FloatingPageChrome.ordinaryPanelOpacity))
+    }
+    static func border(_ media: Bool, _ scheme: ColorScheme) -> UIColor {
+        media ? UIColor.white.withAlphaComponent(0.12)
+            : UIColor.label.resolvedColor(with: traits(scheme)).withAlphaComponent(0.06)
+    }
+    static func ink(_ media: Bool, _ scheme: ColorScheme) -> UIColor {
+        media ? UIColor.white.withAlphaComponent(0.88) : UIColor.secondaryLabel.resolvedColor(with: traits(scheme))
+    }
+    static func mix(_ source: UIColor, _ target: UIColor, _ progress: Double) -> Color {
+        var sr: CGFloat = 0, sg: CGFloat = 0, sb: CGFloat = 0, sa: CGFloat = 0
+        var tr: CGFloat = 0, tg: CGFloat = 0, tb: CGFloat = 0, ta: CGFloat = 0
+        source.getRed(&sr, green: &sg, blue: &sb, alpha: &sa)
+        target.getRed(&tr, green: &tg, blue: &tb, alpha: &ta)
+        let p = CGFloat(progress)
+        return Color(uiColor: UIColor(red: sr + (tr - sr) * p, green: sg + (tg - sg) * p,
+                                      blue: sb + (tb - sb) * p, alpha: sa + (ta - sa) * p))
+    }
+    static func progress(_ tone: PageToneTransition?, reduced: Bool) -> Double {
+        guard !reduced, let tone else { return 1 }
+        return 1 - tone.initialOpacity * (1 - tone.clock.progress)
+    }
+}
+
+struct PageToneBarSurface: View {
+    let overMedia: Bool
+    let fallback: PageToneTransition?
+    var opaqueOverride: Bool? = nil
+    @Environment(\.pageSurfaceTone) private var managed
+    @Environment(\.pageWindowToneContext) private var windowTone
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.accessibilityReduceTransparency) private var opaque
+    @Environment(\.accessibilityReduceMotion) private var reduced
+    var body: some View {
+        let tone = windowTone?.returnTone ?? managed ?? windowTone?.tone ?? fallback
+        SwiftUI.TimelineView(.animation(paused: tone == nil || reduced)) { _ in
+            let p = PageBarPalette.progress(tone, reduced: reduced)
+            let fromMedia = tone?.sourceIsMedia ?? overMedia
+            let toMedia = tone?.destinationIsMedia ?? overMedia
+            let toScheme = tone?.destinationScheme ?? scheme
+            let fromScheme = tone?.sourceScheme ?? scheme
+            let shape = FloatingPageChrome.controlShape
+            shape.fill(PageBarPalette.mix(PageBarPalette.fill(fromMedia, fromScheme, opaqueOverride ?? opaque),
+                                          PageBarPalette.fill(toMedia, toScheme, opaqueOverride ?? opaque), p))
+                .overlay {
+                    shape.strokeBorder(PageBarPalette.mix(PageBarPalette.border(fromMedia, fromScheme),
+                                                           PageBarPalette.border(toMedia, toScheme), p),
+                                       lineWidth: ContentMetrics.Optical.hairline)
+                }
+        }
+        .frame(height: FloatingPageChrome.surfaceHeight).allowsHitTesting(false)
+    }
+}
+
+struct PageToneBarInk: ViewModifier {
+    let selected: Bool
+    let overMedia: Bool
+    let fallback: PageToneTransition?
+    @Environment(\.pageSurfaceTone) private var managed
+    @Environment(\.pageWindowToneContext) private var windowTone
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.accessibilityReduceMotion) private var reduced
+    func body(content: Content) -> some View {
+        let tone = windowTone?.returnTone ?? managed ?? windowTone?.tone ?? fallback
+        SwiftUI.TimelineView(.animation(paused: tone == nil || reduced)) { _ in
+            let p = PageBarPalette.progress(tone, reduced: reduced)
+            let fromMedia = tone?.sourceIsMedia ?? overMedia
+            let toMedia = tone?.destinationIsMedia ?? overMedia
+            let toScheme = tone?.destinationScheme ?? scheme
+            let ink = PageBarPalette.mix(PageBarPalette.ink(fromMedia, tone?.sourceScheme ?? scheme),
+                                         PageBarPalette.ink(toMedia, toScheme), p)
+            content.foregroundStyle(selected ? Color.accentColor : ink)
+                .shadow(color: .black.opacity(((fromMedia ? 0.7 : 0) * (1 - p)) + ((toMedia ? 0.7 : 0) * p)), radius: 2, y: 1)
+        }
+    }
+}
+
+
+extension EnvironmentValues {
+    @Entry var pageWindowToneContext: PageSurfaceToneContext? = nil
+}
+
+struct PageWindowToneReader: ViewModifier {
+    @State private var context: PageSurfaceToneContext?
+    func body(content: Content) -> some View {
+        content.environment(\.pageWindowToneContext, context)
+            .background { WindowMarker(context: $context).allowsHitTesting(false).accessibilityHidden(true) }
+    }
+    private struct WindowMarker: UIViewRepresentable {
+        @Binding var context: PageSurfaceToneContext?
+        func makeUIView(context: Context) -> Marker { Marker() }
+        func updateUIView(_ view: Marker, context: Context) {
+            view.attach = { [weak view] value in
+                let expectedWindow = view?.window
+                // Resolve the window reference once outside the current SwiftUI
+                // update; per-frame tone progress remains a direct clock read.
+                DispatchQueue.main.async { [weak view, weak expectedWindow] in
+                    guard view?.window === expectedWindow else { return }
+                    self.context = value
+                }
+            }
+            view.resolve()
+        }
+        final class Marker: UIView {
+            var attach: ((PageSurfaceToneContext?) -> Void)?
+            private weak var attachedWindow: UIWindow?
+            override func didMoveToWindow() { super.didMoveToWindow(); resolve() }
+            func resolve() {
+                guard window !== attachedWindow else { return }
+                attachedWindow = window
+                attach?(window.map { PageBodyHandoff.toneContext(in: $0) })
+            }
+        }
+    }
+}
+
+
+/// Only a cover needs this canvas strip. Tab transitions already blend their
+/// entire root canvas and must not receive a second color layer here.
+struct PageToneBarCanvas: View {
+    @Environment(\.pageSurfaceTone) private var managed
+    @Environment(\.pageWindowToneContext) private var windowTone
+    var body: some View {
+        if let tone = windowTone?.returnTone ?? managed ?? windowTone?.tone {
+            ZStack {
+                // A navigation drag still has the source page mounted behind
+                // this fixed bar. Explicit return endpoints supply its canvas;
+                // fading the source alone would keep revealing source white.
+                if let media = tone.destinationIsMedia, let scheme = tone.destinationScheme {
+                    media ? Color.black : AppTheme.pageBackground(for: scheme)
+                }
+                PageToneBlend(tone: tone, coversSafeArea: false)
+            }.id(tone.id)
+        }
     }
 }

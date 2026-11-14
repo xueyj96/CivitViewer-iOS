@@ -14,76 +14,8 @@ private extension View {
     }
 }
 
-// Keep gesture feedback updates out of the media pager's view hierarchy.
-@MainActor private final class TimelineEdgePreview: ObservableObject {
-    struct Value {
-        let title: String
-        let translation: Double
-        var ready: Bool { abs(translation) >= ScreenEdgeGesture.commitDistance }
-        var offset: CGFloat {
-            let distance = abs(translation)
-            let threshold = ScreenEdgeGesture.commitDistance
-            let resisted = distance <= threshold ? distance : threshold + (distance - threshold) * 0.28
-            return CGFloat(translation < 0 ? -resisted : resisted)
-        }
-    }
-    @Published private(set) var value: Value?
-
-    func update(title: String?, translation: Double) {
-        let next = title.map { Value(title: $0, translation: translation) }
-        if next?.ready == true, value?.ready != true { UISelectionFeedbackGenerator().selectionChanged() }
-        value = next
-    }
-
-    func clear(animated: Bool = false) {
-        guard value != nil else { return }
-        withAnimation(animated ? .easeOut(duration: 0.18) : nil) { value = nil }
-    }
-}
-
-private struct TimelineEdgeMotion: ViewModifier {
-    @ObservedObject var preview: TimelineEdgePreview
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    func body(content: Content) -> some View {
-        content.offset(x: reduceMotion ? 0 : (preview.value?.offset ?? 0))
-    }
-}
-
-private struct TimelineEdgePreviewView: View {
-    @ObservedObject var preview: TimelineEdgePreview
-    var body: some View {
-        if let value = preview.value {
-            HStack(spacing: 8) {
-                if value.translation > 0 { Image(systemName: "chevron.left") }
-                VStack(spacing: 4) {
-                    Text(value.title).font(.headline)
-                    Text(value.ready ? "松开切换" : "继续拖动").font(.caption2)
-                }
-                if value.translation < 0 { Image(systemName: "chevron.right") }
-            }.foregroundStyle(.white).padding(.horizontal, 15).padding(.vertical, 13)
-                .background(.black.opacity(0.78), in: Capsule())
-                .overlay(Capsule().stroke(.white.opacity(value.ready ? 0.65 : 0.2)))
-                .scaleEffect(value.ready ? 1.05 : 0.92)
-                .opacity(min(1, abs(value.translation) / 30))
-                .animation(.easeOut(duration: 0.12), value: value.ready)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: value.translation < 0 ? .trailing : .leading)
-                .padding(.horizontal, 18).transition(.opacity)
-        }
-    }
-}
-
 struct TimelineLane: View {
     private enum ToolDestination: Hashable { case account, history, followingAuthors }
-    private enum EdgeDestination {
-        case source(Bool), media(MediaKind)
-        var title: String {
-            switch self {
-            case .source(let following): following ? "关注" : "推荐"
-            case .media(let kind): kind.title
-            }
-        }
-    }
     var isVisible: Bool
     let followed: Bool
     var sourceSelection: Binding<Bool>?
@@ -93,10 +25,13 @@ struct TimelineLane: View {
     var restartRequest = 0
     var topRequest = 0
     @EnvironmentObject private var session: SiteSession
+    @Environment(\.rootPageParticipation) private var rootParticipation
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.verticalSizeClass) private var verticalSizeClass
     @Environment(\.ordinaryColorScheme) private var ordinaryColorScheme
+    @Environment(\.accessibilityReduceTransparency) private var opaque
     @Environment(\.overlaidTabBarHeight) private var tabBarOverlap
+    @Environment(\.floatingPageSafeInsets) private var floatingSafeInsets
     @ObservedObject private var blocklist = TagBlocklist.shared
     @ObservedObject private var history = BrowsingHistory.shared
     @ObservedObject private var chrome = ViewingChromeController.shared
@@ -107,9 +42,13 @@ struct TimelineLane: View {
     @State private var pendingPreset: (request: FilterPresetRequest, filter: FeedFilter)?
     @State private var toolDestination: ToolDestination?
     @State private var creator: CreatorRoute?
+    @Environment(\.self) private var pageEnvironment
     @State private var authorHeaderRoute = NativeHeaderRoute()
     @State private var navigationVisible = true
-    @State private var edgePreview = TimelineEdgePreview()
+    @Environment(\.timelinePageMotion) private var inheritedPageMotion
+    @State private var standalonePageMotion = TimelinePageMotion()
+    @State private var edgeTarget: TimelinePageTarget?
+    private var pageMotion: TimelinePageMotion { inheritedPageMotion ?? standalonePageMotion }
     @State private var handledRestartRequest = 0
     @State private var handledTopRequest = 0
     @State private var gridAnchor: Int?
@@ -127,7 +66,7 @@ struct TimelineLane: View {
         if model.restoreState.continuationUnavailable {
             return .failed(.stalled(message: "保存的续页位置当前不可用；原作品仍保留，请重新获取当前结果。"))
         }
-        return feed.continuationState
+        return feed.displayContinuationState
     }
     #if DEBUG && targetEnvironment(simulator)
     @State private var qaMediaActive = false
@@ -143,9 +82,12 @@ struct TimelineLane: View {
     private var feed: FeedStore { model.feed }
     private var chromeBottomSpacing: CGFloat { verticalSizeClass == .compact ? 0 : FloatingPageChrome.bottomInset }
     private var chromeHeight: CGFloat { FloatingPageChrome.controlHeight + FloatingPageChrome.topInset + chromeBottomSpacing }
+    /// Preview declares final chrome/viewport without activating playback or history.
+    private var presentsPageGeometry: Bool {
+        isVisible || (rootParticipation.role == .prepared && (sourceSelection?.wrappedValue ?? false) == followed)
+    }
     private var floatingHeader: Bool {
-        presentation == .stream && isVisible && !feed.items.isEmpty &&
-        feed.requestKey?.identity == session.feedIdentity && !(followed && session.account == nil)
+        presentation == .stream && presentsPageGeometry && !(followed && session.account == nil)
     }
     private var filter: FeedFilter { model.filter }
     private var hasActiveFilter: Bool {
@@ -160,7 +102,18 @@ struct TimelineLane: View {
     }
     private var filterBinding: Binding<FeedFilter> { .init(get: { model.filter }, set: model.selectFilter) }
     private var kindBinding: Binding<MediaKind> {
-        .init(get: { filter.effectiveKind }, set: { model.selectFilter(filter.selecting(kind: $0)) })
+        .init(get: { filter.effectiveKind }, set: { kind in
+            guard kind != filter.effectiveKind else { return }
+            pageMotion.select(from: followed, target: .kind(kind), session: session) { model.selectFilter(filter.selecting(kind: kind)) }
+        })
+    }
+    private var animatedSourceSelection: Binding<Bool>? {
+        sourceSelection.map { selection in
+            Binding(get: { selection.wrappedValue }, set: { value in
+                guard value != selection.wrappedValue else { return }
+                pageMotion.select(from: followed, target: .source(value), session: session) { selection.wrappedValue = value }
+            })
+        }
     }
     private var tagSummary: String {
         let tags = blocklist.names.isEmpty ? "" : "标签屏蔽隐藏 \(feed.hiddenByTags) 项，另有 \(feed.unverifiedTags) 项标签待核实、暂不展示。"
@@ -198,7 +151,7 @@ struct TimelineLane: View {
     #endif
 
     private var timelineTools: some View {
-        Menu {
+        AppMenu {
             Button { openTool(.history) } label: {
                 Label("最近浏览", systemImage: "clock.arrow.circlepath")
             }
@@ -232,7 +185,6 @@ struct TimelineLane: View {
                 }
             }
         }
-        .menuOrder(.fixed)
         .buttonStyle(FloatingPageButtonStyle(iconOnly: true, overMedia: floatingHeader))
         .accessibilityLabel("时间线工具")
         .accessibilityValue((presentation == .stream ? "信息流" : "双列网格") + (hasActiveFilter ? "，筛选已启用" : "，默认筛选"))
@@ -249,7 +201,7 @@ struct TimelineLane: View {
             .accessibilityLabel("账号与设置")
             .accessibilityIdentifier("timeline.account")
             LazyVGrid(columns: FloatingPageChrome.equalColumns(segmentCount, gap: 0), spacing: 0) {
-                if let sourceSelection {
+                if let sourceSelection = animatedSourceSelection {
                     FloatingSegmentedControl(title: "时间线来源", selection: sourceSelection, options: [true, false],
                                              optionTitle: { $0 ? "关注" : "推荐" }, identifier: "timeline.source",
                                              overMedia: floatingHeader, nested: true, showsTrack: false)
@@ -274,8 +226,9 @@ struct TimelineLane: View {
                 .environment(\.colorScheme, floatingHeader ? .dark : ordinaryColorScheme)),
             firstRowHeight: FloatingPageChrome.surfaceHeight,
             colorScheme: floatingHeader ? .dark : ordinaryColorScheme,
-            surfaceColor: floatingHeader ? .black : AppTheme.pageBackground(for: ordinaryColorScheme),
-            borderColor: floatingHeader ? PlaybackChrome.panelStroke : Color.primary.opacity(0.10)
+            surfaceColor: HeaderPanelPalette.fill(overMedia: floatingHeader, scheme: ordinaryColorScheme, opaque: opaque),
+            borderColor: HeaderPanelPalette.border(overMedia: floatingHeader, scheme: ordinaryColorScheme),
+            environment: pageEnvironment, canvasRole: floatingHeader ? .playback : .ordinary
         )
         return timelineHeaderControls
             .background {
@@ -312,13 +265,19 @@ struct TimelineLane: View {
 
     private var laneCanvas: some View {
         ZStack(alignment: .top) {
-            if presentation == .stream && !feed.items.isEmpty { Color.black }
+            if presentation == .stream && !(followed && session.account == nil) { Color.black }
             else { Color(uiColor: .systemBackground) }
             if followed && session.account == nil {
-                ContentUnavailableView { Label("登录后刷关注作品", systemImage: "person.2") } description: {
-                    Text("查看你在 Civitai 关注的作者发布的图片和视频。")
-                } actions: { Button("使用 Google 登录") { session.openLogin() }.buttonStyle(AppActionButtonStyle(tone: .accent)) }
-            } else if feed.requestKey?.identity == session.feedIdentity && !feed.items.isEmpty {
+                ScrollView {
+                    PageMessageCard(title: "登录后刷关注作品", symbol: "person.2",
+                                    detail: "查看你在 Civitai 关注的作者发布的图片和视频。") {
+                        Button("使用 Google 登录") { session.openLogin() }
+                            .buttonStyle(AppActionButtonStyle(tone: .accent))
+                    }
+                    .padding(.horizontal, FloatingPageChrome.pageInset)
+                    .padding(.top, FloatingPageChrome.groupInset)
+                }.avoidOverlaidTabBar()
+            } else if presentation == .stream || (feed.requestKey?.identity == session.feedIdentity && !feed.items.isEmpty) {
                 if presentation == .grid {
                     MediaGrid(feed: feed, continuationState: continuationState, emptyDescription: filter.summary,
                               anchor: $gridAnchor,
@@ -329,14 +288,15 @@ struct TimelineLane: View {
                               refreshFromStart: { await model.restartFromStart(session: session) }) { item in
                         model.focused = item.id; gridViewer = item
                     } loadMore: { await model.next(session: session) }
-                        .padding(.top, chromeHeight + 4)
-                        .avoidOverlaidTabBar()
+                        .floatingScrollCanvas()
                 } else {
-                MediaDeck(items: feed.items, focused: $model.focused, focusRequest: model.focusRequest,
+                // Keep the stream host across loading/empty/error. An empty
+                // queue is still a playback canvas, never an ordinary white page.
+                MediaDeck(items: feed.requestKey?.identity == session.feedIdentity ? feed.items : [], focused: $model.focused, focusRequest: model.focusRequest,
                           queueRevision: model.queueRevision,
                           playbackSuspended: model.restoreState.isRefreshing || showFilter || presetRequest != nil,
                           automaticLoadingAllowed: model.automaticLoadingAllowed, loadsPageOnAppearance: false,
-                          isVisible: deckIsVisible, coveredByNavigation: isVisible && (showFilter || presetRequest != nil),
+                          isVisible: deckIsVisible, coveredByNavigation: isVisible && leavingInlinePlayback,
                           continuationState: continuationState,
                           loadMoreAutomatically: { await model.fillUpcoming(session: session, minimumUpcoming: preloadReserve) },
                           refreshFromStart: { await model.restartFromStart(session: session) },
@@ -345,11 +305,11 @@ struct TimelineLane: View {
                           continuationTopInset: chromeHeight,
                           gestureTopExclusion: chrome.hidden ? 0 : chromeHeight,
                           gestureExcludedFrames: chrome.hidden ? [] : overlayFrames,
-                          onEdgeSwipe: switchByEdge, onEdgeDrag: showEdgeDrag, onAuthor: openCreator, onDetailsVisibility: { feed.setTagPolicyDeferred($0) },
+                          onCanvasReady: { pageMotion.registerCanvas($0, followed: followed) },
+                          onEdgeSwipe: { _, _ in }, onEdgeDrag: showEdgeDrag, onAuthor: openCreator, onDetailsVisibility: { feed.setTagPolicyDeferred($0) },
                           historyCheckpoint: model.checkpoint, resumePositions: model.resumePositions) {
                     await model.nextAndFillUpcoming(session: session, minimumUpcoming: preloadReserve)
                 }
-                .modifier(TimelineEdgeMotion(preview: edgePreview))
                 }
             } else if deckIsVisible {
                 VStack(spacing: 14) {
@@ -363,6 +323,9 @@ struct TimelineLane: View {
                     }
                 }.padding(24).frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+            TimelineMotionStage(motion: pageMotion, followed: followed)
+                .ignoresSafeArea(.container, edges: .vertical)
+                .allowsHitTesting(false).accessibilityHidden(true)
             if floatingHeader && !chrome.hidden {
                 LinearGradient(stops: [
                     .init(color: .black.opacity(0.54), location: 0),
@@ -372,51 +335,69 @@ struct TimelineLane: View {
                 .frame(height: chromeHeight + 34)
                 .allowsHitTesting(false).accessibilityHidden(true)
             }
-            TimelineEdgePreviewView(preview: edgePreview)
-                .viewingChromeHidden(chrome.hidden).allowsHitTesting(false).accessibilityHidden(true)
             // Keep both feeds alive, but put only the active lane's controls in the view hierarchy.
-            if isVisible { timelineHeader }
+            if presentsPageGeometry { timelineHeader }
             if let savedCheckpoint = model.resumeCandidate {
-                HStack(spacing: 8) {
+                HStack(spacing: 0) {
                     Button { Task { await model.restore(savedCheckpoint, session: session) } } label: {
-                        Label("接着看 · 上次" + lane.title, systemImage: "play.circle")
-                            .font(.caption.weight(.medium)).padding(.horizontal, 13).padding(.vertical, 9)
+                        HStack(spacing: FloatingPageChrome.groupInset) {
+                            Image(systemName: "play.circle")
+                            Text("接着看 · 上次" + lane.title).lineLimit(1).truncationMode(.tail)
+                        }
+                        .font(.caption.weight(.medium))
+                        .padding(.leading, FloatingPageChrome.spacing)
+                        .frame(minHeight: FloatingPageChrome.controlHeight)
                     }.disabled(model.restoreState.isBusy).accessibilityIdentifier("timeline.resume")
                     Button { model.dismissPrompt() } label: {
-                        Image(systemName: "xmark").font(.caption.weight(.bold)).frame(width: 44, height: 44)
+                        Image(systemName: "xmark").font(.caption.weight(.medium))
+                            .frame(width: FloatingPageChrome.controlHeight, height: FloatingPageChrome.controlHeight)
+                            .contentShape(Rectangle())
                     }.accessibilityLabel("关闭接着看提示").accessibilityIdentifier("timeline.resume.close")
-                }.foregroundStyle(.white).background(.black.opacity(0.68), in: Capsule())
-                    .timelineGestureFrame(in: gestureSpace).padding(.top, chromeHeight - 2).viewingChromeHidden(chrome.hidden)
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, FloatingPageChrome.groupInset)
+                .modifier(MediaFeedbackSurface(verticalInset: FloatingPageChrome.surfaceInset))
+                .accessibilityElement(children: .contain).accessibilityIdentifier("timeline.resume.banner")
+                .timelineGestureFrame(in: gestureSpace)
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.horizontal, FloatingPageChrome.pageInset)
+                // Both visible surfaces are inset 4pt inside their 44pt hit rows.
+                .padding(.top, FloatingPageChrome.topInset + FloatingPageChrome.controlHeight - FloatingPageChrome.surfaceInset)
+                .viewingChromeHidden(chrome.hidden)
             }
-            if let notice = model.notice, notice.isError {
+            if let notice = model.notice, notice.isError, notice.recovery == .restartFromStart {
                 HStack(spacing: 10) {
-                    Text(notice.text).font(.caption).lineLimit(notice.isError ? 5 : 3)
-                        .accessibilityIdentifier("timeline.notice.text")
-                    if notice.recovery == .restartFromStart {
-                        SwiftUI.TimelineView(.periodic(from: .now, by: 0.5)) { context in
-                            StatusReloadButton { model.requestRestartFromStart(session: session) }
-                                .environment(\.colorScheme, .dark)
-                                .disabled(model.restoreState.isRefreshing || (feed.restartRetryAvailableAt.map { $0 > context.date } ?? false))
-                                .accessibilityIdentifier("timeline.notice.retry")
-                        }.fixedSize()
-                    }
+                    SwiftUI.TimelineView(.periodic(from: .now, by: 0.5)) { context in
+                        StatusReloadButton { model.requestRestartFromStart(session: session) }
+                            .environment(\.colorScheme, .dark)
+                            .disabled(model.restoreState.isRefreshing || (feed.restartRetryAvailableAt.map { $0 > context.date } ?? false))
+                            .accessibilityIdentifier("timeline.notice.retry")
+                    }.fixedSize()
                     Button { model.clearMessage(id: notice.id) } label: {
                         Image(systemName: "xmark").font(.caption.weight(.bold)).frame(width: 44, height: 44)
                     }.accessibilityLabel("关闭提示").accessibilityIdentifier("timeline.notice.close")
-                }.padding(.leading, 12).padding(.trailing, 2).padding(.vertical, 4)
-                    .foregroundStyle(.white).background(.black.opacity(0.82), in: RoundedRectangle(cornerRadius: 14))
+                }.padding(.horizontal, FloatingPageChrome.cardInset).padding(.vertical, ContentMetrics.Card.rowVerticalInset)
+                    .modifier(MediaFeedbackSurface())
                     .contentShape(Rectangle())
                     .simultaneousGesture(TapGesture().onEnded { if !notice.isError { model.clearMessage(id: notice.id) } })
                     .accessibilityElement(children: .contain).accessibilityIdentifier("timeline.notice")
-                    .accessibilityValue(notice.isError ? "错误，等待处理" : "约两秒半后收起，可点按关闭")
+                    .accessibilityValue("错误，等待处理")
                     .timelineGestureFrame(in: gestureSpace)
                     .padding(.horizontal, 16).padding(.top, chromeHeight).viewingChromeHidden(chrome.hidden)
             }
         }
+        .existingFeedbackToast(model.notice.flatMap { $0.isError ? $0.text : nil },
+                               id: model.notice?.id,
+                               active: laneVisible && scenePhase == .active && !chrome.hidden && !leavingInlinePlayback,
+                               scope: session.feedIdentity)
     }
 
     private var presentedLane: some View {
         laneCanvas.coordinateSpace(name: gestureSpace)
+        .environment(\.floatingPageContentInsets, EdgeInsets(top: floatingSafeInsets.top + (chrome.hidden ? 0 : chromeHeight),
+                                                           leading: 0, bottom: floatingSafeInsets.bottom + tabBarOverlap, trailing: 0))
+        .pageBodyViewport(top: chrome.hidden ? 0 : chromeHeight, bottom: tabBarOverlap, enabled: presentsPageGeometry)
+        .timelinePageAnchor(pageMotion, model: model, followed: followed)
         .onPreferenceChange(TimelineGestureFrameKey.self) { overlayFrames = $0 }
         .background((floatingHeader ? Color.black : Color(uiColor: .systemBackground)).ignoresSafeArea())
         .toolbar(.hidden, for: .navigationBar)
@@ -487,9 +468,17 @@ struct TimelineLane: View {
                 return
             }
             #endif
+            #if DEBUG && targetEnvironment(simulator)
+            if ProcessInfo.processInfo.arguments.contains("--qa-initial-loading171"), laneVisible, feed.requestKey == nil {
+                do { try await Task.sleep(for: .seconds(3)); try Task.checkCancellation() } catch { return }
+            }
+            #endif
             await model.activate(session: session, visible: laneVisible && scenePhase == .active, blockedTags: blocklist.names)
             if presentation == .stream, model.shouldFillOnAppearance {
                 await model.fillUpcoming(session: session, minimumUpcoming: preloadReserve)
+            }
+            if laneVisible && scenePhase == .active && presentation == .stream {
+                await pageMotion.prepareNeighbors(from: followed, session: session, blockedTags: blocklist.names)
             }
         }
         .onChange(of: restartRequest) { _, _ in
@@ -499,11 +488,11 @@ struct TimelineLane: View {
         .onChange(of: blocklist.names) { _, names in model.applyBlockedTags(names); requestAppearanceFill() }
         .onChange(of: session.following) { _, ids in Task { await model.followingChanged(ids, session: session) } }
         .onChange(of: leavingInlinePlayback) { _, leaving in
-            if leaving && isVisible { restoreInlineOrientation?() }
+            if leaving && isVisible { pageMotion.cancel(); restoreInlineOrientation?() }
         }
         .onChange(of: isVisible) { _, visible in
             model.setVisible(laneVisible && scenePhase == .active)
-            if !visible { cancelContinuationAction(); edgePreview.clear() }
+            if !visible { cancelContinuationAction(); pageMotion.sourceHidden(followed) }
             if visible { handlePendingTop(); handlePendingRestart() }
             else { handledTopRequest = topRequest; handledRestartRequest = restartRequest }
         }
@@ -519,14 +508,14 @@ struct TimelineLane: View {
         }
         .onDisappear {
             cancelContinuationAction()
-            edgePreview.clear()
+            pageMotion.cancel()
             navigationVisible = false; model.setVisible(isVisible && gridViewer != nil)
             #if DEBUG && targetEnvironment(simulator)
             qaController?.visibilityChanged(isVisible && gridViewer != nil)
             #endif
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase != .active { cancelContinuationAction(); edgePreview.clear() }
+            if phase != .active { cancelContinuationAction(); pageMotion.stop() }
             model.setVisible(laneVisible && phase == .active)
         }
     }
@@ -588,32 +577,32 @@ struct TimelineLane: View {
         creator = route
     }
 
-    private func edgeDestination(in region: MediaEdgeRegion) -> EdgeDestination? {
+    private func edgeDestination(in region: MediaEdgeRegion) -> TimelinePageTarget? {
         switch region {
-        case .upper:
-            guard sourceSelection != nil else { return nil }
-            return .source(!followed)
-        case .lower:
-            return .media(filter.effectiveKind == .video ? .image : .video)
-        }
-    }
-
-    private func switchByEdge(_: Int, _ region: MediaEdgeRegion) {
-        guard deckIsVisible, scenePhase == .active, let destination = edgeDestination(in: region) else { return }
-        switch destination {
-        case .source(let following): sourceSelection?.wrappedValue = following
-        case .media(let kind): model.selectFilter(filter.selecting(kind: kind))
+        case .upper: sourceSelection == nil ? nil : .source(!followed)
+        case .lower: .kind(filter.effectiveKind == .video ? .image : .video)
         }
     }
 
     private func showEdgeDrag(_ delta: Double, _ phase: MediaPanPhase, _ region: MediaEdgeRegion) {
         switch phase {
         case .began, .changed:
-            let destination = abs(delta) > 5 ? edgeDestination(in: region) : nil
-            edgePreview.update(title: destination?.title, translation: delta)
-        case .ended: edgePreview.clear(animated: abs(delta) < ScreenEdgeGesture.commitDistance)
-        case .cancelled: edgePreview.clear(animated: true)
+            guard deckIsVisible, scenePhase == .active else { return }
+            if !pageMotion.isInteracting, abs(delta) > 2, let target = edgeDestination(in: region),
+               pageMotion.begin(from: followed, target: target, translation: delta, session: session) { edgeTarget = target }
+            pageMotion.move(delta)
+        case .ended:
+            guard let target = edgeTarget else { return }
+            pageMotion.end(delta) {
+                switch target {
+                case .source(let following): sourceSelection?.wrappedValue = following
+                case .kind(let kind): model.selectFilter(filter.selecting(kind: kind))
+                }
+            }
+            edgeTarget = nil
+        case .cancelled:
+            pageMotion.end(0, preserveRelease: true) {}
+            edgeTarget = nil
         }
     }
 }
-
