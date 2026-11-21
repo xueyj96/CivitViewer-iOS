@@ -1005,6 +1005,23 @@ import Foundation
         check(budgetSession.pageRequests.map(\.cursor) == [nil, "budget-next"] && budgetModel.feed.items.map(\.id) == [8121],
               "Entering a prepared source resumes filtered-page cursor and exposes the real work")
 
+        let resumeWarmRoot = workspace.appendingPathComponent("cancelled-warm-resume", isDirectory: true)
+        let (resumeWarmModel, _, resumeWarmSession, _, _) = await modelAndSession(root: resumeWarmRoot, owner: 814)
+        let warmStarted = TestGate()
+        resumeWarmSession.fetch = { _ in
+            warmStarted.open()
+            try await Task.sleep(for: .seconds(10))
+            return .init(items: [media(8140)], metadata: .init(nextCursor: nil))
+        }
+        let cancelledWarm = Task { await resumeWarmModel.warm(session: resumeWarmSession, blockedTags: [], otherKind: false) }
+        await warmStarted.wait(); cancelledWarm.cancel(); await cancelledWarm.value
+        check(resumeWarmModel.feed.requestKey != nil && resumeWarmModel.feed.items.isEmpty,
+              "Cancelled warm keeps its request identity and incomplete cursor state for a later resume")
+        resumeWarmSession.fetch = { _ in .init(items: [media(8141)], metadata: .init(nextCursor: nil)) }
+        await resumeWarmModel.warm(session: resumeWarmSession, blockedTags: [], otherKind: false)
+        check(resumeWarmSession.pageRequests.count == 2 && resumeWarmModel.feed.items.map(\.id) == [8141],
+              "A later warm resumes the same cancelled request instead of skipping its incomplete store")
+
         let emptyKindRoot = workspace.appendingPathComponent("empty-adjacent-kind", isDirectory: true)
         let (emptyKindModel, _, emptyKindSession, _, _) = await modelAndSession(root: emptyKindRoot, owner: 813, filter: FeedFilter(kind: .image))
         emptyKindSession.fetch = { request in
@@ -1017,6 +1034,10 @@ import Foundation
         emptyKindModel.selectFilter(FeedFilter(kind: .video))
         check(emptyKindModel.feed.items.isEmpty && !emptyKindModel.feed.reachedEnd,
               "An empty filtered adjacent page transfers incomplete state rather than a fake end")
+        emptyKindModel.selectFilter(FeedFilter(kind: .image))
+        emptyKindModel.selectFilter(FeedFilter(kind: .video))
+        check(emptyKindModel.feed.items.isEmpty && !emptyKindModel.feed.reachedEnd,
+              "A previously active empty filtered lane survives a round trip while still incomplete")
         await emptyKindModel.activate(session: emptyKindSession, visible: true, blockedTags: ["blocked"])
         check(emptyKindSession.pageRequests.filter { $0.filter.kind == .video }.map(\.cursor) == [nil, "kind-next"],
               "Switching into an empty prepared kind resumes its accepted cursor without refetching page one")
@@ -1050,8 +1071,72 @@ import Foundation
         check(warmModel.previewItem(otherKind: true, identity: warmSession.feedIdentity) == nil,
               "Session invalidation drops adjacent account data")
 
+        let handoffRoot = workspace.appendingPathComponent("adjacent-hidden-tail", isDirectory: true)
+        let (handoffModel, _, handoffSession, _, _) = await modelAndSession(root: handoffRoot, owner: 802, filter: FeedFilter(kind: .image))
+        handoffSession.fetch = { request in
+            if request.filter.kind == .video {
+                return .init(items: [media(8210, type: "video")], metadata: .init(nextCursor: nil))
+            }
+            switch request.cursor {
+            case nil:
+                return .init(items: [media(8200, tags: ["visible"]), media(8201, tags: ["blocked"])],
+                             metadata: .init(nextCursor: "image-next"))
+            case "image-next":
+                return .init(items: [media(8202, tags: ["visible"])], metadata: .init(nextCursor: nil))
+            default: preconditionFailure("Unexpected handoff cursor")
+            }
+        }
+        await handoffModel.activate(session: handoffSession, visible: true, blockedTags: ["blocked"])
+        await handoffModel.warm(session: handoffSession, blockedTags: ["blocked"], otherKind: true)
+        handoffModel.selectFilter(.init(kind: .video))
+        handoffModel.selectFilter(.init(kind: .image))
+        check(handoffModel.feed.items.map(\.id) == [8200] && handoffModel.focused == 8200,
+              "Session handoff preserves the visible queue and focus while a hidden tail is retained")
+        await handoffModel.next(session: handoffSession)
+        check(handoffSession.pageRequests.filter { $0.filter.kind == .image }.map(\.cursor) == [nil, "image-next"],
+              "Returning to the same lane makes no first-page replay even with a hidden source tail")
+        handoffModel.applyBlockedTags([])
+        check(handoffModel.feed.items.map(\.id) == [8200, 8201, 8202],
+              "The old hidden source row survives the roundtrip and later policy changes")
+
         check(fillModel.shouldFillOnAppearance,
               "Ordinary browsing exposes stable appearance-fill demand")
+        // History writes are persistence events, not lane redraw events. Resume
+        // inputs remain the snapshot selected by the restore action.
+        let projectionRoot = workspace.appendingPathComponent("history-projection", isDirectory: true)
+        let writer = BrowsingHistory(rootURL: projectionRoot)
+        await writer.bind(ownerID: 999, identity: "projection-seed")
+        let seedContext = writer.context(ownerID: 999)!
+        let video = media(9991, type: "video")
+        writer.record(video, context: seedContext)
+        await writer.waitForWrites()
+        writer.progress(id: video.id, position: 4, duration: 60, flush: true, context: seedContext)
+        let snapshotCheckpoint = TimelineCheckpoint(lane: .recommendation, filter: FeedFilter(kind: .video),
+            ids: [video.id], focusedID: video.id, updatedAt: Date())
+        writer.checkpoint(snapshotCheckpoint, context: seedContext)
+        await writer.waitForWrites()
+        let (projectionModel, projectionHistory, projectionSession, _, _) = await modelAndSession(root: projectionRoot, owner: 999)
+        projectionSession.mediaByID = [video.id: video]
+        projectionSession.fetch = { _ in .init(items: [video], metadata: .init(nextCursor: nil)) }
+        await projectionModel.activate(session: projectionSession, visible: true, blockedTags: [])
+        await projectionModel.restore(snapshotCheckpoint, session: projectionSession)
+        try await Task.sleep(for: .milliseconds(30))
+        check(projectionModel.resumePositions[video.id] == 4, "Restore captures the selected video position")
+        var lanePublishes = 0
+        let projectionObservation = projectionModel.objectWillChange.sink { lanePublishes += 1 }
+        let projectionContext = projectionHistory.context(ownerID: 999)!
+        projectionHistory.progress(id: video.id, position: 19, duration: 60, flush: true, context: projectionContext)
+        await projectionHistory.waitForWrites()
+        try await Task.sleep(for: .milliseconds(30))
+        check(projectionHistory.resumePosition(for: video.id) == 19, "Playback progress still persists to real history")
+        check(lanePublishes == 0, "A history progress write does not publish the timeline model")
+        check(projectionModel.resumePositions[video.id] == 4, "Persisted playback progress does not rewrite the restored resume input")
+        projectionHistory.setRecordingEnabled(false, context: projectionContext)
+        await projectionHistory.waitForWrites()
+        try await Task.sleep(for: .milliseconds(30))
+        check(lanePublishes > 0 && projectionModel.context?.generation != projectionContext.generation,
+              "Recording invalidation still reaches the lane through its context projection")
+        projectionObservation.cancel()
         print("TimelineModelChecks: \(checks) real-model assertions passed; FakeTimelineSource reads are fake")
     }
 }

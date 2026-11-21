@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 // Compile the production FeedStore with a deterministic read-only site double.
 // No credentials or network are used; responses can finish out of order.
@@ -94,6 +95,7 @@ import Foundation
             source.fetch = { _ in .init(items: valid + [invalid], metadata: .init(nextCursor: nil)) }
             _ = await collected.activate(session: source, filter: .init(kind: .all), source: .discovery,
                                          blockedTags: ["blocked"], deduplicateMediaAssets: true)
+            await observed.flush()
             let policy = TagAvailabilityPolicy(blockedTags: ["blocked"], deduplicateMediaAssets: true)
             check(observed.estimate(tagID: 300, scope: source.tagEvidenceIdentity, policy: policy)?.countLowerBound == 3,
                   "Normal FeedStore pages contribute visible tag samples through the shared integration")
@@ -210,14 +212,21 @@ import Foundation
               "An account identity change invalidates an in-flight page before commit")
         site.feedIdentity = "fixture:1"
 
-        site.requests = []; site.fetch = { _ in page(6) }
+        site.requests = []; let cancelStarted = Gate(), releaseCancelled = Gate()
+        site.fetch = { _ in
+            cancelStarted.open(); await releaseCancelled.wait()
+            if Task.isCancelled { throw CancellationError() }
+            return page(6)
+        }
         let cancelled = Task { await store.activate(session: site, filter: FeedFilter(kind: .image), source: .discovery, force: true) }
-        try? await Task.sleep(for: .milliseconds(10))
-        cancelled.cancel()
+        await cancelStarted.wait()
+        check(site.requests.count == 1 && store.loading,
+              "A committed source intent starts its request rather than waiting for a draft debounce")
+        cancelled.cancel(); releaseCancelled.open()
         let cancelCommit = await cancelled.value
-        try? await Task.sleep(for: .milliseconds(280))
-        check(cancelCommit.status == .cancelled && site.requests.isEmpty,
-              "Cancellation after entering source-switch debounce does not submit late")
+        check(cancelCommit.status == .cancelled && store.items.isEmpty && !store.loading,
+              "Cancellation of an active source request cannot commit its late response")
+        site.fetch = { _ in page(6) }
         let resumed = await store.activate(session: site, filter: FeedFilter(kind: .image), source: .discovery)
         check(resumed.status == .committed && store.items.map(\.id) == [6],
               "An uncompleted cancelled activation can continue on the same key")
@@ -231,25 +240,36 @@ import Foundation
               && store.accepts(resumed, identity: site.feedIdentity),
               "A cancelled activation rejected at entry cannot clear a newer committed result")
 
-        site.requests = []; site.fetch = { _ in page(7) }
-        let debounced = Task { await store.activate(session: site, filter: FeedFilter(kind: .image), source: .discovery, force: true) }
-        try? await Task.sleep(for: .milliseconds(10))
+        site.requests = []; let joinStarted = Gate(), releaseJoin = Gate()
+        site.fetch = { _ in joinStarted.open(); await releaseJoin.wait(); return page(7) }
+        let firstOwner = Task { await store.activate(session: site, filter: FeedFilter(kind: .image), source: .discovery, force: true) }
+        await joinStarted.wait()
         let coalesced = await store.activate(session: site, filter: FeedFilter(kind: .image), source: .discovery)
-        let displacedOwner = await debounced.value
-        check(coalesced.status == .committed && displacedOwner.status == .superseded && site.requests.count == 1,
-              "A same-key activation takes over pending debounce ownership without duplicate requests")
-        check(site.requests.count == 1 && store.items.map(\.id) == [7],
-              "Concurrent same-key activation results in one request only")
+        check(coalesced.status == .unchanged && site.requests.count == 1 && store.loading,
+              "A same-key caller joins an actual active request without replacing its owner")
+        releaseJoin.open()
+        let firstCommit = await firstOwner.value
+        check(firstCommit.status == .committed && site.requests.count == 1 && store.items.map(\.id) == [7],
+              "Concurrent same-key activation results in one request and one accepted page")
 
-        site.requests = []; site.fetch = { _ in page(9) }
+        site.requests = []; let replaceStarted = Gate(), releaseReplaced = Gate(); var replaceCalls = 0
+        site.fetch = { _ in
+            replaceCalls += 1
+            if replaceCalls == 1 {
+                replaceStarted.open(); await releaseReplaced.wait()
+                if Task.isCancelled { throw CancellationError() }
+                return page(99)
+            }
+            return page(9)
+        }
         let cancelledOwner = Task { await store.activate(session: site, filter: FeedFilter(kind: .image), source: .discovery, force: true) }
-        try? await Task.sleep(for: .milliseconds(10))
-        cancelledOwner.cancel()
+        await replaceStarted.wait(); cancelledOwner.cancel()
         let replacementOwner = await store.activate(session: site, filter: FeedFilter(kind: .image), source: .discovery)
+        releaseReplaced.open()
         let replacedCommit = await cancelledOwner.value
         check(replacedCommit.status == .cancelled && replacementOwner.status == .committed
-              && site.requests.count == 1 && store.items.map(\.id) == [9],
-              "A same-key caller takes over when the debounce owner is cancelled")
+              && site.requests.count == 2 && store.items.map(\.id) == [9],
+              "A same-key caller replaces a cancelled in-flight owner; its old late page stays rejected")
 
         let flightStore = FeedStore(), flightStarted = Gate(), releaseFlight = Gate()
         site.requests = []; var flightCalls = 0
@@ -999,6 +1019,131 @@ import Foundation
         check(directWaitResult.status == .cancelled && Date().timeIntervalSince(directWaitCancelledAt) < 1 && directWaitPage == 4 &&
               directWaitStore.items.map(\.id) == [9_500] && !directWaitStore.continuationState.isLoading,
               "Cancelling the creating restart caller interrupts its slice sleep promptly without a fifth request")
+
+        func accumulatorItem(_ id: Int, _ suffix: String, authorID: Int? = 7, username: String = "artist",
+                             tags: [MediaTag]? = [.init(name: "clear")], type: String = "image",
+                             duration: Double? = nil) -> MediaItem {
+            MediaItem(id: id, url: "https://fixture.invalid/accumulator/\(suffix)", width: 640, height: 640,
+                      type: type, username: username, browsingLevel: 1, thumbnail: nil, creatorID: authorID,
+                      tags: tags, metadata: duration.map { VideoTechnicalMetadata(duration: $0) })
+        }
+        let accumulatorFirstPage = MediaPage(items: [
+            accumulatorItem(10_001, "shared"),
+            accumulatorItem(10_002, "unknown", tags: nil),
+            accumulatorItem(10_002, "repeated-id"),
+        ], metadata: .init(nextCursor: "accumulator:20"))
+        let accumulatorSecondPage = MediaPage(items: [
+            accumulatorItem(10_003, "shared"),
+            accumulatorItem(10_004, "author", authorID: 8, username: "BlockedName"),
+            accumulatorItem(10_008, "author-handle", authorID: nil, username: "BlockedName"),
+            accumulatorItem(10_005, "tag", tags: [.init(name: "blocked")]),
+            accumulatorItem(10_006, "unknown-2", tags: nil),
+        ], metadata: .init(nextCursor: nil))
+        var incremental = FeedAccumulator(blockedTags: ["blocked"], deduplicateMediaAssets: true)
+        _ = incremental.append(accumulatorFirstPage)
+        check(incremental.applyBlockedAuthors(ids: [8], handles: ["blockedname"]),
+              "Changing author IDs and handles rebuilds the applied projection once")
+        _ = incremental.append(accumulatorSecondPage)
+        var fullSourceOracle = FeedAccumulator()
+        _ = fullSourceOracle.applyBlockedAuthors(ids: [8], handles: ["blockedname"])
+        _ = fullSourceOracle.append(MediaPage(items: accumulatorFirstPage.items + accumulatorSecondPage.items,
+                                              metadata: .init(nextCursor: nil)))
+        _ = fullSourceOracle.applyVisibilityPolicy(blockedTags: ["blocked"], deduplicateMediaAssets: true)
+        check(incremental.items.map(\.id) == fullSourceOracle.items.map(\.id) &&
+              incremental.duplicateCount == fullSourceOracle.duplicateCount &&
+              incremental.blockedCount == fullSourceOracle.blockedCount &&
+              incremental.blockedAuthorCount == fullSourceOracle.blockedAuthorCount &&
+              incremental.unverifiedCount == fullSourceOracle.unverifiedCount &&
+              incremental.hiddenByDuration == fullSourceOracle.hiddenByDuration &&
+              incremental.cursor == accumulatorSecondPage.metadata.nextCursor && incremental.reachedEnd,
+              "Stable-policy page projection matches a full-source oracle across repeated IDs, assets, unknown tags, and author/tag blocks")
+        check(incremental.duplicateCount == 2 && incremental.blockedCount == 1 &&
+              incremental.blockedAuthorCount == 2 && incremental.unverifiedCount == 2,
+              "Incremental counts duplicate=\(incremental.duplicateCount), tag=\(incremental.blockedCount), author=\(incremental.blockedAuthorCount), unknown=\(incremental.unverifiedCount)")
+
+        var directlyChanged = FeedAccumulator(blockedTags: [], deduplicateMediaAssets: true)
+        _ = directlyChanged.append(accumulatorFirstPage)
+        directlyChanged.blockedTags = ["blocked"]
+        directlyChanged.deduplicateMediaAssets = false
+        directlyChanged.videoDurationRange = VideoDurationRange(minimumSeconds: 5, maximumSeconds: 5)
+        _ = directlyChanged.append(MediaPage(items: [accumulatorItem(10_007, "duration-video", type: "video", duration: 5)],
+                                             metadata: .init(nextCursor: "direct-policy-tail")))
+        var directPolicyOracle = FeedAccumulator()
+        _ = directPolicyOracle.applyBlockedAuthors(ids: [8], handles: ["blockedname"])
+        _ = directPolicyOracle.append(MediaPage(items: accumulatorFirstPage.items + [accumulatorItem(10_007, "duration-video", type: "video", duration: 5)],
+                                                metadata: .init(nextCursor: "direct-policy-tail")))
+        directPolicyOracle.blockedTags = ["blocked"]
+        directPolicyOracle.deduplicateMediaAssets = false
+        directPolicyOracle.videoDurationRange = VideoDurationRange(minimumSeconds: 5, maximumSeconds: 5)
+        _ = directPolicyOracle.applyBlockedTags(["blocked"])
+        check(directlyChanged.items.map(\.id) == directPolicyOracle.items.map(\.id) &&
+              directlyChanged.hiddenByDuration == directPolicyOracle.hiddenByDuration &&
+              directlyChanged.unverifiedDuration == directPolicyOracle.unverifiedDuration &&
+              directlyChanged.blockedCount == directPolicyOracle.blockedCount &&
+              directlyChanged.duplicateCount == directPolicyOracle.duplicateCount,
+              "Direct mutation of public tag, asset, and duration policy fields triggers a full reconciliation before append")
+        check(!incremental.applyBlockedAuthors(ids: [8], handles: ["blockedname"]) &&
+              !incremental.applyBlockedTags(["blocked"]) && !incremental.setDeduplicateMediaAssets(true),
+              "Reapplying an already applied policy reports no change")
+
+        let rescanSeedA = accumulatorItem(10_010, "seed-a")
+        let rescanSeedB = accumulatorItem(10_011, "seed-b")
+        var rescanAccumulator = FeedAccumulator(deduplicateMediaAssets: true)
+        rescanAccumulator.restore([rescanSeedA, rescanSeedB], cursor: nil, reachedEnd: false,
+                                  rescanFromBeginning: true, rescanBoundaryID: rescanSeedB.id)
+        _ = rescanAccumulator.append(MediaPage(items: [
+            accumulatorItem(10_012, "new-before-boundary"),
+            accumulatorItem(10_013, "seed-a"),
+            rescanSeedB,
+            accumulatorItem(10_014, "new-after-boundary"),
+        ], metadata: .init(nextCursor: nil)))
+        check(rescanAccumulator.items.map(\.id) == [10_010, 10_011, 10_012, 10_014] &&
+              rescanAccumulator.duplicateCount == 2 && rescanAccumulator.sourceTailID == 10_014,
+              "Incremental projection preserves rescan seed-asset and boundary duplicate semantics")
+
+        let publicationSource = FakeFeedSource(), publicationStore = FeedStore()
+        publicationSource.fetch = { _ in
+            .init(items: [video(10_020, assetA, tags: [.init(name: "city")]), video(10_021, assetB, tags: [.init(name: "nature")])],
+                  metadata: .init(nextCursor: "publication-tail"))
+        }
+        var itemPublications = 0
+        var objectChanges = 0
+        let itemPublicationToken = publicationStore.$items.sink { _ in itemPublications += 1 }
+        let objectChangeToken = publicationStore.objectWillChange.sink { _ in objectChanges += 1 }
+        _ = await publicationStore.activate(session: publicationSource, filter: FeedFilter(kind: .video), source: .discovery)
+        itemPublications = 0
+        objectChanges = 0
+        let sameLoadedKey = await publicationStore.activate(session: publicationSource, filter: FeedFilter(kind: .video), source: .discovery)
+        check(sameLoadedKey.status == .unchanged && itemPublications == 0 && objectChanges == 0,
+              "Activating the same loaded key with the same policy emits no items or objectWillChange publication")
+        publicationStore.setTagPolicyDeferred(true)
+        publicationStore.setTagPolicyDeferred(false)
+        check(itemPublications == 0 && objectChanges == 0 && publicationStore.items.map(\.id) == [10_020, 10_021],
+              "Closing detail tag deferral without a pending policy change emits no items or objectWillChange publication")
+        publicationStore.setTagPolicyDeferred(true)
+        publicationStore.applyBlockedTags(["city"])
+        publicationStore.setTagPolicyDeferred(false)
+        check(itemPublications == 1 && publicationStore.items.map(\.id) == [10_021],
+              "Closing detail tag deferral with one pending policy change rebuilds and publishes exactly once")
+        withExtendedLifetime((itemPublicationToken, objectChangeToken)) {}
+
+        let preparedSource = FakeFeedSource(), preparedStore = FeedStore(), adoptedStore = FeedStore()
+        preparedSource.fetch = { _ in .init(items: [
+            accumulatorItem(10_030, "prepared-clear"),
+            accumulatorItem(10_031, "prepared-blocked", tags: [.init(name: "city")]),
+            accumulatorItem(10_032, "prepared-unknown", tags: nil),
+        ], metadata: .init(nextCursor: nil)) }
+        _ = await preparedStore.activate(session: preparedSource, filter: FeedFilter(kind: .image), source: .discovery,
+                                         blockedTags: ["city"], deduplicateMediaAssets: false)
+        var adoptedItemsPublications = 0
+        let adoptedItemsToken = adoptedStore.$items.sink { _ in adoptedItemsPublications += 1 }
+        adoptedItemsPublications = 0
+        let preparedKey = preparedStore.requestKey!
+        let didAdopt = adoptedStore.adoptPrepared(preparedStore, key: preparedKey, blockedTags: ["city"])
+        check(didAdopt && adoptedStore.items.map(\.id) == [10_030] && adoptedItemsPublications == 1 &&
+              adoptedStore.hiddenByTags == 1 && adoptedStore.unverifiedTags == 1,
+              "Adopting a replacement accumulator publishes rows once and synchronizes its nonzero counters when policy is unchanged")
+        withExtendedLifetime(adoptedItemsToken) {}
 
         print("FeedStoreChecks: \(checkCount) regression checks passed")
     }

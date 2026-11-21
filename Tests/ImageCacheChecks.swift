@@ -9,18 +9,20 @@ import Combine
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("image-cache-checks-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let cache = MediaCache(directoryURL: root.appendingPathComponent("cache"), monitorNetwork: false, diagnostics: nil)
+        try await PreviewQuotaChecks.run(root: root)
+        await cache.trim()
         var checks = 0
         func check(_ value: @autoclosure () -> Bool, _ message: String) { precondition(value(), message); checks += 1 }
         check(cache.diskUsageKnown && cache.diskBytes == 0, "A successfully scanned empty cache is a known zero")
         let cacheFolder = root.appendingPathComponent("cache")
         try FileManager.default.removeItem(at: cacheFolder)
         try Data("directory unavailable".utf8).write(to: cacheFolder)
-        cache.trim()
+        (await cache.trim())
         check(!cache.diskUsageKnown, "An unreadable cache directory must not be presented as zero bytes")
-        check(cache.reserveRepairBudget() == 0, "Unknown cache usage never admits conversion output")
+        let cacheObserved7_0 = await cache.reserveRepairBudget(); check(cacheObserved7_0 == 0, "Unknown cache usage never admits conversion output")
         try FileManager.default.removeItem(at: cacheFolder)
         try FileManager.default.createDirectory(at: cacheFolder, withIntermediateDirectories: true)
-        cache.trim()
+        (await cache.trim())
         check(cache.diskUsageKnown && cache.diskBytes == 0, "A subsequent successful scan restores known empty usage")
         func address(_ path: String) -> URL { base.appendingPathComponent(path) }
         func target(_ url: URL) -> URL {
@@ -33,11 +35,96 @@ import Combine
         let asset = "https://image.civitai.com/public-prefix/1B8CB1F8-AC2B-4E7D-93D0-0D2BF22F3BA1/original=true,blur=15/clip.mp4"
         let still = MediaPosterPolicy.stillURL(URL(string: asset)!)!
         check(still.host == "image.civitai.com" && still.path.hasPrefix("/public-prefix/1B8CB1F8-AC2B-4E7D-93D0-0D2BF22F3BA1/"), "Poster preserves exact CDN namespace and asset")
-        check(still.path.contains("blur=15") && still.path.contains("transcode=true") && still.path.contains("anim=false") && still.path.contains("width=450"), "Poster retains blur while requesting documented bounded still format")
+        check(still.path.contains("blur=15") && still.path.contains("transcode=true") && still.path.contains("anim=false") && still.path.contains("width=450"), "Known video still retains blur and requests bounded video still format")
         check(!still.path.contains("original=true") && still.path.hasSuffix("poster.jpeg"), "Original MP4 option is replaced only for still delivery")
         for raw in [asset + "?signature=fixture", asset + "#fragment", "https://foreign.test/1B8CB1F8-AC2B-4E7D-93D0-0D2BF22F3BA1/clip.mp4", "https://image.civitai.com/no-stable-asset/clip.mp4"] {
             check(MediaPosterPolicy.stillURL(URL(string: raw)!) == nil, "Unknown or signed source is never rewritten")
         }
+        let videoSource = URL(string: asset)!
+        check(MediaPosterPolicy.posterCandidates(source: videoSource, declared: videoSource) == [still], "A known video source produces only its bounded video still")
+        let ordinaryImage = URL(string: "https://image.civitai.com/public-prefix/1B8CB1F8-AC2B-4E7D-93D0-0D2BF22F3BA1/original=true,blur=15/image.png")!
+        let ordinaryVariant = MediaPosterPolicy.imageURL(ordinaryImage)!
+        let loadedCandidateIdentity = CachedImageResourceIdentity(url: ordinaryVariant, fallbackURLs: [still])
+        let changedCandidateIdentity = CachedImageResourceIdentity(url: ordinaryVariant, fallbackURLs: [ordinaryImage])
+        let qualityOnlyIdentity = CachedImageResourceIdentity(url: ordinaryVariant, fallbackURLs: [still])
+        check(loadedCandidateIdentity != changedCandidateIdentity, "Changing fallback resource identity invalidates a loaded candidate image even when the primary URL is unchanged")
+        check(loadedCandidateIdentity == qualityOnlyIdentity, "Quality-only request changes retain the same loaded resource identity")
+        check(ordinaryVariant.path.contains("blur=15") && ordinaryVariant.path.contains("width=450") && !ordinaryVariant.path.contains("transcode") && !ordinaryVariant.path.contains("anim="), "Ordinary image uses a bounded image transform without video flags")
+        check(MediaPosterPolicy.imageURL(URL(string: asset.replacingOccurrences(of: "clip.mp4", with: "thumbnail.jpeg"))!)!.path.contains("thumbnail.jpeg"), "A JPEG thumbnail suffix does not imply a video source")
+        let independent = URL(string: "https://image.civitai.com/public-prefix/1B8CB1F8-AC2B-4E7D-93D0-0D2BF22F3BA1/blur=8/cover.png")!
+        let independentVariant = MediaPosterPolicy.imageURL(independent)!
+        check(MediaPosterPolicy.posterCandidates(source: videoSource, declared: independent) == [independentVariant, still], "Independent thumbnail uses image transform before source video still fallback")
+        let sharedCoverRequest = MediaPosterPolicy.coverRequest(source: videoSource, declared: independent, isVideo: true)
+        check(sharedCoverRequest.candidates == [independentVariant, still] && sharedCoverRequest.decodePixels == 512,
+              "A cover request carries the formal candidate order and shared 512px decode tier")
+        check(sharedCoverRequest.identity == MediaPosterPolicy.coverRequest(source: videoSource, declared: independent, isVideo: true).identity,
+              "Identical cover requests have stable shared identity")
+        check(MediaPosterPolicy.posterCandidates(source: videoSource, declared: videoSource) == MediaPosterPolicy.posterCandidates(source: videoSource, declared: videoSource), "Same declared video candidate is deduplicated")
+        check(MediaPosterPolicy.gridImageURL(source: ordinaryImage, declared: nil) == ordinaryVariant, "Grid sizing uses image transform before transfer")
+        check(MediaPosterPolicy.gridImageCandidates(source: ordinaryImage, declared: ordinaryImage).count == 1, "Identical declared/source image candidates deduplicate")
+        let opaqueCover = address("opaque-cover176")
+        check(sharedCoverRequest.identity != MediaPosterPolicy.coverRequest(source: videoSource, declared: opaqueCover, isVideo: true).identity,
+              "Changing the declared cover invalidates the request identity")
+        check(MediaPosterPolicy.posterCandidates(source: videoSource, declared: opaqueCover) == [opaqueCover, still], "Opaque independent cover retains identity and can fall back to safe source still")
+        let signed = URL(string: asset + "?signature=fixture")!
+        check(MediaPosterPolicy.gridImageURL(source: signed, declared: nil) == signed && MediaPosterPolicy.gridImageCandidates(source: signed, declared: nil) == [signed], "A signed image resource is not rewritten or duplicated")
+        for source in [signed, address("opaque-same-video176")] {
+            do { _ = try await cache.loadPoster(source: source, declared: source, allowExtraction: false); preconditionFailure("Grid downloaded its opaque original video") }
+            catch MediaDownloadError.videoContent { checks += 1 }
+        }
+        let localPreview = root.appendingPathComponent("local-preview176.png")
+        check(MediaPosterPolicy.gridImageURL(source: localPreview, declared: still) == localPreview, "Local collection images never start a remote thumbnail request")
+        check(!PreviewRetryPolicy.shouldRetry(CancellationError()) && !PreviewRetryPolicy.shouldRetry(URLError(.cancelled)) &&
+              !PreviewRetryPolicy.shouldRetry(ImageLoadError.decode) && !PreviewRetryPolicy.shouldRetry(ImageLoadError.lowSpace),
+              "Cancellation, corrupt content and storage failure never retry automatically")
+        _ = try await cache.loadPreviewImage(address("transient-preview176"))
+        do { _ = try await cache.loadPreviewImage(address("persistent-preview176")); preconditionFailure("Persistent preview failure was hidden") }
+        catch MediaDownloadError.http(let status) { check(status == 503, "The second transient failure is returned to the existing UI") }
+        for path in ["http403", "http404", "http429"] {
+            do { _ = try await cache.loadPreviewImage(address(path)); preconditionFailure("Permanent failure was hidden") }
+            catch MediaDownloadError.http { checks += 1 }
+        }
+        _ = try await cache.loadPreviewImage(candidates: [address("candidate-404"), address("candidate-good")])
+        _ = try await cache.loadPreviewImage(candidates: [address("candidate-bad-image"), address("candidate-good-bad")])
+        let warmSource = address("timeline-video-warm-source")
+        let warmCover = address("timeline-video-warm-poster")
+        let warmRequest = MediaPosterPolicy.coverRequest(source: warmSource, declared: warmCover, isVideo: true)
+        let prepared = try await cache.loadCoverPreview(warmRequest, context: "timeline-cover")
+        let ordinaryHits = cache.cacheHits
+        let ordinaryStarted = ContinuousClock.now
+        for _ in 0..<20 {
+            _ = try await cache.loadPoster(source: warmSource, declared: warmCover, allowExtraction: false)
+        }
+        let ordinaryElapsed = ordinaryStarted.duration(to: .now)
+        let warmedHits = cache.cacheHits
+        let warmedStarted = ContinuousClock.now
+        for _ in 0..<20 {
+            let visible = try await cache.loadPoster(source: warmSource, declared: warmCover,
+                                                     allowExtraction: false, reusePreparedPreview: true)
+            check(visible === prepared.image, "Time-line playback uses the exact prepared poster pixels")
+        }
+        let warmedElapsed = warmedStarted.duration(to: .now)
+        check(warmedHits - ordinaryHits == 20 && cache.cacheHits == warmedHits, "Prepared playback posters skip all 20 disk-cache reads")
+        let warmRequests = try await stats()["requests"] as? [String: Int] ?? [:]
+        check(warmRequests["/timeline-video-warm-poster"] == 1 && warmRequests["/timeline-video-warm-source"] == nil,
+              "Warming and showing a poster shares one image download and never requests the original video")
+        print("Warm poster comparison, 20 reads each: disk \(ordinaryElapsed), prepared memory \(warmedElapsed)")
+        for path in ["candidate-403", "candidate-429", "candidate-503"] {
+            do { _ = try await cache.loadPreviewImage(candidates: [address(path), address("candidate-must-not-follow-" + path)]); preconditionFailure("Non-fallback failure advanced candidate") }
+            catch MediaDownloadError.http { checks += 1 }
+        }
+        for path in ["html-body", "json-body"] {
+            do { _ = try await cache.loadPreviewImage(candidates: [address(path), address("candidate-must-not-follow-" + path)]); preconditionFailure("A document response advanced to the next image candidate") }
+            catch MediaDownloadError.notImage { checks += 1 }
+        }
+        let previewStats = try await stats()["requests"] as? [String: Int] ?? [:]
+        check(previewStats["/opaque-same-video176"] == nil, "An opaque same-source video performs zero network reads for its grid cover")
+        check(previewStats["/transient-preview176"] == 2 && previewStats["/persistent-preview176"] == 2, "Preview transport retry is exactly once, including persistent failure")
+        check(["/http403", "/http404", "/http429"].allSatisfy { previewStats[$0] == 1 }, "Access denial, missing resource and cooldown never trigger retry or bypass")
+        check(previewStats["/candidate-404"] == 1 && previewStats["/candidate-good"] == 1 && previewStats["/candidate-bad-image"] == 1 && previewStats["/candidate-good-bad"] == 1, "Missing and undecodable images advance exactly once to a good candidate")
+        check(previewStats["/candidate-403"] == 1 && previewStats["/candidate-429"] == 1 && previewStats["/candidate-must-not-follow-candidate-403"] == nil && previewStats["/candidate-must-not-follow-candidate-429"] == nil, "403 and 429 stop without requesting the next candidate")
+        check(previewStats["/candidate-503"] == 2 && previewStats["/candidate-must-not-follow-candidate-503"] == nil, "503 gets one preview retry then stops without bypassing to another candidate")
+        check(previewStats["/html-body"] == 1 && previewStats["/json-body"] == 1 && previewStats["/candidate-must-not-follow-html-body"] == nil && previewStats["/candidate-must-not-follow-json-body"] == nil, "HTML and JSON documents surface notImage and never request another candidate")
         if CommandLine.arguments.contains("--probe-mime") {
             var result: [String: String] = [:]
             for path in ["mislabel-image", "video-header-image", "no-type-image"] {
@@ -56,6 +143,13 @@ import Combine
         check(images == 12, "All twelve grid thumbnails wait for admission and decode")
         let firstStats = try await stats()
         check((firstStats["maxActive"] as? Int ?? 100) <= 4, "Network transfer concurrency stays at four")
+        let cancelledFallback = Task { try await cache.loadPreviewImage(candidates: [address("candidate-cancel"), address("candidate-must-not-follow-cancel")]) }
+        try await Task.sleep(for: .milliseconds(80)); cancelledFallback.cancel()
+        do { _ = try await cancelledFallback.value; preconditionFailure("Cancelled candidate request completed") }
+        catch is CancellationError { checks += 1 }
+        try await Task.sleep(for: .milliseconds(750))
+        let cancellationStats = try await stats()["requests"] as? [String: Int] ?? [:]
+        check(cancellationStats["/candidate-cancel"] == 1 && cancellationStats["/candidate-must-not-follow-cancel"] == nil, "Cancellation does not start a later candidate")
         let badURL = address("recover")
         do { _ = try await cache.loadImage(badURL); preconditionFailure("Invalid image bytes decoded") }
         catch ImageLoadError.decode { checks += 1 }
@@ -66,6 +160,25 @@ import Combine
         let largeDecoded = try await cache.loadImage(largeImage)
         check(largeDecoded.size.width > 0, "A valid synthetic image larger than 16 MiB decodes")
         check(FileManager.default.fileExists(atPath: target(largeImage).path), "A valid synthetic image larger than 16 MiB is cached")
+        // A foreground download can pass its transfer reservation yet fail
+        // actual-byte commit when all remaining quota is held by a consumer.
+        let commitFolder = root.appendingPathComponent("protected-commit-quota", isDirectory: true)
+        let commitCache = MediaCache(directoryURL: commitFolder, monitorNetwork: false, diagnostics: nil,
+            availableBytesProvider: { 2_000_000_000 })
+        await commitCache.trim()
+        let heldQuota = commitFolder.appendingPathComponent("held-quota.mp4")
+        FileManager.default.createFile(atPath: heldQuota.path, contents: Data([0]))
+        let sparse = try FileHandle(forWritingTo: heldQuota)
+        try sparse.truncate(atOffset: UInt64(commitCache.capacity - 10 * 1024 * 1024)); try sparse.close()
+        guard let quotaLease = await commitCache.leaseFile(heldQuota) else { preconditionFailure("Quota fixture lease missing") }
+        await commitCache.trim()
+        do { _ = try await commitCache.loadImage(address("large-image")); preconditionFailure("Actual bytes exceeded protected remaining quota") }
+        catch ImageLoadError.lowSpace { checks += 1 }
+        let committedPastQuota = await commitCache.cached(address("large-image"), video: false)
+        check(committedPastQuota == nil && commitCache.pendingDownloadBudget == 0, "Rejected final admission releases the token without installing a partial final file")
+        let retainedQuotaIdentity = await commitCache.fileIdentity(heldQuota)
+        check(retainedQuotaIdentity == quotaLease.identity, "Final admission never deletes or replaces a leased quota owner")
+        await commitCache.release(quotaLease)
         let oversizedImage = address("oversized-image")
         do { _ = try await cache.loadImage(oversizedImage); preconditionFailure("Image larger than 64 MiB was accepted") }
         catch MediaDownloadError.limitExceeded { checks += 1 }
@@ -147,7 +260,7 @@ import Combine
         catch MediaDownloadError.http(let status) { check(status == 403, "Final redirect HTTP status is preserved") }
         let deniedStats = try await stats()["requests"] as? [String: Int] ?? [:]
         check(deniedStats["/must-not-fetch-after-403"] == nil, "403 never switches to another poster or media source")
-        check(cache.cached(address("video-poster"), video: true) != nil, "Actually playable video mislabeled as image is retained under video cache format")
+        let cacheObserved6_0 = await cache.cached(address("video-poster"), video: true); check(cacheObserved6_0 != nil, "Actually playable video mislabeled as image is retained under video cache format")
         for path in ["html-body", "json-body"] {
             do { _ = try await cache.loadImage(address(path)); preconditionFailure("Non-media body accepted") }
             catch MediaDownloadError.notImage { checks += 1 }
@@ -164,6 +277,8 @@ import Combine
             check(animation.frames.dropFirst().contains { ($0.dataProvider!.data! as Data) != first }, "Different animation frame pixels actually decoded")
             let reload = try await cache.imageResource(address(path))
             check(reload.frameCount == resource.frameCount, "Cached raw animation survives reloading")
+            if let lease = resource.lease { await cache.release(lease) }
+            if let lease = reload.lease { await cache.release(lease) }
         }
         var posterWrites: [String] = []
         let posterObserver = cache.posterUpdates.sink { posterWrites.append($0) }
@@ -187,7 +302,7 @@ import Combine
         try Data([0x1a, 0x45, 0xdf, 0xa3] + Array(repeating: UInt8(0), count: 64)).write(to: posterOriginal)
         let digest = try MediaRepairStore.contentHash(posterOriginal)
         let derivative = cacheFolder.appendingPathComponent(MediaRepairStore.outputName(repairedAddress, content: digest, transcoded: false))
-        let validVideo = cache.cached(address("video-poster"), video: true)!
+        let validVideo = (await cache.cached(address("video-poster"), video: true))!
         try FileManager.default.copyItem(at: validVideo, to: derivative)
         try MediaRepairStore.commit(repairedAddress, original: posterOriginal, content: digest, transcoded: false, output: derivative, directory: cacheFolder)
         let reusedPoster = try await cache.loadPoster(source: repairedAddress, declared: nil, allowExtraction: false, allowLocalExtraction: true)
@@ -201,19 +316,19 @@ import Combine
         let capturedAddress = address("captured-native-frame")
         let capturedBytes = try Data(contentsOf: jpeg)
         let beforeCapturedWrites = posterWrites.count
-        try cache.storeGeneratedPoster(capturedBytes, source: capturedAddress, expectedGeneration: cache.repairGeneration)
+        try (await cache.storeGeneratedPoster(capturedBytes, source: capturedAddress, expectedGeneration: cache.repairGeneration))
         check(posterWrites.count == beforeCapturedWrites + 1 && posterWrites.last == cache.posterCacheKey(for: capturedAddress), "A native producer immediately invalidates exactly this source after committing a valid JPEG")
         check(posterWrites.last != cache.posterCacheKey(for: address("unrelated-work")), "The write signal cannot be confused with another work")
         var capturedStage = PosterDiagnosticStage.declaredImage
         _ = try await cache.loadPoster(source: capturedAddress, declared: address("must-not-request-declared-cover"), allowExtraction: false,
             onStage: { capturedStage = $0 })
         check(posterWrites.count == beforeCapturedWrites + 1, "Reading the new native frame does not republish its write")
-        check(capturedStage == .cachedPoster && cache.hasGeneratedPoster(capturedAddress), "A player-frame JPEG is reused under the same source identity before a remote request")
+        let cacheObserved5_0 = await cache.hasGeneratedPoster(capturedAddress); check(capturedStage == .cachedPoster && cacheObserved5_0, "A player-frame JPEG is reused under the same source identity before a remote request")
         let capturedStats = try await stats()["requests"] as? [String: Int] ?? [:]
         check(capturedStats["/must-not-request-declared-cover"] == nil, "A generated frame does not refetch the failed declared thumbnail")
-        do { try cache.storeGeneratedPoster(capturedBytes, source: address("stale-generated"), expectedGeneration: cache.repairGeneration - 1); preconditionFailure("Stale generation committed a frame") }
+        do { try (await cache.storeGeneratedPoster(capturedBytes, source: address("stale-generated"), expectedGeneration: cache.repairGeneration - 1)); preconditionFailure("Stale generation committed a frame") }
         catch is CancellationError { checks += 1 }
-        do { try cache.storeGeneratedPoster(Data("notjpeg".utf8), source: address("invalid-generated"), expectedGeneration: cache.repairGeneration); preconditionFailure("Invalid generated image accepted") }
+        do { try (await cache.storeGeneratedPoster(Data("notjpeg".utf8), source: address("invalid-generated"), expectedGeneration: cache.repairGeneration)); preconditionFailure("Invalid generated image accepted") }
         catch ImageLoadError.decode { checks += 1 }
         check(posterWrites.count == beforeCapturedWrites + 1, "Rejected stale and invalid writes cannot notify previews")
         check(PosterDiagnosticPolicy.failure(ImageLoadError.decode, stage: .declaredImage) == .decode &&
@@ -222,13 +337,14 @@ import Combine
 
         let localClip = root.appendingPathComponent("poster50-local.mp4")
         try FileManager.default.copyItem(at: URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("Fixtures/short.mp4"), to: localClip)
+        try await MediaCacheConcurrencyChecks.run(root: root, jpeg: capturedBytes, localSource: localClip, remoteImage: address("image-tier-grid174"))
         let corruptJPEG = root.appendingPathComponent("poster50-corrupt.jpeg")
         try Data(Data(contentsOf: jpeg).prefix(20)).write(to: corruptJPEG)
         var localStages: [PosterDiagnosticStage] = []
         let localRecovered = try await cache.loadPoster(source: localClip, declared: corruptJPEG, allowExtraction: false,
             allowLocalExtraction: true, onStage: { localStages.append($0) })
         check(localRecovered.size.width > 0 && localStages.contains(.localFrame), "A broken declared JPEG can recover from this exact already-local valid video")
-        check(cache.hasGeneratedPoster(localClip), "A recovered local frame is reusable under the original source key")
+        let cacheObserved4_0 = await cache.hasGeneratedPoster(localClip); check(cacheObserved4_0, "A recovered local frame is reusable under the original source key")
         let evictingCache = MediaCache(directoryURL: root.appendingPathComponent("immediate-eviction"), monitorNetwork: false,
             diagnostics: nil, availableBytesProvider: { 0 })
         var evictedWrites: [String] = []
@@ -237,11 +353,11 @@ import Combine
         let evictedPreview = try await evictingCache.loadPoster(source: localClip, declared: corruptJPEG,
             allowExtraction: false, allowLocalExtraction: true)
         check(evictedPreview.size.width > 0, "Low space still returns the successfully extracted in-memory preview")
-        check(!evictingCache.hasGeneratedPoster(localClip) && evictingCache.diskBytes == 0, "The existing zero cache budget immediately evicts its generated disk poster")
-        print("PosterEvictionProbe: retained=\(evictingCache.hasGeneratedPoster(localClip));notifications=\(evictedWrites.count)")
+        let cacheObserved3_0 = await evictingCache.hasGeneratedPoster(localClip); check(!cacheObserved3_0 && evictingCache.diskBytes == 0, "The existing zero cache budget immediately evicts its generated disk poster")
+        print("PosterEvictionProbe: retained=\((await evictingCache.hasGeneratedPoster(localClip)));notifications=\(evictedWrites.count)")
         check(evictedWrites.isEmpty, "An immediately evicted poster must not notify and restart its own extractor")
-        do { try evictingCache.storeGeneratedPoster(capturedBytes, source: localClip,
-            expectedGeneration: evictingCache.repairGeneration); preconditionFailure("Low-space native frame was committed") }
+        do { try (await evictingCache.storeGeneratedPoster(capturedBytes, source: localClip,
+            expectedGeneration: evictingCache.repairGeneration)); preconditionFailure("Low-space native frame was committed") }
         catch ImageLoadError.lowSpace { checks += 1 }
         check(evictedWrites.isEmpty, "A low-space rejected native write does not signal cache availability")
         let unavailable = address("must-not-fetch-on-poster-decode")
@@ -257,7 +373,7 @@ import Combine
         do { _ = try await cache.loadPoster(source: deniedClip, declared: address("http403"), allowExtraction: false,
             allowLocalExtraction: true); preconditionFailure("A denied declared cover was bypassed") }
         catch MediaDownloadError.http(let status) { check(status == 403, "A403 remains a403 even when a valid local video exists") }
-        check(!cache.hasGeneratedPoster(deniedClip), "No frame is generated after an explicit access denial")
+        let cacheObserved2_0 = await cache.hasGeneratedPoster(deniedClip); check(!cacheObserved2_0, "No frame is generated after an explicit access denial")
         for (name, body) in [("html", "<!doctype html><html><form>Login</form></html>"),
                              ("comment-html", "<!-- gateway -->\n<!doctype html><html><form>Login</form></html>"),
                              ("json", "{\"error\":\"authentication\"}")] {
@@ -266,20 +382,20 @@ import Combine
             do { _ = try await cache.loadPoster(source: deniedClip, declared: document, allowExtraction: false,
                 allowLocalExtraction: true); preconditionFailure("An error document was treated as a damaged image") }
             catch MediaDownloadError.notImage { checks += 1 }
-            check(!cache.hasGeneratedPoster(deniedClip), "A mislabeled error document cannot trigger local frame recovery")
+            let cacheObserved1_0 = await cache.hasGeneratedPoster(deniedClip); check(!cacheObserved1_0, "A mislabeled error document cannot trigger local frame recovery")
         }
         var generationChangedDuringFrame = false
         do {
             _ = try await cache.loadPoster(source: deniedClip, declared: corruptJPEG, allowExtraction: false,
                 allowLocalExtraction: true, onStage: { stage in
-                    if stage == .localFrame { cache.clear(); generationChangedDuringFrame = true }
+                    if stage == .localFrame { Task { await cache.clear() }; generationChangedDuringFrame = true }
                 })
             preconditionFailure("A stale generation local frame was accepted")
         } catch is CancellationError {
             check(generationChangedDuringFrame && !Task.isCancelled,
                   "Cache-generation cancellation is preserved even though the calling task was not cancelled")
         }
-        check(!cache.hasGeneratedPoster(deniedClip), "A generation change during local frame extraction cannot write a poster")
+        let cacheObserved0_0 = await cache.hasGeneratedPoster(deniedClip); check(!cacheObserved0_0, "A generation change during local frame extraction cannot write a poster")
 
         let shared = address("shared-image")
         let one = Task { try await cache.loadImage(shared) }, two = Task { try await cache.loadImage(shared) }
@@ -304,7 +420,7 @@ import Combine
         let outside = root.appendingPathComponent("offline-kept.bin")
         try Data("preserve offline data".utf8).write(to: outside)
         let clearing = Task { try await cache.loadImage(address("clear-active")) }
-        try await Task.sleep(for: .milliseconds(80)); cache.clear()
+        try await Task.sleep(for: .milliseconds(80)); (await cache.clear())
         do { _ = try await clearing.value; preconditionFailure("Cleared job returned a late cache write") } catch is CancellationError { checks += 1 }
         check(!FileManager.default.fileExists(atPath: target(address("clear-active")).path), "Clear rejects late cache writes")
         check(FileManager.default.fileExists(atPath: outside.path), "Cache cleanup preserves files outside its directory")
@@ -314,19 +430,19 @@ import Combine
         let repairSource = address("short-video")
         let original = try await cache.repairOriginal(repairSource) { _, _ in }
         check(FileManager.default.fileExists(atPath: original.path), "Repair source uses the normal bounded cache")
-        cache.pin(repairSource); cache.pin(repairSource); cache.unpin(repairSource)
+        (await cache.pin(repairSource)); (await cache.pin(repairSource)); (await cache.unpin(repairSource))
         let generationBeforeClear = cache.repairGeneration
-        cache.clear()
+        (await cache.clear())
         check(cache.repairGeneration != generationBeforeClear, "Clear invalidates any pending repair commit")
         check(FileManager.default.fileExists(atPath: original.path), "One consumer cannot release another original pin")
-        cache.unpin(repairSource); cache.clear()
+        (await cache.unpin(repairSource)); (await cache.clear())
         check(!FileManager.default.fileExists(atPath: original.path), "Last original pin releases cache ownership")
         let partial = cache.repairDirectory.appendingPathComponent("cvr1-synthetic.partial")
         try Data(repeating: 1, count: 128).write(to: partial)
-        cache.protectRepairFile(partial); cache.protectRepairFile(partial); cache.unprotectRepairFile(partial)
-        cache.clear()
+        (await cache.protectRepairFile(partial)); (await cache.protectRepairFile(partial)); (await cache.unprotectRepairFile(partial))
+        (await cache.clear())
         check(FileManager.default.fileExists(atPath: partial.path), "Partial-file pins are reference counted")
-        cache.unprotectRepairFile(partial); cache.clear()
+        (await cache.unprotectRepairFile(partial)); (await cache.clear())
         check(!FileManager.default.fileExists(atPath: partial.path), "Released partial files remain clearable")
         check(FileManager.default.fileExists(atPath: outside.path), "Repair cleanup leaves offline scope untouched")
         let largeAddress = address("large-video")

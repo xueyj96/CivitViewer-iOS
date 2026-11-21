@@ -16,6 +16,34 @@ import FoundationNetworking
 
 struct BoundaryPayload: Decodable, Equatable { let value: Int }
 
+// The lock owns every mutable field. Only the decoding worker blocks; MainActor stays free to invalidate its epoch.
+final class BoundaryDecodeGate: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var entered = false
+    private var released = false
+    private var mainThread = false
+    var started: Bool { condition.lock(); defer { condition.unlock() }; return entered }
+    var decodedOnMainThread: Bool { condition.lock(); defer { condition.unlock() }; return mainThread }
+    func reset() { condition.lock(); defer { condition.unlock() }; entered = false; released = false; mainThread = false }
+    func block() {
+        condition.lock(); defer { condition.unlock() }
+        mainThread = Thread.isMainThread; entered = true
+        while !released {
+            precondition(condition.wait(until: Date().addingTimeInterval(5)), "Decode worker failed to resume")
+        }
+    }
+    func open() { condition.lock(); released = true; condition.broadcast(); condition.unlock() }
+}
+struct BoundaryWorkerPayload: Decodable, Sendable {
+    static let gate = BoundaryDecodeGate()
+    let value: Int
+    private enum CodingKeys: String, CodingKey { case value }
+    init(from decoder: Decoder) throws {
+        Self.gate.block()
+        value = try decoder.container(keyedBy: CodingKeys.self).decode(Int.self, forKey: .value)
+    }
+}
+
 @MainActor final class BoundaryOAuth: SiteAuthorizedTransport {
     var hasCredentials = true
     var calls = 0
@@ -289,6 +317,20 @@ struct BoundaryPayload: Decodable, Equatable { let value: Int }
         let written: BoundaryPayload = try await mutation.request(path: "/api/trpc/fixture", postBody: "{}", response: .rpc)
         check(written.value == 7 && mutation.cooldown.retryAvailableAt != nil,
               "A mutation bypasses the read gate without clearing cooldown")
+
+        // A real Decodable initializer suspends off MainActor while the UI/account epoch remains responsive.
+        for malformed in [false, true] {
+            BoundaryWorkerPayload.gate.reset()
+            let decoding = SessionBoundaryHarness()
+            decoding.oauth.authorized = { _ in (malformed ? Data("{}".utf8) : payload(8), response()) }
+            let request = Task { try await decoding.request(path: "/api/fixture") as BoundaryWorkerPayload }
+            while !BoundaryWorkerPayload.gate.started { await Task.yield() }
+            check(!BoundaryWorkerPayload.gate.decodedOnMainThread, "Typed JSON decoding leaves the main thread")
+            decoding.authGeneration += 1
+            BoundaryWorkerPayload.gate.open()
+            do { _ = try await request.value; check(false, "A decoded value from an old epoch must not return") }
+            catch is CancellationError { check(true, "Both decoder success and decoder failure revalidate their epoch") }
+        }
 
         print("SessionBoundaryChecks: \(checks) regression checks passed")
     }

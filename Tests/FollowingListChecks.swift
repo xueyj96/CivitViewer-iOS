@@ -174,6 +174,10 @@ import Foundation
         await diskCache.store(cachedRows, for: cachedKey)
         let readCachedRows = await diskCache.creators(for: cachedKey)
         precondition(readCachedRows?.map(\.id) == [201,200], "Disk cache stores only the complete ordered identity snapshot")
+        await diskCache.store([creator(201, String(repeating: "x", count: 1_024 * 1_024)), cachedRows[1]], for: cachedKey)
+        let retainedAfterOversizedWrite = await diskCache.creators(for: cachedKey)
+        precondition(retainedAfterOversizedWrite?.map(\.username) == ["Before", "After"],
+                     "A snapshot that exceeds the byte limit must leave the last usable following cache intact")
         let cacheSource = FollowingMock()
         cacheSource.followingIdentity = cachedKey.identity; cacheSource.followingActorID = 999
         cacheSource.followingMemberIDs = cachedIDs; cacheSource.followingRevision = cachedKey.revision

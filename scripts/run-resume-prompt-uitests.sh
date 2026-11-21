@@ -61,6 +61,8 @@ common=(
   CODE_SIGNING_ALLOWED=NO
   COMPILER_INDEX_STORE_ENABLE=NO
   ONLY_ACTIVE_ARCH=YES
+  CLANG_ENABLE_CODE_COVERAGE=NO
+  ENABLE_CODE_COVERAGE=NO
 )
 case "${CIVIT_UI_TEST_OPTIMIZED:-0}" in
   0) ;;
@@ -105,7 +107,7 @@ container_readback_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 write_source_manifest "$evidence/source-after.json"
 python3 - "$root" "$logs/test.log" "$container" "$evidence" "$run" "$build_status" "$test_status" "$derived" "$container_readback_utc" "$sim" <<'PY'
 from pathlib import Path
-import datetime, hashlib, json, os, re, shutil, sys
+import datetime, hashlib, json, os, re, shutil, subprocess, sys
 root=Path(sys.argv[1]); log_path=Path(sys.argv[2]); container=Path(sys.argv[3]); evidence=Path(sys.argv[4])
 run=sys.argv[5]; build_status=int(sys.argv[6]); test_status=int(sys.argv[7])
 derived=Path(sys.argv[8]); container_readback_utc=sys.argv[9]; sim=sys.argv[10]
@@ -130,11 +132,16 @@ def tree_hash(path):
 app=derived/'Build/Products/Debug-iphonesimulator/CivitViewer.app'
 test_bundle=derived/'Build/Products/Debug-iphonesimulator/CivitViewerUITests-Runner.app/PlugIns/CivitViewerUITests.xctest'
 debug_dylib=app/'CivitViewer.debug.dylib'
+profile_sections={}
+for binary in [app/'CivitViewer', *sorted(app.glob('*.dylib'))]:
+    sections=subprocess.run(['xcrun','otool','-l',str(binary)],capture_output=True,check=True).stdout
+    profile_sections[binary.name]=b'__llvm_prf' in sections or b'__llvm_cov' in sections
 receipt={
  'run_id':run, 'created_at_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
  'simulator_udid':sim,'build_configuration':'Debug simulator unsigned',
  'swift_optimization_level':'-O' if os.environ.get('CIVIT_UI_TEST_OPTIMIZED') == '1' else 'project default',
  'swift_compilation_mode':'wholemodule' if os.environ.get('CIVIT_UI_TEST_OPTIMIZED') == '1' else 'project default',
+ 'app_code_coverage':'disabled', 'app_profile_sections':profile_sections,
  'build_exit_code':int(build_status),'test_exit_code':int(test_status),
  'source_manifest_before_sha256':before['manifest_sha256'],'source_manifest_after_sha256':manifest,
  'source_manifest_unchanged':before==after,
@@ -157,6 +164,8 @@ receipt={
 print(json.dumps({'evidence':str(evidence),'run_ids':run_ids,'source_manifest_sha256':manifest,'test_exit_code':int(test_status)}))
 if not receipt['source_manifest_unchanged']:
     raise SystemExit('Build inputs changed during the run; repeat verification against stable inputs.')
+if any(profile_sections.values()):
+    raise SystemExit('The application still contains LLVM profile instrumentation; performance evidence is invalid.')
 PY
 printf 'run_id=%s\nresult=%s\nlogs=%s\nevidence=%s\nexit_code=%s\n' "$run" "$result" "$logs" "$evidence" "$test_status"
 exit "$test_status"

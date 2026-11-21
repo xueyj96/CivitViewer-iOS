@@ -17,6 +17,12 @@ source_root = baseline if args.baseline51 else root
 if not source_root.exists():
     raise SystemExit(f"baseline source tree missing: {source_root}")
 
+
+def production_source(relative_path):
+    # Archived builds predate the feature folders and retain their original source paths.
+    path = Path(relative_path)
+    return source_root / "CivitViewer" / (path.name if args.baseline51 else path)
+
 def chunk(kind, data):
     return struct.pack("!I", len(data)) + kind + data + struct.pack("!I", zlib.crc32(kind + data) & 0xffffffff)
 
@@ -137,6 +143,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             time.sleep(.4)
         if "bounded-image" in self.path:
             time.sleep(.1)
+        if self.path == "/writer-focus-image":
+            time.sleep(.5)
         if self.path.endswith("video2") or self.path.endswith("c-video") or self.path.endswith("s-video") or self.path.endswith("x-video") or self.path.endswith("focus-video2"):
             time.sleep(1.3)
         if self.path.endswith("video") or "video" in self.path:
@@ -153,20 +161,20 @@ server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
 server.daemon_threads = True
 threading.Thread(target=server.serve_forever, daemon=True).start()
 port = server.server_port
-cache_source = (source_root / "CivitViewer/MediaCache.swift").read_text()
-model_source = (source_root / "CivitViewer/Models.swift").read_text()
+cache_source = (production_source("Media/Loading/MediaCache.swift")).read_text()
+model_source = (production_source("Feed/Models.swift")).read_text()
 # Permit only loopback HTTP in the generated test copy; production source remains HTTPS-only.
 model_source = model_source.replace('url.scheme == "https"', '(url.scheme == "https" || (url.scheme == "http" && url.host == "127.0.0.1"))')
 cache_source = cache_source.replace("import UIKit", "import AppKit\ntypealias UIImage = NSImage\nextension NSImage { var scale: CGFloat { 1 }; func jpegData(compressionQuality: CGFloat) -> Data? { tiffRepresentation.flatMap { NSBitmapImageRep(data: $0)?.representation(using: .jpeg, properties: [.compressionFactor: compressionQuality]) } }; convenience init(cgImage: CGImage) { self.init(cgImage: cgImage, size: .zero) } }", 1)
 cache_file = build / "MediaCacheUnderTest.swift"
 model_file = build / "ModelsUnderTest.swift"
 cache_file.write_text(cache_source); model_file.write_text(model_source)
-sources = [source_root / "CivitViewer/VideoDuration.swift", model_file,
-           source_root / "CivitViewer/MediaLoadQueue.swift", source_root / "CivitViewer/MediaFormat.swift",
-           source_root / "CivitViewer/MediaRepairStore.swift", source_root / "CivitViewer/PlaybackDiagnostics.swift",
-           source_root / "CivitViewer/LocalDiagnostics.swift", cache_file]
+sources = [production_source("Media/VideoDuration.swift"), model_file,
+           production_source("Media/Loading/MediaLoadQueue.swift"), production_source("Media/MediaFormat.swift"),
+           production_source("Media/MediaRepairStore.swift"), production_source("Diagnostics/PlaybackDiagnostics.swift"),
+           production_source("Diagnostics/LocalDiagnostics.swift"), cache_file]
 if not args.baseline51:
-    sources.append(root / "CivitViewer/MediaPreloader.swift")
+    sources.append(root / "CivitViewer/Media/Loading/MediaPreloader.swift")
 sources.append(root / "Tests/MediaPrefetchChecks.swift")
 binary = build / ("media-prefetch-51" if args.baseline51 else "media-prefetch-current")
 env = {**os.environ, "DEVELOPER_DIR": "/Applications/Xcode.app/Contents/Developer"}
@@ -190,9 +198,9 @@ try:
         raise RuntimeError(f"probe failed ({completed.returncode})\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}")
     observed = json.loads(completed.stdout.strip().splitlines()[-1])
     observed["sourceHashes"] = {
-        "MediaCache.swift": hashlib.sha256((source_root / "CivitViewer/MediaCache.swift").read_bytes()).hexdigest(),
-        "Models.swift": hashlib.sha256((source_root / "CivitViewer/Models.swift").read_bytes()).hexdigest(),
-        **({"MediaPreloader.swift": hashlib.sha256((root / "CivitViewer/MediaPreloader.swift").read_bytes()).hexdigest()} if not args.baseline51 else {}),
+        "MediaCache.swift": hashlib.sha256((production_source("Media/Loading/MediaCache.swift")).read_bytes()).hexdigest(),
+        "Models.swift": hashlib.sha256((production_source("Feed/Models.swift")).read_bytes()).hexdigest(),
+        **({"MediaPreloader.swift": hashlib.sha256((root / "CivitViewer/Media/Loading/MediaPreloader.swift").read_bytes()).hexdigest()} if not args.baseline51 else {}),
         "compiledInputs": {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sources},
     }
     observed["fixtureSha256"] = hashlib.sha256(video).hexdigest()

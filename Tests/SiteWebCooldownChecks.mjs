@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 // Execute the actual embedded request script against an in-memory fetch double.
 // No browser session, cookies, credentials, or real HTTP requests are used.
-const source = readFileSync(new URL('../CivitViewer/SiteRequestClient.swift', import.meta.url), 'utf8');
+const source = readFileSync(new URL('../CivitViewer/Site/SiteRequestClient.swift', import.meta.url), 'utf8');
 const embedded = source.match(/let script = """\n([\s\S]*?)\n        """/);
 assert.ok(embedded, 'Expected the embedded site request script');
 const script = embedded[1];

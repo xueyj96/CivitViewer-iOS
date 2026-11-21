@@ -21,9 +21,11 @@ import Foundation
         memory.observe(items: [item(11, tags: [1], url: "https://image.civitai.com/images/\(uuid)/preview"),
                               item(12, tags: [1], url: "https://image.civitai.com/images/\(uuid)/preview"),
                               item(13, tags: [1], url: "https://image.civitai.com/images/\(uuid)/preview")], scope: "account-a", policy: policy)
+        await memory.flush()
         check(memory.estimate(tagID: 1, scope: "account-a", policy: policy)?.countLowerBound == 1,
               "Civitai UUID witnesses deduplicate across media IDs")
         memory.observe(items: [item(21, tags: [1]), item(22, tags: [1]), item(23, tags: [1])], scope: "account-a", policy: policy)
+        await memory.flush()
         check(memory.estimate(tagID: 1, scope: "account-a", policy: policy)?.countLowerBound == 4,
               "Non-Civitai URL assets fall back to numeric media IDs")
         check(memory.estimate(tagID: 1, scope: "account-b", policy: policy) == nil, "Account scopes are isolated")
@@ -37,10 +39,12 @@ import Foundation
         let sharedURL = "https://image.civitai.com/images/\(uuid)/preview"
         noDedupStore.observe(items: [item(31, tags: [2], url: sharedURL), item(32, tags: [2], url: sharedURL), item(33, tags: [2], url: sharedURL)],
                               scope: "account-a", policy: noDedup)
+        await noDedupStore.flush()
         check(noDedupStore.estimate(tagID: 2, scope: "account-a", policy: noDedup)?.countLowerBound == 3,
               "Disabling asset deduplication counts numeric IDs")
 
         memory.recordEmpty(tagID: 1, scope: "account-a", policy: policy)
+        await memory.flush()
         let empty = memory.estimate(tagID: 1, scope: "account-a", policy: policy)
         check(empty?.emptyUntil == instant.addingTimeInterval(86_400) && empty?.isRecommended == false,
               "A complete empty observation suppresses recommendation for 24 hours")
@@ -49,6 +53,7 @@ import Foundation
               "Expired empty evidence no longer suppresses a recent positive estimate")
         memory.recordEmpty(tagID: 1, scope: "account-a", policy: policy)
         memory.observe(items: [item(24, tags: [1])], scope: "account-a", policy: policy)
+        await memory.flush()
         check(memory.estimate(tagID: 1, scope: "account-a", policy: policy)?.emptyUntil == nil,
               "A new positive witness revokes negative evidence")
         instant.addTimeInterval(31 * 24 * 60 * 60)
@@ -62,21 +67,21 @@ import Foundation
         let persisted = TagObservationStore(rootURL: root, now: { instant })
         // Exercise pre-activation observations: disk data must merge instead of being replaced.
         let initial = TagObservationStore(rootURL: root, now: { instant })
-        await initial.activate(scope: secretScope)
+        await initial.activate()
         initial.observe(items: [item(41, tags: [4]), item(42, tags: [4]), item(43, tags: [4])], scope: secretScope, policy: secretHandlePolicy)
         initial.recordEmpty(tagID: 4, scope: secretScope, policy: secretHandlePolicy)
         await initial.flush()
         instant.addTimeInterval(1)
         persisted.observe(items: [item(44, tags: [4])], scope: secretScope, policy: secretHandlePolicy)
-        await persisted.activate(scope: secretScope)
+        await persisted.activate()
         check(persisted.estimate(tagID: 4, scope: secretScope, policy: secretHandlePolicy)?.countLowerBound == 4,
               "Activation merges existing persisted data with observations made before load")
         check(persisted.estimate(tagID: 4, scope: secretScope, policy: secretHandlePolicy)?.emptyUntil == nil,
               "Newer pre-load positive observation overrides persisted empty evidence")
         let racingActivation = TagObservationStore(rootURL: root, now: { instant })
         racingActivation.observe(items: [item(45, tags: [4])], scope: secretScope, policy: secretHandlePolicy)
-        async let activateAgainA: Void = racingActivation.activate(scope: secretScope)
-        async let activateAgainB: Void = racingActivation.activate(scope: secretScope)
+        async let activateAgainA: Void = racingActivation.activate()
+        async let activateAgainB: Void = racingActivation.activate()
         _ = await (activateAgainA, activateAgainB)
         let racedEstimate = racingActivation.estimate(tagID: 4, scope: secretScope, policy: secretHandlePolicy)
         check((4...5).contains(racedEstimate?.countLowerBound ?? 0) &&
@@ -107,7 +112,7 @@ import Foundation
             let url = invalidRoot.appendingPathComponent("observations-v1.json")
             try invalidBytes.write(to: url)
             let invalidStore = TagObservationStore(rootURL: invalidRoot, now: { instant })
-            await invalidStore.activate(scope: "validation")
+            await invalidStore.activate()
             invalidStore.recordEmpty(tagID: 99, scope: "validation", policy: policy)
             await invalidStore.flush()
             return try Data(contentsOf: url) == invalidBytes
@@ -172,7 +177,7 @@ import Foundation
         }
         check(badDatePreserved, "Malformed persisted dates are rejected and preserved")
         let restarted = TagObservationStore(rootURL: root, now: { instant })
-        await restarted.activate(scope: secretScope)
+        await restarted.activate()
         check(restarted.estimate(tagID: 4, scope: secretScope, policy: secretHandlePolicy)?.countLowerBound == 4,
               "JSON persistence survives store restart")
 
@@ -183,7 +188,7 @@ import Foundation
         let corrupt = Data("not a valid observation file".utf8)
         try corrupt.write(to: corruptURL)
         let damagedStore = TagObservationStore(rootURL: corruptRoot, now: { instant })
-        await damagedStore.activate(scope: "x")
+        await damagedStore.activate()
         damagedStore.observe(items: [item(51, tags: [5])], scope: "x", policy: policy)
         await damagedStore.flush()
         let preservedCorrupt = try Data(contentsOf: corruptURL)
@@ -210,7 +215,7 @@ import Foundation
         let invalidWitnessURL = invalidWitnessRoot.appendingPathComponent("observations-v1.json")
         try invalidWitnessBytes.write(to: invalidWitnessURL)
         let invalidWitnessStore = TagObservationStore(rootURL: invalidWitnessRoot, now: { instant })
-        await invalidWitnessStore.activate(scope: "x")
+        await invalidWitnessStore.activate()
         invalidWitnessStore.observe(items: [item(61, tags: [6])], scope: "x", policy: policy)
         await invalidWitnessStore.flush()
         let preservedInvalidWitness = try Data(contentsOf: invalidWitnessURL)
@@ -224,7 +229,7 @@ import Foundation
         let oversized = Data(repeating: 0x41, count: 8 * 1024 * 1024 + 1)
         try oversized.write(to: oversizedURL)
         let oversizedStore = TagObservationStore(rootURL: oversizedRoot, now: { instant })
-        await oversizedStore.activate(scope: "x")
+        await oversizedStore.activate()
         oversizedStore.recordEmpty(tagID: 7, scope: "x", policy: policy)
         await oversizedStore.flush()
         let stillOversized = try Data(contentsOf: oversizedURL)
@@ -233,13 +238,13 @@ import Foundation
         let autosaveRoot = FileManager.default.temporaryDirectory.appendingPathComponent("tag-observation-auto-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: autosaveRoot) }
         let autosave = TagObservationStore(rootURL: autosaveRoot, now: { instant })
-        await autosave.activate(scope: "auto")
+        await autosave.activate()
         autosave.observe(items: [item(71, tags: [8])], scope: "auto", policy: policy)
         autosave.observe(items: [item(72, tags: [8])], scope: "auto", policy: policy)
         try await Task.sleep(for: .milliseconds(1_100))
         let autoFile = autosaveRoot.appendingPathComponent("observations-v1.json")
         let autoRestart = TagObservationStore(rootURL: autosaveRoot, now: { instant })
-        await autoRestart.activate(scope: "auto")
+        await autoRestart.activate()
         check(autoRestart.estimate(tagID: 8, scope: "auto", policy: policy)?.countLowerBound == 2 &&
               FileManager.default.fileExists(atPath: autoFile.path),
               "Debounced autosave coalesces rapid observations into the latest snapshot")
@@ -248,13 +253,16 @@ import Foundation
         for scopeIndex in 0..<5 {
             bounded.recordEmpty(tagID: scopeIndex + 1, scope: "scope-\(scopeIndex)", policy: policy)
         }
+        await bounded.flush()
         let retainedContexts = (0..<5).filter { bounded.estimate(tagID: $0 + 1, scope: "scope-\($0)", policy: policy) != nil }
         check(retainedContexts == Array(1..<5), "Four newest contexts survive even when their timestamps are equal")
         let beforeUntagged = bounded.revision
         bounded.observe(items: [item(10_000, tags: [])], scope: "no-tags", policy: policy)
+        await bounded.flush()
         check(bounded.revision == beforeUntagged, "A page with no tag evidence needs no update")
         let manyTags = (1...5_005).map { item(10_000 + $0, tags: [10_000 + $0]) }
         bounded.observe(items: manyTags, scope: "capacity", policy: policy)
+        await bounded.flush()
         let retainedTagCount = (10_001...15_005).filter {
             bounded.estimate(tagID: $0, scope: "capacity", policy: policy) != nil
         }.count
@@ -262,6 +270,7 @@ import Foundation
         let witnessItems = (20_001...20_020).map { item($0, tags: [6]) }
         let witnessStore = TagObservationStore(now: { instant })
         witnessStore.observe(items: witnessItems, scope: "witness-cap", policy: policy)
+        await witnessStore.flush()
         check(witnessStore.estimate(tagID: 6, scope: "witness-cap", policy: policy)?.countLowerBound == 8,
               "At most eight recent witnesses are retained per tag")
 
@@ -269,7 +278,7 @@ import Foundation
         defer { try? FileManager.default.removeItem(at: scaleRoot) }
         var scaleClock = instant
         let scaleStore = TagObservationStore(rootURL: scaleRoot, now: { scaleClock })
-        for index in 0..<4 { await scaleStore.activate(scope: "scale-context-\(index)") }
+        await scaleStore.activate()
         let scaleTagIDs = Array(100_001...105_000)
         for contextIndex in 0..<4 {
             let observations = (0..<8).map { witnessIndex in
@@ -280,6 +289,7 @@ import Foundation
             scaleStore.observe(items: observations, scope: "scale-context-\(contextIndex)", policy: policy)
             scaleClock.addTimeInterval(1)
         }
+        await scaleStore.flush()
         check((0..<4).allSatisfy {
             scaleStore.estimate(tagID: scaleTagIDs[0], scope: "scale-context-\($0)", policy: policy)?.countLowerBound == 8
         }, "Scale fixture represents 5000 tags with eight UUID witnesses in all four contexts")
@@ -290,13 +300,13 @@ import Foundation
         check(scaleStore.estimate(tagID: scaleTagIDs[0], scope: "scale-context-0", policy: policy)?.countLowerBound == 8,
               "Disk byte pruning leaves the full in-memory LRU records intact")
         let scaleRestart = TagObservationStore(rootURL: scaleRoot, now: { scaleClock })
-        await scaleRestart.activate(scope: "scale-context-3")
+        await scaleRestart.activate()
         check(scaleRestart.estimate(tagID: scaleTagIDs[0], scope: "scale-context-3", policy: policy)?.countLowerBound == 8,
               "Newest representative-scale context survives byte-budget pruning and restart")
         scaleStore.observe(items: [item(300_001, tags: [106_000])], scope: "scale-context-new", policy: policy)
         await scaleStore.flush()
         let scaleRestartAfterUpdate = TagObservationStore(rootURL: scaleRoot, now: { scaleClock })
-        await scaleRestartAfterUpdate.activate(scope: "scale-context-new")
+        await scaleRestartAfterUpdate.activate()
         check(scaleRestartAfterUpdate.estimate(tagID: 106_000, scope: "scale-context-new", policy: policy)?.countLowerBound == 1,
               "A post-pruning observation can be saved and read after restart")
 

@@ -2,12 +2,38 @@ import Foundation
 
 @main struct PresentationLifecycleChecks {
     struct Item: Identifiable { let id: Int }
-    @MainActor static func main() {
+    @MainActor static func main() async {
         var checks = 0
         func expect(_ condition: @autoclosure () -> Bool, _ message: String) {
             checks += 1
             precondition(condition(), message)
         }
+        let actionID = UUID()
+        var acquisitions = 0
+        var releases = 0
+        func acquireInput() -> (@MainActor () -> Void) {
+            acquisitions += 1
+            return { releases += 1 }
+        }
+        var dragInput: PageTransitionInput? = PageTransitionInput(token: actionID)
+        expect(dragInput!.acquire(acquireInput), "drag acquires its input once")
+        let bodyInput = dragInput!
+        dragInput = nil
+        expect(bodyInput.isHeld, "promoting the body retains the same hold")
+        bodyInput.release(UUID())
+        expect(bodyInput.isHeld && releases == 0, "a late callback cannot release a different action")
+        expect(!bodyInput.acquire(acquireInput) && acquisitions == 1, "a promoted hold does not reacquire")
+        bodyInput.release(actionID)
+        bodyInput.release(actionID)
+        expect(!bodyInput.isHeld && releases == 1, "the terminal callback releases exactly once")
+        let interrupted = PageTransitionInput(token: UUID())
+        expect(!interrupted.acquire {
+            interrupted.release(interrupted.token)
+            return acquireInput()
+        }, "an interruption during shield insertion invalidates acquisition")
+        expect(!interrupted.isHeld && acquisitions == 2 && releases == 2,
+               "the shield inserted by an invalidated action is removed immediately")
+
         let state = PresentationLifecycle<Item>()
         expect(state.phase == .idle && state.platformSession == nil, "starts without a platform request")
         state.requestChanged()
@@ -136,7 +162,39 @@ import Foundation
         expect(!cancelled.recordNavigation(.committed, token: cancelled.id), "cancelled navigation cannot submit late")
 
         checks += verifyScopedReturns()
+        checks += await verifyNativeReturnGate()
         print("PresentationLifecycle: \(checks) checks passed")
+    }
+
+    @MainActor private static func verifyNativeReturnGate() async -> Int {
+        var checks = 0
+        func expect(_ value: @autoclosure () -> Bool, line: UInt = #line) {
+            checks += 1
+            precondition(value(), "Native return gate regression", line: line)
+        }
+        let source = PageNativeReturnGate()
+        let otherPage = PageNativeReturnGate()
+        let first = PageTransitionReceipt()
+        let second = PageTransitionReceipt()
+        expect(!source.blocksBack && !otherPage.blocksBack)
+        expect(source.submit(first) && source.blocksBack && !otherPage.blocksBack)
+        expect(!source.submit(second))
+        source.release(second.id)
+        expect(source.blocksBack && source.receipt === first)
+        first.recordVisual(.aborted("superseded"), token: first.id)
+        expect(source.blocksBack)
+        first.recordNavigation(.committed, token: first.id)
+        source.release(first.id)
+        expect(!source.blocksBack)
+        expect(source.submit(second, timeout: .milliseconds(5)))
+        source.release(first.id)
+        expect(source.receipt === second)
+        let limit = ContinuousClock.now.advanced(by: .seconds(1))
+        while source.blocksBack, ContinuousClock.now < limit {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        expect(!source.blocksBack && second.navigation == nil)
+        return checks
     }
     @MainActor private static func verifyScopedReturns() -> Int {
         var checks = 0
@@ -164,6 +222,57 @@ import Foundation
         retry.releaseBody(first)
         expect(retry.claimBody(second, navigation: { _ in }, abortVisual: { _ in }))
         retry.releaseBody(first); expect(retry.hasBodyOwner)
+
+        let accepted = PageReturnNavigationReceipt(id: UUID())
+        let acceptedEdge = PageTransitionReceipt()
+        var oldVisualObservations = 0
+        expect(accepted.claimBody(acceptedEdge.id, navigation: { _ in oldVisualObservations += 1 },
+                                  abortVisual: { _ in oldVisualObservations += 1 }))
+        expect(!accepted.beginEdgeClose(PageTransitionReceipt()))
+        expect(accepted.beginEdgeClose(acceptedEdge))
+        expect(accepted.hasEdgeClose)
+        accepted.releaseBody(acceptedEdge.id)
+        accepted.resolveEdgeClose(acceptedEdge.id, accepted: true, requested: true, retryDelay: .zero)
+        expect(!accepted.hasBodyOwner && accepted.hasEdgeClose)
+        expect(!accepted.claimBody(UUID(), navigation: { _ in }, abortVisual: { _ in }))
+        expect(accepted.recordNavigation(.committed))
+        expect(acceptedEdge.navigation == .committed && oldVisualObservations == 0)
+
+        let unavailable = PageReturnNavigationReceipt(id: UUID())
+        let unavailableEdge = PageTransitionReceipt(), retriedEdge = PageTransitionReceipt()
+        expect(unavailable.claimBody(unavailableEdge.id, navigation: { _ in }, abortVisual: { _ in }))
+        expect(unavailable.beginEdgeClose(unavailableEdge))
+        unavailable.resolveEdgeClose(unavailableEdge.id, accepted: true, requested: false, retryDelay: .zero)
+        unavailable.releaseBody(unavailableEdge.id)
+        expect(!unavailable.hasBodyOwner && !unavailable.hasEdgeClose)
+        expect(!unavailable.claimBody(retriedEdge.id, navigation: { _ in }, abortVisual: { _ in }))
+        expect(unavailable.claimBody(retriedEdge.id, visibleAndRequested: true, navigation: { _ in }, abortVisual: { _ in }))
+        expect(unavailable.beginEdgeClose(retriedEdge))
+        unavailable.resolveEdgeClose(retriedEdge.id, accepted: true, requested: true)
+        unavailable.releaseBody(retriedEdge.id)
+        expect(unavailable.recordNavigation(.committed))
+        expect(unavailableEdge.navigation == nil && retriedEdge.navigation == .committed)
+
+        let ordinary = PageReturnNavigationReceipt(id: UUID())
+        let unrequestedEdge = PageTransitionReceipt()
+        var unrelatedNavigation = 0, unrelatedAbort = 0
+        expect(ordinary.claimBody(unrequestedEdge.id, navigation: { _ in unrelatedNavigation += 1 },
+                                  abortVisual: { _ in unrelatedAbort += 1 }))
+        expect(ordinary.beginEdgeClose(unrequestedEdge))
+        ordinary.resolveEdgeClose(unrequestedEdge.id, accepted: true, requested: false)
+        expect(!ordinary.claimBody(UUID(), visibleAndRequested: true, navigation: { _ in }, abortVisual: { _ in }))
+        expect(ordinary.recordNavigation(.committed))
+        expect(unrelatedNavigation == 0 && unrelatedAbort == 1 && unrequestedEdge.navigation == nil)
+
+        let reentrant = PageReturnNavigationReceipt(id: UUID())
+        let reentrantEdge = PageTransitionReceipt()
+        expect(reentrant.claimBody(reentrantEdge.id, navigation: { _ in }, abortVisual: { _ in }))
+        expect(reentrant.beginEdgeClose(reentrantEdge))
+        reentrant.releaseBody(reentrantEdge.id)
+        expect(reentrant.recordNavigation(.committed))
+        reentrant.resolveEdgeClose(reentrantEdge.id, accepted: true, requested: true)
+        expect(reentrantEdge.navigation == .committed)
+
         let cleanup=PagePresentationCleanup(); let a=UUID(), b=UUID()
         cleanup.begin(a); let exact=cleanup.receipt(for: a)!
         cleanup.mounted(a); expect(cleanup.awaitingPlatformReceipt)

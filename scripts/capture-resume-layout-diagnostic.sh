@@ -12,7 +12,7 @@ out="$root/build/resume-prompt-layout-diagnostic/$runID"
 scenario="dismiss"
 mkdir -p "$out"
 startUTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-sourceSHA="$(shasum -a 256 "$root/CivitViewer/ResumePromptQA.swift" "$root/CivitViewer/MediaViewer.swift" "$root/CivitViewer/TimelineLane.swift" "$root/CivitViewer/SiteSession.swift" "$root/CivitViewer/BrowsingHistory.swift" "$root/CivitViewer/CivitViewerApp.swift" | shasum -a 256 | awk '{print $1}')"
+sourceSHA="$(shasum -a 256 "$root/CivitViewer/Diagnostics/ResumePromptQA.swift" "$root/CivitViewer/Media/MediaViewer.swift" "$root/CivitViewer/Features/Timeline/TimelineLane.swift" "$root/CivitViewer/Site/SiteSession.swift" "$root/CivitViewer/Features/History/BrowsingHistory.swift" "$root/CivitViewer/App/CivitViewerApp.swift" | shasum -a 256 | awk '{print $1}')"
 
 xcodebuild -quiet -project "$root/CivitViewer.xcodeproj" -scheme CivitViewer \
   -configuration Debug -destination "platform=iOS Simulator,id=$sim" \

@@ -21,9 +21,9 @@ import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE_COMMIT = "d81d3bc15193a89d12884058fbb8a082e6cb24c2"
-SOURCE_NAMES = [
-    "VideoDuration.swift", "Models.swift", "MediaLoadQueue.swift", "MediaFormat.swift",
-    "MediaRepairStore.swift", "PlaybackDiagnostics.swift", "LocalDiagnostics.swift", "MediaCache.swift",
+SOURCE_PATHS = [
+    "Media/VideoDuration.swift", "Feed/Models.swift", "Media/Loading/MediaLoadQueue.swift", "Media/MediaFormat.swift",
+    "Media/MediaRepairStore.swift", "Diagnostics/PlaybackDiagnostics.swift", "Diagnostics/LocalDiagnostics.swift", "Media/Loading/MediaCache.swift",
 ]
 FIXTURE = ROOT / "Tests/Fixtures/short.mp4"
 OUT = ROOT / "build/continuous59"
@@ -210,21 +210,21 @@ def source_tree(label: str, baseline: bool, cancel_current_image_control: bool =
         shutil.rmtree(target)
     (target / "CivitViewer").mkdir(parents=True)
     (target / "Tests").mkdir()
-    for name in SOURCE_NAMES:
-        relative = f"CivitViewer/{name}"
+    for source_path in SOURCE_PATHS:
+        relative = f"CivitViewer/{Path(source_path).name}"
         if baseline:
             completed = subprocess.run(["git", "show", f"{BASELINE_COMMIT}:{relative}"], cwd=ROOT,
                                        check=True, capture_output=True)
             data = completed.stdout
         else:
-            data = (ROOT / relative).read_bytes()
+            data = (ROOT / "CivitViewer" / source_path).read_bytes()
         (target / relative).write_bytes(data)
     if baseline:
         preloader = subprocess.run(["git", "show", f"{BASELINE_COMMIT}:CivitViewer/MediaPreloader.swift"], cwd=ROOT,
                                    check=True, capture_output=True).stdout
         (target / "CivitViewer/MediaPreloader.swift").write_bytes(preloader)
     else:
-        shutil.copy2(ROOT / "CivitViewer/MediaPreloader.swift", target / "CivitViewer/MediaPreloader.swift")
+        shutil.copy2(ROOT / "CivitViewer/Media/Loading/MediaPreloader.swift", target / "CivitViewer/MediaPreloader.swift")
     if cancel_current_image_control:
         preloader_path = target / "CivitViewer/MediaPreloader.swift"
         source = preloader_path.read_text()
@@ -241,7 +241,7 @@ def source_tree(label: str, baseline: bool, cancel_current_image_control: bool =
     cache_path.write_text(cache)
     shutil.copy2(ROOT / "Tests/ContinuousPrefetchChecks.swift", target / "Tests/ContinuousPrefetchChecks.swift")
     shutil.copy2(OUT / "short-padded.mp4", target / "short.mp4")
-    sources = [target / "CivitViewer" / name for name in SOURCE_NAMES]
+    sources = [target / "CivitViewer" / Path(source_path).name for source_path in SOURCE_PATHS]
     sources += [target / "CivitViewer/MediaPreloader.swift", target / "Tests/ContinuousPrefetchChecks.swift"]
     return target, sources
 

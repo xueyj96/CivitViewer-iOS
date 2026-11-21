@@ -24,7 +24,15 @@ import Foundation
             while Date() < end { if await condition() { return true }; try? await Task.sleep(for: .milliseconds(20)) }
             return await condition()
         }
-        func size(_ file: URL?) -> Int? { file.flatMap { try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize } }
+        func size(_ file: URL?) -> Int? {
+            guard let file else { return nil }
+            var fresh = URL(fileURLWithPath: file.path)
+            fresh.removeAllCachedResourceValues()
+            return try? fresh.resourceValues(forKeys: [.fileSizeKey]).fileSize
+        }
+        func statSize(_ file: URL) -> Int? {
+            ((try? FileManager.default.attributesOfItem(atPath: file.path))?[.size] as? NSNumber)?.intValue
+        }
         func fetch(_ cache: MediaCache, _ path: String) async throws -> URL? {
             let url = base.appendingPathComponent(path)
             #if LEGACY_PREFETCH52
@@ -63,10 +71,10 @@ import Foundation
             catch { overCapError = isLimitExceeded(error) }
             let overCount = try await requests()["/over-cap", default: 0]
             defaults.set(1, forKey: "cacheLimitGB")
-            precondition(overCapError && overCapCache.cached(base.appendingPathComponent("over-cap"), video: true) == nil && overCount == 1,
+            let cacheObserved3_0 = await overCapCache.cached(base.appendingPathComponent("over-cap"), video: true); precondition(overCapError && cacheObserved3_0 == nil && overCount == 1,
                          "Over-512 MiB content-length must yield limitExceeded without a cached file")
             rows.append(["case": "over-cap", "error": "limitExceeded", "requestCount": overCount,
-                         "cached": overCapCache.cached(base.appendingPathComponent("over-cap"), video: true) != nil])
+                         "cached": (await overCapCache.cached(base.appendingPathComponent("over-cap"), video: true)) != nil])
 
             // Sparse logical cache occupancy exercises quota-derived max shrink
             // without writing hundreds of MiB to disk. The neutral MP4 fixture
@@ -79,7 +87,12 @@ import Foundation
             let seedHandle = try FileHandle(forWritingTo: seed)
             try seedHandle.truncate(atOffset: 700 * 1024 * 1024)
             try seedHandle.close()
-            quota.pin(seedURL)
+            let returnedURLFirstSize = try seed.resourceValues(forKeys: [.fileSizeKey]).fileSize
+            precondition(returnedURLFirstSize == 700 * 1024 * 1024,
+                         "The consumer's first read of the returned URL has no producer-cached 39 KiB size")
+            precondition(statSize(seed) == 700 * 1024 * 1024 && size(seed) == statSize(seed),
+                         "The returned URL and path stat both observe the actual 700 MiB sparse seed")
+            (await quota.pin(seedURL))
             let firstPressureURL = base.appendingPathComponent("quota-96")
             let pressureTask = Task { try await fetch(quota, "quota-96") }
             let pressureStarted = await wait { (try? await requests()["/quota-96"]) != nil }
@@ -88,29 +101,35 @@ import Foundation
             precondition(shrunkReservation >= 96 * 1024 * 1024 && shrunkReservation < 512 * 1024 * 1024,
                          "Protected 700 MiB occupancy must shrink the admitted maximum below 512 MiB while retaining room for 96 MiB")
             let pressureFile = try await pressureTask.value
-            precondition(size(pressureFile) == 96 * 1024 * 1024 && quota.cached(firstPressureURL, video: true) != nil &&
-                         quota.cached(seedURL, video: true) != nil,
+            let cacheObserved2_0 = await quota.cached(firstPressureURL, video: true); let cacheObserved2_1 = await quota.cached(seedURL, video: true); precondition(size(pressureFile) == 96 * 1024 * 1024 && cacheObserved2_0 != nil &&
+                         cacheObserved2_1 != nil,
                          "The 96 MiB response succeeds and the protected sparse seed remains cached")
-            quota.pin(firstPressureURL)
+            (await quota.pin(firstPressureURL))
             let firstHeldSize = size(seed)
+            precondition(firstHeldSize == 700 * 1024 * 1024 && firstHeldSize == statSize(seed),
+                         "After admission the returned URL cannot regress to the original 39 KiB prefix metadata")
             let growHandle = try FileHandle(forWritingTo: seed)
             try growHandle.truncate(atOffset: 724 * 1024 * 1024)
             try growHandle.close()
+            precondition(statSize(seed) == 724 * 1024 * 1024 && size(seed) == statSize(seed),
+                         "Growing the source again is observed by both fresh URL and path stat")
             try await reset()
             var exhaustedError = false
             do { _ = try await fetch(quota, "quota-exhausted") }
             catch { exhaustedError = isLowSpace(error) }
             let exhaustedRequests = try await requests()
-            precondition(exhaustedError && exhaustedRequests["/quota-exhausted"] == nil &&
-                         quota.cached(seedURL, video: true) != nil && size(seed) == 724 * 1024 * 1024 &&
-                         quota.cached(firstPressureURL, video: true) != nil,
+            let cacheObserved1_0 = await quota.cached(seedURL, video: true); let cacheObserved1_1 = await quota.cached(firstPressureURL, video: true); precondition(exhaustedError && exhaustedRequests["/quota-exhausted"] == nil &&
+                         cacheObserved1_0 != nil && size(seed) == 724 * 1024 * 1024 &&
+                         cacheObserved1_1 != nil,
                          "Below 8 MiB quota fails lowSpace before HTTP and retains both protected cache files")
-            rows.append(["case": "quota-shrink-and-floor", "sparseHeldBeforeBytes": firstHeldSize!,
-                         "sparseHeldAtFloorBytes": size(seed)!, "effectiveReservationBytes": shrunkReservation,
-                         "downloadedSizeBytes": size(pressureFile)!, "protectedStillCached": quota.cached(seedURL, video: true) != nil && quota.cached(firstPressureURL, video: true) != nil,
+            let protectedSeed = await quota.cached(seedURL, video: true)
+            let protectedPressure = await quota.cached(firstPressureURL, video: true)
+            rows.append(["case": "quota-shrink-and-floor", "sparseHeldBeforeBytes": firstHeldSize!, "returnedURLFirstSizeBytes": returnedURLFirstSize!,
+                         "sparseHeldAtFloorBytes": size(seed)!, "statHeldAtFloorBytes": statSize(seed)!, "effectiveReservationBytes": shrunkReservation,
+                         "downloadedSizeBytes": size(pressureFile)!, "protectedStillCached": protectedSeed != nil && protectedPressure != nil,
                          "exhaustedRequests": exhaustedRequests])
-            quota.unpin(seedURL)
-            quota.unpin(firstPressureURL)
+            (await quota.unpin(seedURL))
+            (await quota.unpin(firstPressureURL))
 
             // A foreground repair joins a prefetch flight whose quota-derived
             // maximum is too small for its Content-Length. It must retry once
@@ -123,7 +142,7 @@ import Foundation
             let sharedSeedHandle = try FileHandle(forWritingTo: sharedSeed)
             try sharedSeedHandle.truncate(atOffset: 800 * 1024 * 1024)
             try sharedSeedHandle.close()
-            sharedFlight.pin(sharedSeedURL)
+            (await sharedFlight.pin(sharedSeedURL))
             let sharedURL = base.appendingPathComponent("foreground-40")
             let prefetchTask = Task {
                 do { _ = try await fetch(sharedFlight, "foreground-40"); return "success" }
@@ -153,7 +172,7 @@ import Foundation
                          "prefetchOutcome": prefetchOutcome, "repairSizeBytes": size(repairOutcome.0)!,
                          "requestCount": sharedFlightRequests["/foreground-40", default: 0],
                          "pendingDownloadBudget": sharedFlight.pendingDownloadBudget])
-            sharedFlight.unpin(sharedSeedURL)
+            (await sharedFlight.unpin(sharedSeedURL))
 
             // Below the 8 MiB admission floor, no HTTP request may be issued.
             let tiny = MediaCache(directoryURL: root.appendingPathComponent("tiny"), monitorNetwork: false,
@@ -182,7 +201,7 @@ import Foundation
             let a = try await aTask.value
             let sameA = try await sharedConsumer.value
             precondition(a == sameA, "Two consumers share the same completed large file")
-            let sharedOwner = UUID(); shared.setPrefetchTargets([(base.appendingPathComponent("shared-a"), true)], owner: sharedOwner)
+            let sharedOwner = UUID(); (await shared.setPrefetchTargets([(base.appendingPathComponent("shared-a"), true)], owner: sharedOwner))
             precondition(size(a) == 96 * 1024 * 1024 && bLowSpace && shared.pendingDownloadBudget == 0,
                          "A completes, B is refused within shared 160 MiB headroom, and the reservation returns to zero")
             let bRetry = try await fetch(shared, "shared-b")
@@ -194,7 +213,7 @@ import Foundation
             rows.append(["case": "shared-budget", "aSizeBytes": size(a)!, "bSizeBytes": size(bRetry)!,
                          "pendingDownloadBudget": shared.pendingDownloadBudget, "requests": sharedRequests])
 
-            shared.removePrefetchTargets(owner: sharedOwner)
+            (await shared.removePrefetchTargets(owner: sharedOwner))
 
             // Cancellation closes the response stream, removes the partial file,
             // and releases the whole flight reservation.
@@ -208,10 +227,10 @@ import Foundation
             cancelTask.cancel()
             do { _ = try await cancelTask.value } catch { }
             let clean = await wait { cancelled.pendingDownloadBudget == 0 }
-            precondition(clean && cancelled.cached(cancelURL, video: true) == nil,
+            let cacheObserved0_0 = await cancelled.cached(cancelURL, video: true); precondition(clean && cacheObserved0_0 == nil,
                          "Cancelled long prefetch leaves no final cache file and releases its reservation")
             rows.append(["case": "cancelled", "pendingDownloadBudget": cancelled.pendingDownloadBudget,
-                         "cached": cancelled.cached(cancelURL, video: true) != nil])
+                         "cached": (await cancelled.cached(cancelURL, video: true)) != nil])
         }
         let compiledSourceHash = ProcessInfo.processInfo.environment["LONG_PREFETCH_SOURCE_HASH"] ?? "not-provided"
         print(try JSONSerialization.data(withJSONObject: ["mode": legacy ? "baseline52" : "current53",

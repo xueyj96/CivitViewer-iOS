@@ -59,6 +59,7 @@ struct VideoPlaybackSessionChecks {
         current.player.isMuted = true
         check(current.valid && current.state == .active && pool.isActive(current),
               "current entry owns the active lease")
+        check(!current.hasPresentedNative, "a new entry has not presented a native frame")
         _ = await waitForReady(current, label: "current")
         check(current.item.status == .readyToPlay && current.player.status == .readyToPlay,
               "current fixture becomes ready")
@@ -124,6 +125,8 @@ struct VideoPlaybackSessionChecks {
         let retainedTime = promoted.player.currentTime()
         check(retainedTime.isNumeric && retainedTime.seconds > 4.9,
               "entry has a nonzero position before being covered")
+        promoted.markNativePresented()
+        check(promoted.hasPresentedNative, "the stable ready entry records its presented native frame")
         pool.retainCovered(promoted)
         check(!pool.isActive(promoted) && promoted.state == .coveredPaused,
               "covered entry releases active qualification")
@@ -132,6 +135,8 @@ struct VideoPlaybackSessionChecks {
               "reacquiring covered entry reuses player and item")
         check(CMTimeCompare(reacquired.player.currentTime(), retainedTime) == 0,
               "reacquiring covered entry preserves its position")
+        check(reacquired.hasPresentedNative,
+              "native presentation survives a new surface acquiring the same covered entry")
 
         // Same owner/scope with a changed identity for one work retires only that work's old entry.
         let changedCurrentKey = makeKey(owner: owner, scope: "feed", workID: 102,
@@ -139,6 +144,8 @@ struct VideoPlaybackSessionChecks {
         guard let changedCurrent = acquire(changedCurrentKey) else { fatalError("could not acquire changed work identity") }
         check(!reacquired.valid && pool.lookup(key: candidateKey) == nil,
               "changed identity retires old entry for the same work")
+        check(!reacquired.hasPresentedNative && !changedCurrent.hasPresentedNative,
+              "retired and replacement source identities cannot inherit a native presentation")
         check(current.valid && pool.lookup(key: currentKey) === current,
               "same-scope entry for another work is preserved")
         pool.release(changedCurrent)
@@ -449,6 +456,172 @@ struct VideoPlaybackSessionChecks {
         pool.reset()
         check(pool.entries.isEmpty && pins == unpins,
               "root-slot lifecycle cleanup balances all pins")
+
+        let attachmentKey = makeKey(owner: UUID(), scope: "attachment", workID: 351, url: fixture)
+        guard let firstAttachment = acquire(attachmentKey) else { fatalError("attachment setup") }
+        let oldAttachment = firstAttachment.attachment
+        guard let reattached = acquire(attachmentKey) else { fatalError("reattachment setup") }
+        check(reattached === firstAttachment && reattached.attachment != oldAttachment,
+              "Reacquire keeps the player and replaces only its consumer attachment")
+        pool.release(reattached, attachment: oldAttachment)
+        check(reattached.valid && pool.isActive(reattached), "Old leaf release cannot retire a reattached player")
+        pool.retainCovered(reattached, attachment: oldAttachment)
+        check(pool.isActive(reattached), "Old leaf cannot pause a reattached player as covered")
+        pool.retainCovered(reattached, attachment: reattached.attachment)
+        check(reattached.state == .coveredPaused, "Current attachment can retain covered playback")
+        reattached.userIntent = .init(playing: false, autoplay: true)
+        guard let intentRestored = acquire(attachmentKey) else { fatalError("intent restoration setup") }
+        check(intentRestored === reattached && intentRestored.userIntent == .init(playing: false, autoplay: true),
+              "Explicit pause belongs to the same retained player, not its native rate")
+        pool.release(intentRestored, attachment: intentRestored.attachment)
+        check(!reattached.valid && pool.entries.isEmpty && pins == unpins,
+              "Current attachment retires exactly once and balances resources")
+
+        // Compare the legacy two-entry sequence with the same local three-work path.
+        let slidingOwner = UUID(), slidingSlot = UUID()
+        let slidingA = makeKey(owner: slidingOwner, scope: "feed:sliding", workID: 401, url: fixture, rootSlot: slidingSlot)
+        let slidingB = makeKey(owner: slidingOwner, scope: "feed:sliding", workID: 402, url: fixture, rootSlot: slidingSlot)
+        let slidingC = makeKey(owner: slidingOwner, scope: "feed:sliding", workID: 403, url: fixture, rootSlot: slidingSlot)
+        let ordinaryPinsStart = pins
+        guard let ordinaryA = acquire(slidingA) else { fatalError("ordinary sliding A") }
+        let ordinaryAReady = await waitForReady(ordinaryA, label: "ordinary sliding A")
+        check(ordinaryAReady, "first work is ready")
+        guard let ordinaryB = pool.prepareCandidate(key: slidingB, expectedCurrentWorkID: slidingA.workID,
+            pin: { pins += 1 }, unpin: { unpins += 1 }), acquire(slidingB) === ordinaryB else {
+            fatalError("ordinary sliding B")
+        }
+        let ordinaryBReady = await waitForReady(ordinaryB, label: "ordinary sliding B")
+        check(ordinaryBReady, "warm forward work becomes current")
+        guard let ordinaryC = pool.prepareCandidate(key: slidingC, expectedCurrentWorkID: slidingB.workID,
+            pin: { pins += 1 }, unpin: { unpins += 1 }), let ordinaryReturnedA = acquire(slidingA) else {
+            fatalError("ordinary sliding C then return A")
+        }
+        check(ordinaryReturnedA !== ordinaryA && !ordinaryA.valid && !ordinaryC.valid && pool.entries.count == 2,
+              "ordinary two-entry playback reconstructs A after prewarming C")
+        print("SLIDING_POOL_ORDINARY createdThroughReturn=\(pins - ordinaryPinsStart) reuseBackward=false")
+        pool.reset()
+        check(pins == unpins, "ordinary comparison balances its pins")
+
+        func neighbor(_ key: VideoPlaybackSessionKey) -> VideoPlaybackNeighborWindow.Neighbor {
+            .init(workID: key.workID, address: key.requestedURL)
+        }
+        let windowA = VideoPlaybackNeighborWindow(previous: nil, next: neighbor(slidingB))
+        let windowB = VideoPlaybackNeighborWindow(previous: neighbor(slidingA), next: neighbor(slidingC))
+        let timelinePinsStart = pins
+        func activateTimeline(_ key: VideoPlaybackSessionKey, window: VideoPlaybackNeighborWindow) -> VideoPlaybackSessions.Entry {
+            guard let entry = pool.acquireCurrent(key: key, timelineWindow: window,
+                pin: { pins += 1 }, unpin: { unpins += 1 }) else {
+                fatalError("timeline acquisition failed for \(key.workID)")
+            }
+            entry.player.isMuted = true
+            return entry
+        }
+        func warmTimeline(_ key: VideoPlaybackSessionKey, from work: Int) -> VideoPlaybackSessions.Entry? {
+            pool.prepareCandidate(key: key, expectedCurrentWorkID: work,
+                pin: { pins += 1 }, unpin: { unpins += 1 })
+        }
+        let timelineA = activateTimeline(slidingA, window: windowA)
+        let timelineAReady = await waitForReady(timelineA, label: "timeline A")
+        check(timelineAReady, "timeline first work is ready")
+        check(!timelineA.startRemoteAutoplayIfReady(attachment: timelineA.attachment),
+              "A ready local timeline video does not use remote autoplay startup")
+        let marked = await timelineA.player.seek(to: CMTime(seconds: 0.8, preferredTimescale: 600),
+                                                toleranceBefore: .zero, toleranceAfter: .zero)
+        timelineA.userIntent = .init(playing: false, autoplay: true)
+        check(marked, "timeline first work has a real native paused position")
+        let wrongTimelineSlot = makeKey(owner: slidingOwner, scope: "feed:sliding", workID: 402, url: fixture, rootSlot: UUID())
+        check(warmTimeline(wrongTimelineSlot, from: slidingA.workID) == nil,
+              "another root slot cannot warm this timeline")
+        guard let warmB = warmTimeline(slidingB, from: slidingA.workID) else { fatalError("warm timeline B") }
+        let warmBReady = await waitForReady(warmB, label: "timeline B")
+        check(warmBReady, "the next player can reach readiness without playing")
+        let oldAAttachment = timelineA.attachment
+        check(pool.retainTimelineNeighbor(timelineA, attachment: oldAAttachment) && !pool.isActive(timelineA),
+              "a native detach before promotion parks the ready local player")
+        let timelineB = activateTimeline(slidingB, window: windowB)
+        check(timelineB === warmB && timelineA.state == .adjacentPaused && pool.isActive(timelineB),
+              "adjacent playback promotion keeps the outgoing ready player")
+        guard let timelineC = warmTimeline(slidingC, from: slidingB.workID) else { fatalError("warm timeline C") }
+        check(warmTimeline(slidingA, from: slidingB.workID) === timelineA && pool.entries.count == 3,
+              "filling the third slot does not rebuild the previously presented neighbor")
+        check(pool.hasPreparedTimelineNeighbor(neighbor(slidingA), owner: slidingOwner, scope: slidingA.scope,
+            rootSlot: slidingSlot, cacheGeneration: nil), "the existing pinned neighbor bypasses duplicate preparation")
+        check(!pool.hasPreparedTimelineNeighbor(neighbor(slidingA), owner: slidingOwner, scope: slidingA.scope,
+            rootSlot: slidingSlot, cacheGeneration: 1), "a prepared neighbor cannot be reused after its cache generation changes")
+        let timelineCReady = await waitForReady(timelineC, label: "timeline C")
+        check(timelineCReady && timelineC.player.rate == 0, "the spare player becomes ready silently")
+        timelineB.player.play()
+        let returnedA = activateTimeline(slidingA, window: windowA)
+        check(returnedA === timelineA && returnedA.player === timelineA.player && returnedA.item === timelineA.item &&
+              returnedA.userIntent == .init(playing: false, autoplay: true) &&
+              abs(returnedA.player.currentTime().seconds - 0.8) < 0.03,
+              "backward reuse keeps the exact native position and explicit pause intent")
+        check(!timelineC.valid && timelineB.state == .adjacentPaused && timelineB.player.rate == 0 &&
+              pool.isActive(returnedA) && pool.entries.filter { $0.player.rate != 0 }.count == 0,
+              "backward focus drops the out-of-window player and pauses the departing one")
+        pool.release(returnedA, attachment: oldAAttachment)
+        check(pool.isActive(returnedA), "a stale view cannot release the reattached native player")
+        check(pins - timelinePinsStart == 3, "the timeline sequence creates only A, B and C")
+        print("SLIDING_POOL_TIMELINE createdThroughReturn=\(pins - timelinePinsStart) reuseBackward=true")
+        let returnedB = activateTimeline(slidingB, window: windowB)
+        check(returnedB === timelineB, "an immediate forward retry also reuses the retained player")
+        guard let warmC = warmTimeline(slidingC, from: slidingB.workID) else { fatalError("rewarm timeline C") }
+        check(pool.entries.count == 3 && pool.entries.filter { pool.isActive($0) }.count == 1,
+              "only one native player owns playback in the full timeline window")
+        pool.pauseForRootDeparture(rootSlot: slidingSlot, feedIdentity: "feed")
+        check(pool.entries.count == 1 && returnedB.state == .rootPaused &&
+              !pool.isActive(returnedB) && !warmC.valid && !returnedA.valid,
+              "root departure retains the selected player and releases both spares")
+        check(activateTimeline(slidingB, window: windowB) === returnedB,
+              "the selected player is reusable when returning to its root")
+        guard let staleC = warmTimeline(slidingC, from: slidingB.workID) else { fatalError("cache clear candidate") }
+        pool.clearTimelineSpares(owner: slidingOwner, cacheGeneration: 2)
+        check(!staleC.valid && pool.isActive(returnedB) && returnedB.timelineWindow == windowB,
+              "cache clear releases speculative leases with the active timeline window intact")
+        let oldAttachmentAfterClear = returnedB.attachment
+        let oldTokenAfterClear = returnedB.token
+        check(!pool.retainTimelineNeighbor(returnedB, attachment: oldAttachmentAfterClear) && pool.isActive(returnedB),
+              "clearing the cache leaves current playback eligible but disables parking its lease")
+        let freshC = VideoPlaybackSessionKey(owner: slidingOwner, scope: slidingC.scope, workID: slidingC.workID,
+            requestedURL: slidingC.requestedURL, sourceURL: slidingC.sourceURL,
+            sourceRevision: "fresh", rootSlot: slidingSlot, cacheGeneration: 2)
+        let freshB = VideoPlaybackSessionKey(owner: slidingOwner, scope: slidingB.scope, workID: slidingB.workID,
+            requestedURL: slidingB.requestedURL, sourceURL: slidingB.sourceURL,
+            sourceRevision: "fresh", rootSlot: slidingSlot, cacheGeneration: 2)
+        let windowC = VideoPlaybackNeighborWindow(previous: neighbor(freshB), next: nil)
+        guard let receivedC = warmTimeline(freshC, from: slidingB.workID) else { fatalError("post-clear neighbor") }
+        let unpinsBeforeFocusAfterClear = unpins
+        let freshCurrent = activateTimeline(freshC, window: windowC)
+        check(freshCurrent === receivedC && pool.isActive(freshCurrent) && !returnedB.valid &&
+              !pool.entries.contains { $0.token == oldTokenAfterClear } && unpins == unpinsBeforeFocusAfterClear + 1,
+              "advancing after cache clear promotes the fresh neighbor and releases the previous token and lease")
+        pool.release(returnedB, attachment: oldAttachmentAfterClear)
+        check(unpins == unpinsBeforeFocusAfterClear + 1, "late old-leaf cleanup cannot release the invalidated lease twice")
+        let freshReady = await waitForReady(freshCurrent, label: "post-clear current")
+        check(freshReady, "fresh post-clear playback becomes ready")
+        guard let pressuredB = warmTimeline(freshB, from: slidingC.workID) else { fatalError("pressure candidate") }
+        pool.handleMemoryPressure()
+        check(pool.entries.count == 1 && pool.isActive(freshCurrent) && !pressuredB.valid &&
+              warmTimeline(freshB, from: slidingC.workID) == nil,
+              "memory pressure evicts spares and defers rewarming the unchanged selection")
+        pool.suspendForBackground()
+        check(pool.entries.count == 1 && freshCurrent.player.rate == 0 && !pool.isActive(freshCurrent),
+              "background suspends playback access")
+        pool.reset()
+        check(pool.entries.isEmpty && pins == unpins, "every timeline creation releases its pin exactly once")
+
+        let competingTimeline = activateTimeline(slidingB, window: windowB)
+        let competingReady = await waitForReady(competingTimeline, label: "competing timeline")
+        check(competingReady, "the timeline is ready before opening a separate playback surface")
+        guard let spareA = warmTimeline(slidingA, from: slidingB.workID),
+              let spareC = warmTimeline(slidingC, from: slidingB.workID) else { fatalError("competing timeline spares") }
+        let externalKey = makeKey(owner: UUID(), scope: "other-deck", workID: 410, url: fixture)
+        guard let competingExternal = acquire(externalKey) else { fatalError("external active entry") }
+        check(!spareA.valid && !spareC.valid && pool.entries.count == VideoPlaybackSessions.capacity &&
+              pool.isActive(competingExternal) && !pool.isActive(competingTimeline),
+              "another playback owner reclaims the speculative slots and stays within its ordinary capacity")
+        pool.reset()
+        check(pins == unpins, "competing playback cleans up all cache pins")
 
         print("PASS: \(checks) native playback pool checks")
         print("PREROLL: \(candidate.prerollFinished ? "finished" : "not observed; optional readiness gap")")

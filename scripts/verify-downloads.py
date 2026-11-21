@@ -8,14 +8,16 @@ import threading
 import time
 
 root = Path(__file__).resolve().parents[1]
-source = (root / 'CivitViewer/MediaCache.swift').read_text()
-actual = 'import Foundation\n' + source[source.index('enum MediaDownloadError:'):]
+source = (root / 'CivitViewer/Media/Loading/MediaCache.swift').read_text()
+file_values = source[source.index('private enum MediaFileValues'):source.index('struct CachedImageResource')]
+download = source[source.index('enum MediaDownloadError:'):source.index('struct MediaFileLease')]
+actual = 'import Foundation\n' + file_values + download
 extracted = root / 'build/DownloadUnderTest.swift'
 extracted.parent.mkdir(exist_ok=True)
 extracted.write_text(actual)
 env = {**os.environ, 'DEVELOPER_DIR': '/Applications/Xcode.app/Contents/Developer'}
 binary = root / 'build/download-checks'
-sources = ['VideoDuration.swift', 'Models.swift', 'MediaLoadQueue.swift']
+sources = ['Media/VideoDuration.swift', 'Feed/Models.swift', 'Media/Loading/MediaLoadQueue.swift']
 subprocess.run(['xcrun', 'swiftc', *(str(root / 'CivitViewer' / name) for name in sources),
                 str(extracted), str(root / 'Tests/DownloadChecks.swift'), '-o', str(binary)], check=True, env=env)
 

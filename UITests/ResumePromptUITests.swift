@@ -17,6 +17,183 @@ final class ResumePromptUITests: XCTestCase {
         return picker
     }
 
+    func testPlayback174TailBaseline() {
+        app = XCUIApplication()
+        app.launchArguments = ["--qa-collection-paging", "--qa-height-audit", "--qa-header-motion", "--qa-drag-performance167", "-muted", "YES", "-autoplay", "NO"]
+        XCUIDevice.shared.orientation = .portrait
+        app.launch()
+        heightOpen("author-video", expected: 28_037_102)
+        waitUntil("Author video is focused") { self.watchFocus() == 28_037_102 }
+        heightDeck().swipeUp()
+        waitUntil("The last author video is focused") { self.watchFocus() == 28_037_104 }
+        let seek = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", "播放进度")).allElementsBoundByIndex.first(where: \.isHittable)
+        print("PLAYBACK174_GEOMETRY seek=\(seek?.frame ?? .zero);footer=\(mainTabBar().frame);header=\(floatingPageTitle("作者作品").frame)")
+        let ended = app.staticTexts["feed.continuation.ended"].firstMatch
+        XCTAssertTrue(ended.waitForExistence(timeout: 5), "A settled final page keeps its continuation status")
+        if ended.exists {
+            print("PLAYBACK174_ENDED \(ended.frame)")
+            XCTAssertGreaterThanOrEqual(ended.frame.minY, floatingPageTitle("作者作品").frame.maxY + 4)
+        }
+        XCTAssertNotNil(seek)
+        if let seek { XCTAssertLessThanOrEqual(seek.frame.maxY, mainTabBar().frame.minY + 1, "Seek hit area must clear the floating footer") }
+        attachScreenshot(named: "playback174-author-tail-before")
+        print("PERF174_READY epoch=\(Date().timeIntervalSince1970)")
+        let window = app.windows.firstMatch
+        for _ in 0..<12 {
+            window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.70))
+                .press(forDuration: 0.1, thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.34)), withVelocity: XCUIGestureVelocity(rawValue: 200), thenHoldForDuration: 0.1)
+        }
+        print("PERF174_END epoch=\(Date().timeIntervalSince1970)")
+        print("PERF174_CADENCE " + app.staticTexts["performance.cadence172"].valueDescription)
+        XCTAssertEqual(watchFocus(), 28_037_104)
+        attachScreenshot(named: "playback174-author-tail-after")
+    }
+
+    func testPlayback174BoundaryMotionDoesNotRepublishHosts() {
+        app = XCUIApplication()
+        app.launchArguments = ["--qa-collection-paging", "--qa-height-audit", "--qa-pager-touch-trace",
+                               "-muted", "YES", "-autoplay", "NO"]
+        app.launch()
+        heightOpen("author-video", expected: 28_037_102)
+        heightDeck().swipeUp()
+        waitUntil("The final author video settles") { self.watchFocus() == 28_037_104 }
+        let window = app.windows.firstMatch
+        func drag() {
+            window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.70))
+                .press(forDuration: 0.1, thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.34)),
+                       withVelocity: XCUIGestureVelocity(rawValue: 200), thenHoldForDuration: 0.1)
+        }
+        func state() -> [String: Any] {
+            let data = Data(app.staticTexts["pager.qa.trace"].valueDescription.utf8)
+            let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            return object?["current"] as? [String: Any] ?? [:]
+        }
+        drag()
+        waitUntil("The boundary state is committed before measuring finger motion") {
+            state()["latestBoundaryWaiting"] as? Bool == true && state()["transitionActive"] as? Bool == false
+        }
+        let before = state()
+        XCTAssertNotNil(before["hostRootAssignments"])
+        for _ in 0..<4 { drag() }
+        let after = state()
+        XCTAssertEqual(after["instance"] as? String, before["instance"] as? String)
+        XCTAssertEqual(after["hostRootAssignments"] as? Int, before["hostRootAssignments"] as? Int)
+        XCTAssertEqual(after["hostContentPublishes"] as? Int, before["hostContentPublishes"] as? Int,
+                       "Finger motion cannot republish unchanged media pages")
+        print("HOST174 before=\(before);after=\(after)")
+        attachEdgeTrace("174-boundary-publication")
+    }
+
+    func testPlayback174CachedAuthorStaysOpen() {
+        app = XCUIApplication()
+        app.launchArguments = ["--qa-collection-paging", "--qa-height-audit", "--qa-collection-batch-manage", "--qa-header-motion", "--qa-pager-touch-trace", "--qa-caption-hit174", "-muted", "YES", "-autoplay", "NO"]
+        XCUIDevice.shared.orientation = .portrait
+        app.launch()
+        heightOpen("collections", expected: 28_037_102)
+        waitUntil("Cached video is focused") { self.watchFocus() == 28_037_102 }
+        let author = app.buttons["media.author.28037102"].firstMatch
+        waitUntil("Cached video author control settles") {
+            author.isHittable && (!self.app.staticTexts["page.interaction-lock"].exists || self.app.staticTexts["page.interaction-lock"].valueDescription.contains("locks=0"))
+        }
+        let originalPlayer = playerFields()["player"]
+        XCTAssertNotNil(originalPlayer)
+        for _ in 0..<3 {
+            print("AUTHOR174_CANDIDATES " + self.app.buttons.matching(identifier: "media.author.28037102").allElementsBoundByIndex.map { "\($0.frame):hittable=\($0.isHittable):enabled=\($0.isEnabled)" }.joined(separator: ";"))
+            print("AUTHOR174_PARENT " + self.app.staticTexts["media.qa.parent-ready"].valueDescription)
+            print("AUTHOR174_PLAYER " + self.app.staticTexts["media.qa.player"].valueDescription)
+            author.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+            let header = self.app.descendants(matching: .any)["creator.top-bar"]
+            let opened = header.waitForExistence(timeout: 8)
+            if !opened {
+                print("AUTHOR174_TRACE " + self.app.staticTexts["pager.qa.trace"].valueDescription)
+                attachEdgeTrace("174-cached-author-rejection")
+                attachScreenshot(named: "174-cached-author-failure")
+            }
+            XCTAssertTrue(opened)
+            let unexpectedlyClosed = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !header.exists }, object: nil)
+            XCTAssertEqual(XCTWaiter.wait(for: [unexpectedlyClosed], timeout: 4), .timedOut, "The author page must stay open rather than return to playback")
+            attachScreenshot(named: "playback174-cached-author-open")
+            header.buttons["navigation.back"].tap()
+            waitUntil("Returning restores the cached video") { self.watchFocus() == 28_037_102 }
+            waitUntil("Returning reuses the original cached player") {
+                self.playerFields()["player"] == originalPlayer && self.playerFields()["ready"] == "true"
+            }
+        }
+
+    }
+
+    func testPlayback174VideoChromeKeepsPlayerAndIntent() {
+        app = XCUIApplication()
+        app.launchArguments = ["--qa-collection-paging", "--qa-height-audit", "-muted", "YES", "-autoplay", "YES"]
+        XCUIDevice.shared.orientation = .portrait
+        app.launch()
+        heightOpen("collections", expected: 28_037_102)
+        waitUntil("The local video starts playing") {
+            let state = self.playerFields()
+            return state["ready"] == "true" && (Double(state["rate"] ?? "") ?? 0) > 0
+        }
+        heightDeck().tap()
+        waitUntil("The user explicitly pauses the local video") {
+            let state = self.playerFields()
+            return state["ready"] == "true" && state["intent"] == "false"
+        }
+        let original = playerFields()
+        let close = app.buttons["playback.close"]
+        for _ in 0..<2 {
+            centralPress()
+            waitUntil("Long press hides the playback title") { !close.exists || !close.isHittable }
+            waitUntil("Hiding controls retains the same paused player") {
+                let state = self.playerFields()
+                return state["player"] == original["player"] && state["ready"] == "true" &&
+                    state["intent"] == "false" && state["rate"] == "0.0" &&
+                    abs((Double(state["nativePosition"] ?? "") ?? -100) - (Double(original["nativePosition"] ?? "") ?? 0)) < 0.75
+            }
+            centralPress()
+            waitUntil("Long press restores the playback title") { close.exists && close.isHittable }
+            XCTAssertEqual(playerFields()["player"], original["player"])
+            XCTAssertLessThanOrEqual(Int(playerFields()["poolCount"] ?? "99") ?? 99, 2)
+        }
+        close.tap()
+        XCTAssertTrue(close.waitForNonExistence(timeout: 5))
+    }
+
+    func testRoot174EdgeDragDoesNotActivateSourceRow() {
+        app = XCUIApplication()
+        app.launchArguments = ["--qa-collection-paging", "--qa-author-activity58", "--qa-header-motion",
+                               "--qa-body-motion", "-muted", "YES", "-autoplay", "NO"]
+        app.launch()
+        let window = app.windows.firstMatch
+        func idle() {
+            waitUntil("The root gesture releases its interaction lease") {
+                !self.app.staticTexts["page.interaction-lock"].exists ||
+                self.app.staticTexts["page.interaction-lock"].valueDescription.contains("locks=0")
+            }
+        }
+        for right in [false, true] {
+            mainTabButton("作者榜").tap(); idle()
+            let row = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "leaderboard.author.")).element(boundBy: 3)
+            XCTAssertTrue(row.waitForExistence(timeout: 8)); XCTAssertTrue(row.isHittable)
+            let x = right ? window.frame.width - 24 : 24
+            let start = app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: x, dy: row.frame.midY))
+            XCTAssertTrue(row.frame.contains(CGPoint(x: x, y: row.frame.midY)), "The drag starts inside the actual row hit area")
+            let short = app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: x + (right ? -28 : 28), dy: row.frame.midY))
+            start.press(forDuration: 0.05, thenDragTo: short, withVelocity: XCUIGestureVelocity(rawValue: 90), thenHoldForDuration: 0.15)
+            idle()
+            XCTAssertTrue(mainTabButton("作者榜").isSelected)
+            XCTAssertFalse(app.otherElements["creator.top-bar"].exists, "Cancelling an edge drag must not tap the source row")
+            let finish = app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: window.frame.midX, dy: row.frame.midY))
+            start.press(forDuration: 0.05, thenDragTo: finish, withVelocity: XCUIGestureVelocity(rawValue: 180), thenHoldForDuration: 0.1)
+            waitUntil("The completed edge selects the adjacent root") { self.mainTabButton(right ? "搜索" : "时间线").isSelected }
+            idle()
+            mainTabButton("作者榜").tap(); idle()
+            XCTAssertFalse(app.otherElements["creator.top-bar"].exists, "Completing an edge drag must not navigate inside its source")
+            row.tap()
+            let author = app.otherElements["creator.top-bar"]
+            XCTAssertTrue(author.waitForExistence(timeout: 6), "The same source row remains tappable")
+            author.buttons["navigation.back"].tap(); idle()
+        }
+    }
+
     func testMediaModes70TimelineSourcesAndReset() {
         app = XCUIApplication()
         app.launchArguments = ["--qa-collection-paging", "--qa-visual-controls", "-muted", "YES", "-autoplay", "NO", "-timeline.presentation", "stream"]
@@ -475,7 +652,8 @@ final class ResumePromptUITests: XCTestCase {
         XCTAssertEqual(input.frame, inputFrame)
         XCTAssertEqual(toggle.frame, toggleFrame)
         XCTAssertEqual(prefix.frame, prefixFrame)
-        XCTAssertGreaterThanOrEqual(unknown.frame.height, 44)
+        XCTAssertGreaterThanOrEqual(unknown.frame.height, 32, "The shared tag chip uses a 32 pt target at standard Dynamic Type")
+        XCTAssertTrue(unknown.isHittable)
         attachScreenshot(named: "tags71-compact-results-and-clear")
         app.buttons["清空标签名称"].tap()
         XCTAssertTrue(toggle.buttons["常用"].isSelected)
@@ -513,15 +691,15 @@ final class ResumePromptUITests: XCTestCase {
         XCTAssertTrue(sparse.waitForExistence(timeout: 5)); sparse.tap()
         let tagPicker = app.buttons["search-tag-picker"]
         back.tap()
-        XCTAssertTrue(tagPicker.waitForValueToContain("未选择", timeout: 5))
-        app.buttons["search-tag-picker"].tap()
+        XCTAssertTrue(tagPicker.waitForValueToContain("已选择 1 个标签", timeout: 5), "A successful return commits local tag selection")
+        tagPicker.tap()
         XCTAssertTrue(toggle.waitForExistence(timeout: 5))
         toggle.buttons["全部标签"].tap()
         XCTAssertTrue(sparse.waitForExistence(timeout: 5))
-        XCTAssertFalse(sparse.valueDescription.contains("已选择"))
+        XCTAssertTrue(sparse.valueDescription.hasPrefix("已选择"))
         sparse.tap()
         done.tap()
-        XCTAssertTrue(tagPicker.waitForValueToContain("已选择 1 个标签", timeout: 5))
+        XCTAssertTrue(tagPicker.waitForValueToContain("未选择", timeout: 5))
     }
 
     func testTagDirectoryAutomaticallyPagesAndRetriesAtEnd() {
@@ -795,32 +973,41 @@ final class ResumePromptUITests: XCTestCase {
     }
 
     func testNonTimelineDoubleTapDoesNotRefreshAndTimelineDoubleTapUsesFirstPage() {
-        launchQA("restart-recommendation")
+        launchQA("restart-recommendation-retained-tail")
         let state = app.descendants(matching: .any)["qa-state"]
-        XCTAssertTrue(state.waitForExistence(timeout: 10))
-        XCTAssertTrue(state.waitForValueToContain("recQueueCount=5", timeout: 15), "Recommendation lane must be seeded; state=\(state.valueDescription)")
+        waitUntil("The recommendation fixture must retain its original queue and cursor", timeout: 15) {
+            let value = state.valueDescription
+            return value.contains("recQueueCount=8") && value.contains("recCursor=qa-next")
+        }
         let initialState = state.valueDescription
         XCTAssertTrue(initialState.contains("recFocus=28029101"))
-        XCTAssertTrue(initialState.contains("recCursor=qa-next"))
-        XCTAssertTrue(initialState.contains("recQueueCount=5"))
+        let firstPages = metric("recSelectedFirstPageRequests", in: initialState)
+        XCTAssertGreaterThanOrEqual(firstPages, 0)
 
-        mainTabButton("作者榜").doubleTap()
-        mainTabButton("时间线").tap()
-        XCTAssertTrue(state.valueDescription.contains("recFirstPageRequests=0"), "Other tab double tap must not restart")
+        let authorTab = mainTabButton("作者榜")
+        let timelineTab = mainTabButton("时间线")
+        authorTab.doubleTap()
+        waitForTimelineGestureTestTab("作者榜")
+        timelineTab.tap()
+        waitForTimelineGestureTestTab("时间线")
+        XCTAssertEqual(metric("recSelectedFirstPageRequests", in: state.valueDescription), firstPages,
+                       "Other tab double tap must not restart")
         XCTAssertTrue(state.valueDescription.contains("recFocus=28029101"), "Single selection must preserve focus")
         XCTAssertTrue(state.valueDescription.contains("recCursor=qa-next"), "Single selection must preserve the old cursor")
-        XCTAssertTrue(state.valueDescription.contains("recQueueCount=5"), "Single selection must preserve the loaded queue")
+        XCTAssertTrue(state.valueDescription.contains("recQueueCount=8"), "Single selection must preserve the loaded queue")
 
-        mainTabButton("作者榜").tap()
-        XCTAssertTrue(state.valueDescription.contains("recFirstPageRequests=0"), "Leaving Timeline must not request a page")
-        let timelineTab = mainTabButton("时间线")
+        authorTab.tap()
+        waitForTimelineGestureTestTab("作者榜")
+        XCTAssertEqual(metric("recSelectedFirstPageRequests", in: state.valueDescription), firstPages,
+                       "Leaving Timeline must not request a new first page")
         timelineTab.doubleTap()
-        XCTAssertTrue(state.waitForValueToContain("recFirstPageRequests=1", timeout: 10), "Real timeline double tap from Works should issue one first-page request")
+        waitForTimelineGestureTestTab("时间线")
+        XCTAssertTrue(state.waitForValueToContain("recQueueCount=5", timeout: 10), "Double tap must replace the retained queue with the first page")
         XCTAssertTrue(state.valueDescription.contains("recCursor=nil"), "Restart request must leave the recommendation lane at its initial-page cursor")
         XCTAssertTrue(state.valueDescription.contains("recFocus=28029101"), "A successful restart should focus the first returned item")
-        XCTAssertTrue(state.valueDescription.contains("recQueueCount=5"), "The refreshed queue should contain only the new first page")
         Thread.sleep(forTimeInterval: 1)
-        XCTAssertTrue(state.valueDescription.contains("recFirstPageRequests=1"), "One double tap must not issue duplicate first-page requests")
+        XCTAssertEqual(metric("recSelectedFirstPageRequests", in: state.valueDescription), firstPages + 1,
+                       "One double tap must issue exactly one new first-page request")
         XCTAssertFalse(app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "接着看")).firstMatch.exists)
     }
 
@@ -834,16 +1021,27 @@ final class ResumePromptUITests: XCTestCase {
         XCTAssertTrue(state.valueDescription.contains("kind=video"))
         XCTAssertTrue(state.valueDescription.contains("sort=Most Comments"))
         XCTAssertTrue(state.valueDescription.contains("period=Month"))
+        activeMediaDeck().swipeUp()
+        waitUntil("The existing Following queue is on its second work") {
+            self.metric("followFocus", in: state.valueDescription) == 28_029_102
+        }
 
         let beforeLeaving = state.valueDescription
-        let firstPageBeforeLeaving = metric("firstPageRequests", in: beforeLeaving)
-        let requestsBeforeLeaving = metric("pageRequests", in: beforeLeaving)
+        let firstPageBeforeLeaving = metric("followSelectedFirstPageRequests", in: beforeLeaving)
+        XCTAssertGreaterThanOrEqual(firstPageBeforeLeaving, 0)
         mainTabButton("作者榜").tap()
+        waitForTimelineGestureTestTab("作者榜")
         let afterSingleWorksTap = state.valueDescription
-        XCTAssertEqual(metric("firstPageRequests", in: afterSingleWorksTap), firstPageBeforeLeaving, "Single navigation to Works must not issue a first-page request")
-        XCTAssertEqual(metric("pageRequests", in: afterSingleWorksTap), requestsBeforeLeaving, "Single navigation to Works must preserve the request count")
+        XCTAssertEqual(metric("followSelectedFirstPageRequests", in: afterSingleWorksTap), firstPageBeforeLeaving,
+                       "Single navigation to Works must not restart the selected Following feed")
         mainTabButton("时间线").doubleTap()
-        XCTAssertTrue(state.waitForValueToContain("lastSource=following", timeout: 15))
+        waitForTimelineGestureTestTab("时间线")
+        waitUntil("Double tap must request the first page using the selected Following filter", timeout: 15) {
+            self.metric("followSelectedFirstPageRequests", in: state.valueDescription) == firstPageBeforeLeaving + 1
+        }
+        waitUntil("The refreshed Following queue returns to its first work") {
+            self.metric("followFocus", in: state.valueDescription) == 28_029_101
+        }
         let readback = state.valueDescription
         XCTAssertTrue(readback.contains("lastSource=following"), "Refresh from Works must apply to the active followed lane")
         XCTAssertTrue(readback.contains("lastKind=video;lastSort=Most Comments;lastPeriod=Month"), "Refresh must retain filter and sort")
@@ -851,8 +1049,14 @@ final class ResumePromptUITests: XCTestCase {
         XCTAssertTrue(readback.contains("followFocus=28029101"), "The first returned item should become focused")
         XCTAssertTrue(readback.contains("followQueueCount=5"), "The refreshed queue should use the first page")
         Thread.sleep(forTimeInterval: 1)
-        XCTAssertEqual(metric("firstPageRequests", in: state.valueDescription) - metric("firstPageRequests", in: afterSingleWorksTap), 1,
+        XCTAssertEqual(metric("followSelectedFirstPageRequests", in: state.valueDescription), firstPageBeforeLeaving + 1,
                        "One double tap from Works must issue exactly one new first-page request")
+    }
+
+    private func waitForTimelineGestureTestTab(_ title: String) {
+        waitUntil("The \(title) tab must be committed and the timeline button hittable", timeout: 8) {
+            self.mainTabButton(title).isSelected && self.mainTabButton("时间线").isHittable
+        }
     }
 
     func testSelectedTimelineSingleTapReturnsToTopAndDoubleTapRestarts() {
@@ -1164,40 +1368,126 @@ final class ResumePromptUITests: XCTestCase {
     func testFavoritesRestoreCachedListBeforeFreshAccountResponse() {
         app = XCUIApplication()
         let cache = "--qa-collection-cache-key=\(UUID().uuidString)"
-        let common = ["--qa-collection-paging", "--qa-visual-controls", cache,
+        let common = ["--qa-collection-paging", "--qa-collection-cache-controlled", cache,
                       "-app.appearance", "light", "-muted", "YES", "-autoplay", "NO"]
         XCUIDevice.shared.orientation = .portrait
         let previous = app.buttons["media.grid.cell.28037100"]
         let fresh = app.buttons["media.grid.cell.28037106"]
         let receipt = app.staticTexts["collection-cache.qa"]
+        let progress = app.descendants(matching: .any)["feed.continuation.loading"]
+        let release = app.buttons["collection-cache.qa.release"]
 
         app.launchArguments = common
         app.launch()
-        let favorites = mainTabButton("收藏")
-        XCTAssertTrue(favorites.waitForExistence(timeout: 8))
-        let coldStart = ProcessInfo.processInfo.systemUptime
-        favorites.tap()
+        XCTAssertTrue(mainTabButton("收藏").isSelected)
         XCTAssertFalse(previous.exists, "The cold list has to wait for the controlled server reads")
+        XCTAssertTrue(progress.waitForExistence(timeout: 8), "The initial request shows feedback when no cards are available")
+        release.tap()
         XCTAssertTrue(previous.waitForExistence(timeout: 12))
-        let coldFirstPaint = ProcessInfo.processInfo.systemUptime - coldStart
         waitUntil("The first confirmed list must be persisted before relaunching") { receipt.exists && receipt.label == "stored" }
 
         app.terminate()
         app.launchArguments = common + ["--qa-collection-cache-update"]
         app.launch()
-        XCTAssertTrue(favorites.waitForExistence(timeout: 8))
-        let warmStart = ProcessInfo.processInfo.systemUptime
-        favorites.tap()
-        XCTAssertTrue(previous.waitForExistence(timeout: 3), "The previous list should appear while folders and works still wait on the server")
-        let warmFirstPaint = ProcessInfo.processInfo.systemUptime - warmStart
+        XCTAssertTrue(mainTabButton("收藏").isSelected)
+        XCTAssertTrue(previous.waitForExistence(timeout: 8), "The previous list should appear before the held cloud response")
+        XCTAssertFalse(progress.exists, "A cached grid does not show the initial loading indicator")
         XCTAssertFalse(fresh.exists)
-        XCTAssertLessThan(warmFirstPaint, coldFirstPaint)
         attachScreenshot(named: "collection90-cached-before-network")
+        release.tap()
         XCTAssertTrue(fresh.waitForExistence(timeout: 12))
         XCTAssertFalse(previous.exists, "A work removed upstream should disappear after reconciliation")
         waitUntil("The refreshed list replaces the stored preview") { receipt.exists && receipt.label == "stored" }
-        print("COLLECTION_CACHE_FIRST_PAINT cold=\(coldFirstPaint);warm=\(warmFirstPaint)")
         attachScreenshot(named: "collection90-reconciled")
+
+        app.buttons["collection-filter-menu"].tap()
+        app.buttons["刷新作品"].tap()
+        XCTAssertTrue(receipt.waitForValueToContain("loading", timeout: 3))
+        XCTAssertTrue(fresh.isHittable, "The last confirmed single-card grid stays usable during refresh")
+        XCTAssertFalse(progress.exists, "A background refresh does not add a spinner to a usable grid")
+        release.tap()
+        XCTAssertTrue(receipt.waitForValueToContain("settled", timeout: 8))
+
+        let videos = app.otherElements["collection.media-kind"].buttons["视频"]
+        videos.tap()
+        waitUntil("The video pane is ready for input after its transition") { videos.isSelected && release.isHittable }
+        XCTAssertTrue(receipt.waitForValueToContain("loading", timeout: 3))
+        XCTAssertFalse(app.staticTexts["feed.continuation.ended"].exists,
+                       "A cold video pane must not claim an empty result before its first response")
+        XCTAssertTrue(progress.waitForExistence(timeout: 3),
+                      "A cold empty pane keeps its pending feedback while the first response is held")
+        release.tap()
+        let ended = app.staticTexts["feed.continuation.ended"]
+        XCTAssertTrue(ended.waitForExistence(timeout: 8), "An empty scoped cloud result settles instead of spinning")
+        XCTAssertTrue(receipt.waitForValueToContain("settled", timeout: 3))
+        XCTAssertFalse(fresh.exists, "Changing media kind never shows the previous kind's cached work")
+        XCTAssertFalse(progress.exists)
+
+        app.buttons["collection-filter-menu"].tap()
+        app.buttons["刷新作品"].tap()
+        XCTAssertTrue(receipt.waitForValueToContain("loading", timeout: 3),
+                      "The refresh request is held after the pane has confirmed empty")
+        XCTAssertTrue(ended.waitForExistence(timeout: 2),
+                      "A confirmed empty pane keeps its empty presentation as refresh starts")
+        RunLoop.main.run(until: Date().addingTimeInterval(1.5))
+        XCTAssertTrue(ended.exists,
+                      "A confirmed empty pane stays empty after the delayed-spinner threshold")
+        XCTAssertFalse(progress.exists,
+                       "A quiet refresh of a confirmed empty pane does not replace it with a spinner")
+        release.tap()
+        XCTAssertTrue(receipt.waitForValueToContain("settled", timeout: 8))
+        XCTAssertTrue(ended.exists, "The empty presentation remains after refresh settles")
+    }
+
+    func testFavoritesLoadsNextPageSilentlyWhileCardsAreVisible() {
+        app = XCUIApplication()
+        app.launchArguments = ["--qa-collection-paging", "--qa-collection-cache-controlled", "--qa-collection-second-page",
+                               "--qa-collection-cache-key=\(UUID().uuidString)", "-muted", "YES", "-autoplay", "NO"]
+        app.launch()
+        let release = app.buttons["collection-cache.qa.release"]
+        let spinner = app.descendants(matching: .any)["feed.continuation.loading"]
+        XCTAssertTrue(spinner.waitForExistence(timeout: 8))
+        release.tap()
+        let first = app.buttons["media.grid.cell.28037100"]
+        XCTAssertTrue(first.waitForExistence(timeout: 8))
+        let receipt = app.staticTexts["collection-cache.qa"]
+        XCTAssertTrue(receipt.waitForValueToContain("loading", timeout: 8))
+        XCTAssertTrue(first.isHittable)
+        XCTAssertFalse(spinner.exists)
+        release.tap()
+        XCTAssertTrue(app.buttons["media.grid.cell.28037106"].waitForExistence(timeout: 8))
+        XCTAssertTrue(receipt.waitForValueToContain("settled", timeout: 4))
+    }
+
+    func testFavoritesOpensLocalWorkWhileCloudListIsLoading() {
+        app = XCUIApplication()
+        app.launchArguments = ["--qa-collection-paging", "--qa-collection-cache-controlled", "--qa-visual-controls", "--qa-height-audit",
+                               "--qa-collection-cache-key=\(UUID().uuidString)", "--qa-collection-cache-fail",
+                               "-muted", "YES", "-autoplay", "NO"]
+        XCUIDevice.shared.orientation = .portrait
+        app.launch()
+        let favorites = mainTabButton("收藏")
+        XCTAssertTrue(favorites.waitForExistence(timeout: 8))
+        favorites.tap()
+        waitUntil("The floating tab selects the collection page while its data is pending") { favorites.isSelected }
+        let card = visualButton("media.grid.cell.28037100")
+        let progress = app.descendants(matching: .any)["feed.continuation.loading"]
+        let retry = app.buttons.matching(NSPredicate(format: "identifier IN %@", ["feed.continuation.retry", "feed.continuation.restart"])).firstMatch
+        XCTAssertTrue(card.waitForExistence(timeout: 8), "A downloaded work can appear before the held first cloud page")
+        XCTAssertFalse(retry.exists, "The held request hasn't returned its controlled failure yet")
+        XCTAssertFalse(progress.exists)
+        XCTAssertTrue(card.isHittable)
+        card.tap()
+        let close = app.buttons["关闭作品"]
+        XCTAssertTrue(close.waitForExistence(timeout: 4), "Opening the local card presents the collection viewer")
+        let geometry = app.staticTexts.matching(identifier: "collection.qa.geometry")
+            .matching(NSPredicate(format: "label BEGINSWITH %@", "focused=28037100;")).firstMatch
+        XCTAssertTrue(geometry.waitForExistence(timeout: 4))
+        close.tap()
+        app.buttons["collection-cache.qa.release"].tap()
+        XCTAssertTrue(retry.waitForExistence(timeout: 9), "Returning to the list still surfaces a cloud failure with retry")
+        XCTAssertTrue(card.isHittable, "A cloud read failure preserves playable local works")
+        XCTAssertFalse(progress.exists)
     }
 
     func testFavoritesSelectMultipleFoldersInPlace() {
@@ -2275,6 +2565,274 @@ final class ResumePromptUITests: XCTestCase {
         app.terminate()
     }
 
+    func testRoot181PlaybackWaitsForVisualHandoff() {
+        app = XCUIApplication()
+        app.launchArguments = ["--qa-collection-paging", "--qa-height-audit", "--qa-theme-timeline", "--qa-root-activation181",
+                               "--qa-header-motion", "--qa-body-motion", "-muted", "YES", "-autoplay", "YES",
+                               "-timeline.presentation", "stream", "-app.appearance", "light"]
+        XCUIDevice.shared.orientation = .portrait
+        app.launch()
+        let tabs = mainTabBar()
+        XCTAssertTrue(tabs.waitForExistence(timeout: 10))
+        let bottom = tabs.frame
+        app.otherElements["timeline.media-kind"].buttons["视频"].tap()
+        let player = app.staticTexts["media.qa.player"].firstMatch
+        waitUntil("The silent local video actually starts", timeout: 10) {
+            player.exists && (self.numericReadback(player.valueDescription)["rate"] ?? 0) > 0
+        }
+        mainTabButton("作者榜").tap()
+        waitUntil("The source root is settled before re-entering playback") {
+            self.mainTabButton("作者榜").isSelected
+                && self.app.staticTexts["page.interaction-lock"].valueDescription.contains("locks=0")
+        }
+        mainTabButton("时间线").tap()
+        let activation = app.staticTexts["root.activation181.qa"]
+        waitUntil("The committed target remains silent while live chrome is held") {
+            activation.valueDescription.contains("allowed=false;playing=0")
+                && self.mainTabButton("时间线").isSelected
+        }
+        XCTAssertFalse(app.staticTexts["page.interaction-lock"].valueDescription.contains("locks=0"))
+        waitUntil("Only terminal handoff releases playback and input", timeout: 10) {
+            activation.valueDescription.contains("allowed=true")
+                && self.app.staticTexts["page.interaction-lock"].valueDescription.contains("locks=0")
+                && player.exists && (self.numericReadback(player.valueDescription)["rate"] ?? 0) > 0
+        }
+        XCTAssertEqual(mainTabBar().frame, bottom)
+        XCTAssertLessThanOrEqual(numericReadback(player.valueDescription)["poolCount"] ?? 99, 2)
+        XCTAssertTrue(player.valueDescription.contains("muted=true"))
+        app.terminate()
+    }
+
+    func testRootMissingPanTerminalRestoresTouchAndNextSwipe() {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-drop-root-pan-terminal-and-reset", "--qa-header-motion",
+                             "--qa-body-motion", "-autoplay", "NO", "-muted", "YES"])
+        let locks = app.staticTexts["page.interaction-lock"]
+        let body = app.staticTexts["body.motion.qa"]
+        mainTabButton("作者榜").tap()
+        XCTAssertTrue(locks.waitForValueToContain("locks=0", timeout: 5))
+        let window = app.windows.firstMatch
+        let start = window.coordinate(withNormalizedOffset: CGVector(dx: 0.98, dy: 0.5))
+        let finish = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        start.press(forDuration: 0.05, thenDragTo: finish, withVelocity: XCUIGestureVelocity(rawValue: 180), thenHoldForDuration: 0.9)
+        XCTAssertTrue(body.waitForValueToContain("reason=root-touch-ended-without-terminal", timeout: 5), body.valueDescription)
+        XCTAssertTrue(mainTabButton("作者榜").isSelected)
+        XCTAssertTrue(locks.waitForValueToContain("locks=0", timeout: 3), locks.valueDescription)
+
+        let author = app.buttons["leaderboard.author.28037001"]
+        XCTAssertTrue(author.waitForExistence(timeout: 6))
+        author.tap()
+        let authorBar = app.otherElements["creator.top-bar"]
+        XCTAssertTrue(authorBar.waitForExistence(timeout: 5))
+        XCTAssertTrue(locks.waitForValueToContain("locks=0", timeout: 3))
+        authorBar.buttons["navigation.back"].tap()
+        XCTAssertTrue(authorBar.waitForNonExistence(timeout: 5))
+        start.press(forDuration: 0.05, thenDragTo: finish, withVelocity: XCUIGestureVelocity(rawValue: 180), thenHoldForDuration: 0.1)
+        waitUntil("A second real root swipe commits") { self.mainTabButton("搜索").isSelected }
+        XCTAssertTrue(locks.waitForValueToContain("locks=0", timeout: 3))
+        mainTabButton("时间线").tap()
+        waitUntil("The footer is responsive after the next swipe") { self.mainTabButton("时间线").isSelected }
+    }
+
+    func testTimelineMissingPanTerminalRestoresTouchAndNextSwipe() {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-drop-timeline-pan-terminal-and-reset", "--qa-pager-touch-trace",
+                             "--qa-header-motion", "-autoplay", "NO", "-muted", "YES"])
+        let locks = app.staticTexts["page.interaction-lock"]
+        let motion = app.staticTexts["timeline.page-motion.qa"]
+        let source = app.otherElements["timeline.source"]
+        let media = app.otherElements["timeline.media-kind"]
+        let window = app.windows.firstMatch
+        let start = window.coordinate(withNormalizedOffset: CGVector(dx: 0.98, dy: 0.34))
+        let finish = window.coordinate(withNormalizedOffset: CGVector(dx: 0.4, dy: 0.34))
+        start.press(forDuration: 0.05, thenDragTo: finish, withVelocity: XCUIGestureVelocity(rawValue: 180), thenHoldForDuration: 0.9)
+        XCTAssertTrue(motion.waitForValueToContain("reason=timeline-touch-ended-without-terminal", timeout: 5), motion.valueDescription)
+        XCTAssertTrue(source.buttons["推荐"].isSelected)
+        XCTAssertTrue(locks.waitForValueToContain("locks=0", timeout: 3), locks.valueDescription)
+        XCTAssertGreaterThan(heightValues(motion.valueDescription)["peak"] ?? 0, 8, "The held timeline drag must have started moving")
+
+        start.press(forDuration: 0.05, thenDragTo: finish, withVelocity: XCUIGestureVelocity(rawValue: 180), thenHoldForDuration: 0.1)
+        waitUntil("A second real timeline swipe commits") { source.buttons["关注"].isSelected }
+        XCTAssertTrue(locks.waitForValueToContain("locks=0", timeout: 3))
+        media.buttons["视频"].tap()
+        waitUntil("The timeline header is responsive after the next swipe") { media.buttons["视频"].isSelected }
+        XCTAssertTrue(locks.waitForValueToContain("locks=0", timeout: 3))
+        mainTabButton("作者榜").tap()
+        XCTAssertTrue(app.otherElements["leaderboard.top-bar"].waitForExistence(timeout: 5))
+    }
+
+    func testCommittedSearchAcceptsNextFooterTapBeforeHeaderAcknowledgement() {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-header-motion", "--qa-body-motion", "--qa-delay-search-terminal196",
+                             "-muted", "YES", "-autoplay", "NO"])
+        let favoritesFrame = mainTabButton("收藏").frame
+        mainTabButton("搜索").tap()
+        let body = app.staticTexts["body.motion.qa"]
+        XCTAssertTrue(body.waitForValueToContain("waiting-search-terminal196", timeout: 6))
+        let lock = app.staticTexts["page.interaction-lock"]
+        XCTAssertTrue(lock.valueDescription.contains("locks=1"))
+        tapScreenFrame(favoritesFrame)
+        waitUntil("A single footer tap during the committed search handoff opens Favorites", timeout: 10) {
+            self.mainTabButton("收藏").isSelected && lock.valueDescription.contains("locks=0")
+        }
+    }
+
+    func testRootTerminalFrameLossReleasesInputOnTheCommittedPage() {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-header-motion", "--qa-body-motion", "--qa-drop-root-terminal-frame",
+                             "-autoplay", "NO", "-muted", "YES"])
+        let locks = app.staticTexts["page.interaction-lock"]
+        let body = app.staticTexts["body.motion.qa"]
+        mainTabButton("作者榜").tap()
+        XCTAssertTrue(body.waitForValueToContain("reason=terminal-handoff-timeout", timeout: 6),
+                      body.valueDescription)
+        XCTAssertTrue(mainTabButton("作者榜").isSelected)
+        XCTAssertTrue(locks.waitForValueToContain("locks=0", timeout: 3), locks.valueDescription)
+        let author = app.buttons["leaderboard.author.28037001"]
+        XCTAssertTrue(author.waitForExistence(timeout: 6))
+        author.tap()
+        let authorBar = app.otherElements["creator.top-bar"]
+        XCTAssertTrue(authorBar.waitForExistence(timeout: 5))
+        XCTAssertTrue(locks.waitForValueToContain("locks=0", timeout: 3))
+        authorBar.buttons["navigation.back"].tap()
+        XCTAssertTrue(authorBar.waitForNonExistence(timeout: 5))
+        XCTAssertTrue(mainTabButton("作者榜").isSelected)
+    }
+
+    func testNative181PlaybackWaitsForChromeOnButtonReturn() {
+        app = XCUIApplication()
+        app.launchArguments = ["--qa-collection-paging", "--qa-height-audit", "--qa-theme-timeline", "--qa-native-activation181",
+                               "--qa-header-motion", "--qa-body-motion", "-muted", "YES", "-autoplay", "YES",
+                               "-timeline.presentation", "stream", "-app.appearance", "light"]
+        XCUIDevice.shared.orientation = .portrait
+        app.launch()
+        XCTAssertTrue(mainTabBar().waitForExistence(timeout: 10))
+        app.otherElements["timeline.media-kind"].buttons["视频"].tap()
+        waitPlayingFixture()
+        let bottom = mainTabBar().frame
+        timelineTools().tap()
+        app.buttons["浏览条件"].tap()
+        let filter = floatingPageTitle("浏览条件")
+        XCTAssertTrue(filter.waitForExistence(timeout: 6))
+        waitUntil("Filter controls are available after native push") {
+            self.app.staticTexts["page.interaction-lock"].valueDescription.contains("locks=0")
+        }
+        filter.buttons["完成"].tap()
+        let activation = app.staticTexts["root.activation181.qa"]
+        waitUntil("The native pop has a silent target until the real header handoff") {
+            activation.valueDescription.contains("allowed=false;playing=0")
+                && !self.app.staticTexts["page.interaction-lock"].valueDescription.contains("locks=0")
+        }
+        waitUntil("Native completion releases both playback and input", timeout: 10) {
+            activation.valueDescription.contains("allowed=true")
+                && self.app.staticTexts["page.interaction-lock"].valueDescription.contains("locks=0")
+                && self.playerFields()["rate"] == "1.0"
+        }
+        XCTAssertEqual(mainTabBar().frame, bottom)
+        XCTAssertEqual(playerFields()["muted"], "true")
+        app.terminate()
+    }
+
+    func testOrdinary181RejectedBeforeCanvasDoesNotReplayMovement() {
+        app = XCUIApplication()
+        app.launchArguments = ["--qa-collection-paging", "--qa-height-audit", "--qa-page-return",
+                               "--qa-return-assembly-delay181", "--qa-header-motion", "--qa-body-motion",
+                               "-muted", "YES", "-autoplay", "NO", "-app.appearance", "light"]
+        XCUIDevice.shared.orientation = .portrait
+        app.launch()
+        openAccountSettings()
+        let bottom = mainTabBar().frame
+        let window = app.windows.firstMatch
+        let header = floatingPageTitle("最近浏览")
+        let qa = app.descendants(matching: .any)["page.return-motion.qa"]
+        for right in [false, true] {
+            tapAboveMainBar(app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "最近浏览与接着看")).firstMatch)
+            XCTAssertTrue(header.waitForExistence(timeout: 6))
+            waitUntil("History is ready before its delayed capture") {
+                self.app.staticTexts["page.interaction-lock"].valueDescription.contains("locks=0")
+            }
+            let top = header.frame
+            let start = window.coordinate(withNormalizedOffset: CGVector(dx: right ? 0.98 : 0.02, dy: 0.5))
+            start.press(forDuration: 0.05,
+                        thenDragTo: start.withOffset(CGVector(dx: right ? -20 : 20, dy: 0)),
+                        withVelocity: XCUIGestureVelocity(rawValue: 160), thenHoldForDuration: 0)
+            waitUntil("Preassembly rejection keeps the source without a replay") {
+                qa.valueDescription.contains("phase=cancelled") && qa.valueDescription.contains("assembled=false")
+            }
+            XCTAssertTrue(qa.valueDescription.contains("navigationOutcome=cancelled"), qa.valueDescription)
+            XCTAssertTrue(qa.valueDescription.contains("visualOutcome=cancelled"), qa.valueDescription)
+            XCTAssertTrue(qa.valueDescription.contains("sourceMasked=false"), qa.valueDescription)
+            XCTAssertEqual(numericReadback(qa.valueDescription)["sourceSnapshotTx"], 0)
+            let stable = qa.valueDescription
+            // Outlive the deliberately late capture and prove it cannot mount.
+            let elapsed = expectation(description: "Late canvas deadline passes")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { elapsed.fulfill() }
+            wait(for: [elapsed], timeout: 2)
+            XCTAssertEqual(qa.valueDescription, stable)
+            XCTAssertTrue(header.isHittable)
+            XCTAssertEqual(header.frame, top)
+            XCTAssertEqual(mainTabBar().frame, bottom)
+            XCTAssertTrue(app.staticTexts["page.interaction-lock"].valueDescription.contains("locks=0"))
+            // An accepted fast return may wait for assembly, then commits once.
+            start.press(forDuration: 0.05,
+                        thenDragTo: start.withOffset(CGVector(dx: right ? -170 : 170, dy: 0)),
+                        withVelocity: XCUIGestureVelocity(rawValue: 900), thenHoldForDuration: 0)
+            XCTAssertTrue(header.waitForNonExistence(timeout: 8))
+            waitUntil("Accepted delayed return restores settings input") {
+                self.floatingPageTitle("账号与设置").buttons["navigation.back"].isHittable
+                    && self.app.staticTexts["page.interaction-lock"].valueDescription.contains("locks=0")
+            }
+        }
+        app.terminate()
+    }
+
+    func testHistory181CenterSwitchesAndBothEdgesReturn() {
+        app = XCUIApplication()
+        app.launchArguments = ["--qa-collection-paging", "--qa-height-audit", "--qa-segment-edge",
+                               "--qa-header-motion", "--qa-body-motion", "-muted", "YES", "-autoplay", "NO",
+                               "-app.appearance", "light"]
+        XCUIDevice.shared.orientation = .portrait
+        app.launch()
+        openAccountSettings()
+        let bottom = mainTabBar().frame
+        let window = app.windows.firstMatch
+        let header = floatingPageTitle("最近浏览")
+        let media = app.otherElements["history.media-kind"]
+        func idle() {
+            waitUntil("The real history transition releases input") {
+                let locks = self.app.staticTexts["page.interaction-lock"]
+                return locks.exists && locks.valueDescription.contains("locks=0")
+            }
+        }
+        for right in [false, true] {
+            tapAboveMainBar(app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "最近浏览与接着看")).firstMatch)
+            XCTAssertTrue(header.waitForExistence(timeout: 5)); idle()
+            let top = header.frame
+            for (from, to, title) in [(0.75, 0.25, "视频"), (0.25, 0.75, "图片")] {
+                window.coordinate(withNormalizedOffset: CGVector(dx: from, dy: 0.55))
+                    .press(forDuration: 0.05, thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: to, dy: 0.55)),
+                           withVelocity: XCUIGestureVelocity(rawValue: 180), thenHoldForDuration: 0.1)
+                waitUntil("The history center swipe selects \(title)") { media.buttons[title].isSelected }
+                XCTAssertTrue(header.exists)
+                XCTAssertEqual(header.frame, top)
+                XCTAssertEqual(mainTabBar().frame, bottom)
+            }
+            let start = window.coordinate(withNormalizedOffset: CGVector(dx: right ? 0.98 : 0.02, dy: 0.5))
+            start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: right ? -30 : 30, dy: 0)),
+                        withVelocity: XCUIGestureVelocity(rawValue: 60), thenHoldForDuration: 0.1)
+            idle()
+            XCTAssertTrue(header.exists, "A cancelled edge return retains the history page")
+            XCTAssertTrue(media.buttons["图片"].isSelected, "An edge return does not change history media kind")
+            start.press(forDuration: 0.05,
+                        thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: right ? 0.30 : 0.70, dy: 0.5)),
+                        withVelocity: XCUIGestureVelocity(rawValue: 180), thenHoldForDuration: 0.1)
+            XCTAssertTrue(header.waitForNonExistence(timeout: 5)); idle()
+            XCTAssertTrue(floatingPageTitle("账号与设置").exists)
+            XCTAssertEqual(mainTabBar().frame, bottom)
+        }
+        app.terminate()
+    }
+
     func testHistoryOfflineAndTagContentEdgePaging() {
         app = XCUIApplication()
         app.launchArguments = ["--qa-collection-paging", "--qa-height-audit", "--qa-segment-edge", "-muted", "YES", "-app.appearance", "light"]
@@ -2489,6 +3047,49 @@ final class ResumePromptUITests: XCTestCase {
         app.terminate()
     }
 
+    func testSegmentedLostEndAndResetReleasesInput() {
+        app = XCUIApplication()
+        app.launchArguments = ["--qa-collection-paging", "--qa-segment-edge", "--qa-drop-section-pan-terminal-and-reset",
+                               "-app.appearance", "light", "-autoplay", "NO", "-muted", "YES"]
+        XCUIDevice.shared.orientation = .portrait
+        app.launch()
+        mainTabButton("作者榜").tap()
+        let board = app.otherElements["leaderboard.board"]
+        let seasonal = board.buttons["Seasonal"], legacy = board.buttons["Legacy"]
+        XCTAssertTrue(seasonal.waitForExistence(timeout: 5))
+        seasonal.tap()
+        let motion = app.staticTexts["segment.content.leaderboard.board"]
+        let trace = app.staticTexts["segment.trace.leaderboard.board"]
+        let locks = app.staticTexts["page.interaction-lock"]
+        let row = app.buttons["leaderboard.author.28037001"]
+        waitUntil("The selected leaderboard is ready for a real drag") {
+            seasonal.isSelected && row.isHittable && motion.valueDescription.contains("phase=idle")
+        }
+        let acquired = heightValues(locks.valueDescription)["acquired"] ?? 0
+        let window = app.windows.firstMatch
+        let start = window.coordinate(withNormalizedOffset: CGVector(dx: 0.70, dy: 0.55))
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: -110, dy: 0)),
+                    withVelocity: XCUIGestureVelocity(rawValue: 160), thenHoldForDuration: 0.90)
+        waitUntil("Lifting the held drag cancels the same pane without its standard callbacks") {
+            trace.valueDescription.contains("decision=touch-sequence-ended") && motion.valueDescription.contains(":cancelled;phase=idle") &&
+                self.heightValues(locks.valueDescription)["locks"] == 0 && seasonal.isSelected && row.isHittable
+        }
+        XCTAssertGreaterThan(heightValues(locks.valueDescription)["acquired"] ?? 0, acquired)
+        XCTAssertEqual(app.state, .runningForeground)
+
+        swipeSegmentCenter(right: true)
+        XCTAssertTrue(legacy.isSelected, "The next real center swipe can commit")
+        seasonal.tap()
+        waitUntil("The real header selection and source list are actionable again") {
+            seasonal.isSelected && motion.valueDescription.contains("phase=idle") && row.isHittable
+        }
+        mainTabButton("搜索").tap()
+        waitUntil("The bottom bar can take a real tap after the recovered drag") {
+            self.mainTabButton("搜索").isSelected && self.app.otherElements["search.top-bar"].isHittable &&
+                self.heightValues(locks.valueDescription)["locks"] == 0
+        }
+    }
+
     func testCollectionSegmentTapMovesRealPanesAndUnlocks() {
         app = XCUIApplication()
         app.launchArguments = ["--qa-collection-paging", "--qa-segment-edge", "-app.appearance", "light", "-muted", "YES"]
@@ -2566,13 +3167,46 @@ final class ResumePromptUITests: XCTestCase {
         header.buttons["collections.downloads"].tap()
         let tasks = floatingPageTitle("下载管理")
         XCTAssertTrue(tasks.waitForExistence(timeout: 5))
-        tasks.buttons["downloads.storage"].tap()
-        let space = floatingPageTitle("空间管理")
-        XCTAssertTrue(space.waitForExistence(timeout: 5))
+        let sections = tasks.otherElements["downloads.section"]
+        sections.buttons["空间"].tap()
+        XCTAssertTrue(app.buttons["offline.storage.clean-unfavorited"].waitForExistence(timeout: 5))
+        XCTAssertTrue(tasks.isHittable)
+        XCTAssertTrue(sections.buttons["空间"].isSelected)
         XCTAssertFalse(app.descendants(matching: .any)["offline.media-kind"].exists)
         XCTAssertFalse(app.descendants(matching: .any)["offline.storage-list"].exists)
         XCTAssertTrue(app.buttons["offline.storage.clean-unfavorited"].exists)
         attachScreenshot(named: "collection162-space-only")
+    }
+
+    func testCollectionPendingFileVerificationDoesNotHoldTabsOrOpenStaleWork() {
+        app = XCUIApplication()
+        app.launchArguments = ["--qa-collection-paging", "--qa-height-audit", "--qa-collection-corners162",
+                               "--qa-collection-open-file-wait", "-autoplay", "NO", "-muted", "YES"]
+        XCUIDevice.shared.orientation = .portrait
+        app.launch()
+        mainTabButton("收藏").tap()
+        let header = app.descendants(matching: .any)["collections.top-bar"]
+        XCTAssertTrue(header.waitForExistence(timeout: 8))
+        header.otherElements["collection.media-kind"].buttons["视频"].tap()
+        let ready = visualButton("media.grid.cell.28037102")
+        XCTAssertTrue(ready.waitForExistence(timeout: 5))
+        ready.tap()
+        let pending = app.staticTexts["collection.open-file.state"]
+        XCTAssertTrue(pending.waitForValueToContain("entered=1;completed=0", timeout: 5))
+        mainTabButton("搜索").tap()
+        let search = app.textFields["search-title-input"]
+        XCTAssertTrue(search.waitForExistence(timeout: 5))
+        XCTAssertTrue(search.isHittable)
+        app.buttons["collection.open-file.release"].tap()
+        XCTAssertTrue(pending.waitForValueToContain("entered=1;completed=1", timeout: 5))
+        XCTAssertTrue(search.isHittable)
+        let player = app.descendants(matching: .any)["media.qa.player"]
+        XCTAssertFalse(player.exists, "A completed file check may not open playback on a different tab")
+        mainTabButton("收藏").tap()
+        XCTAssertTrue(ready.waitForExistence(timeout: 5))
+        XCTAssertFalse(player.exists, "Returning after a stale completion leaves the collection grid active")
+        ready.tap()
+        XCTAssertTrue(player.waitForValueToContain("source=offline", timeout: 8), player.valueDescription)
     }
 
     func testCenterSegmentsAndAuthorEdgeReturn162() {
@@ -2623,6 +3257,156 @@ final class ResumePromptUITests: XCTestCase {
         drag(0.98, 0.55)
         waitUntil("Root collection edges switch to the next main page") { self.mainTabButton("时间线").isSelected }
         XCTAssertEqual(mainTabBar().frame, fixedBottom)
+    }
+
+    func testAuthor176PagingKeepsAcceptedRequestWhenScrollingAway() {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-author-paging176", "-autoplay", "NO", "-muted", "YES"])
+        visualButton("media.author.28037100").tap()
+        let header = app.descendants(matching: .any)["creator.top-bar"]
+        XCTAssertTrue(header.waitForExistence(timeout: 5))
+        let state = app.staticTexts["author176.state"]
+        XCTAssertTrue(state.waitForValueToContain("committed=20", timeout: 8))
+        let window = app.windows.firstMatch
+        for _ in 0..<7 {
+            if state.valueDescription.contains("requests=2") { break }
+            window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.78))
+                .press(forDuration: 0.05, thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3)))
+        }
+        XCTAssertTrue(state.waitForValueToContain("requests=2", timeout: 5), "One next-page request starts before reaching the end")
+        for _ in 0..<4 {
+            window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3))
+                .press(forDuration: 0.05, thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.8)))
+        }
+        XCTAssertTrue(state.valueDescription.contains("cancelled=0"), "Moving away from the tail does not cancel the accepted page")
+        app.buttons["author176.release"].tap()
+        XCTAssertTrue(state.waitForValueToContain("committed=40", timeout: 8))
+        XCTAssertTrue(state.valueDescription.contains("requests=2"), "The second page completes once without duplicate reads")
+        XCTAssertTrue(state.valueDescription.contains("cancelled=0"))
+        XCTAssertTrue(header.isHittable)
+        attachScreenshot(named: "author176-accepted-page-survives-scroll-back")
+    }
+
+    private func openAuthorWithPendingContinuation(extra: [String] = []) {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-author-paging176", "--qa-header-motion", "--qa-drag-performance167",
+                             "-autoplay", "NO", "-muted", "YES"] + extra)
+        mainTabButton("作者榜").tap()
+        let row = app.buttons["leaderboard.author.28037001"]
+        XCTAssertTrue(row.waitForExistence(timeout: 8))
+        row.tap()
+        let pageState = app.staticTexts["author176.state"]
+        XCTAssertTrue(pageState.waitForValueToContain("committed=20", timeout: 8))
+        for _ in 0..<10 {
+            if pageState.valueDescription.contains("requests=2") { break }
+            dragAuthorGrid(from: 0.77, to: 0.25)
+        }
+        assertContinuationPending()
+    }
+
+    private func assertContinuationPending(file: StaticString = #filePath, line: UInt = #line) {
+        let value = app.staticTexts["author176.state"].valueDescription
+        XCTAssertEqual(heightValues(value)["requests"], 2, value, file: file, line: line)
+        XCTAssertEqual(heightValues(value)["committed"], 20, value, file: file, line: line)
+        XCTAssertEqual(heightValues(value)["cancelled"], 0, value, file: file, line: line)
+    }
+
+    private func dragAuthorGrid(from: CGFloat, to: CGFloat, velocity: CGFloat = 560) {
+        let window = app.windows.firstMatch
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0.48, dy: from))
+            .press(forDuration: 0.03, thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.48, dy: to)),
+                   withVelocity: XCUIGestureVelocity(rawValue: velocity), thenHoldForDuration: 0)
+    }
+
+    func testAuthorPaginationContinuousInputBeforeAndDuringCommit() {
+        openAuthorWithPendingContinuation(extra: ["--qa-author-paging-continuous", "--qa-author-paging-loaded-tag-index"])
+        XCTAssertTrue(app.staticTexts["author176.state"].valueDescription.contains("tagIndexSeeded=1"))
+        let first = visualButton("media.grid.cell.28037300")
+        XCTAssertFalse(first.isHittable, "The first work must start above the visible viewport")
+        for _ in 0..<2 {
+            for _ in 0..<5 {
+                if first.isHittable { break }
+                dragAuthorGrid(from: 0.27, to: 0.82)
+            }
+            XCTAssertTrue(first.isHittable, "Reverse drag must bring the first work back while the response is held")
+            assertContinuationPending()
+            for _ in 0..<5 {
+                dragAuthorGrid(from: 0.79, to: 0.25)
+            }
+            XCTAssertFalse(first.isHittable, "Forward drag must actually move the first work away")
+            assertContinuationPending()
+        }
+        app.buttons["author176.release-on-drag"].tap()
+        dragAuthorGrid(from: 0.25, to: 0.82, velocity: 150)
+        let state = app.staticTexts["author176.state"]
+        XCTAssertTrue(state.waitForValueToContain("committed=40", timeout: 8), state.valueDescription)
+        XCTAssertTrue(state.waitForValueToContain("gestureEnd=", timeout: 5))
+        let sample = heightValues(state.valueDescription)
+        let start = sample["gestureStart"] ?? 0, apply = sample["pageApplied"] ?? 0, end = sample["gestureEnd"] ?? 0
+        XCTAssertGreaterThan(apply, start, state.valueDescription)
+        XCTAssertLessThan(apply, end, state.valueDescription)
+        XCTAssertGreaterThan(sample["movesAfterApply"] ?? 0, 0, "The real drag must keep getting movement after the page is merged")
+        let cadence = app.staticTexts["performance.cadence172"].valueDescription
+        let payload = try? JSONSerialization.jsonObject(with: Data(cadence.utf8)) as? [String: Any]
+        let gaps = (payload?["gaps"] as? [[Double]] ?? []).filter { $0.count >= 2 && $0[0] >= start && $0[0] <= end }
+        let costs = payload?["cost174"] as? [String: Any]
+        print("PAGINATION_LIVE " + state.valueDescription + ";gaps=" + String(describing: gaps) + ";cost=" + String(describing: costs))
+        XCTAssertTrue(app.otherElements["creator.top-bar"].buttons["navigation.back"].isHittable)
+    }
+
+    private func assertAuthorCoverRequestsPending() {
+        let state = app.staticTexts["author176.state"]
+        waitUntil("Actual cover tasks remain pending in the visible author grid") {
+            (self.heightValues(state.valueDescription)["waitingCovers"] ?? 0) > 0
+        }
+    }
+
+    func testAuthorPendingPaginationAndCoversCanOpenAnExistingWork() {
+        openAuthorWithPendingContinuation(extra: ["--qa-author-paging-hold-covers"])
+        assertAuthorCoverRequestsPending()
+        let existing = (28037312..<28037320).map { visualButton("media.grid.cell.\($0)") }.first { $0.isHittable }
+        XCTAssertNotNil(existing, "An existing work is visible while both loads are pending")
+        existing?.tap()
+        let close = app.buttons["playback.close"]
+        XCTAssertTrue(close.waitForExistence(timeout: 5), "Tapping the work enters its viewer before the response")
+        close.tap()
+        XCTAssertTrue(close.waitForNonExistence(timeout: 5))
+        XCTAssertTrue(app.otherElements["creator.top-bar"].buttons["navigation.back"].isHittable)
+    }
+
+    func testAuthorPendingPaginationButtonAndEdgeReturnRemainOperable() {
+        for method in ["button", "edge"] {
+            openAuthorWithPendingContinuation(extra: ["--qa-author-paging-hold-covers"])
+            assertAuthorCoverRequestsPending()
+            let header = app.otherElements["creator.top-bar"]
+            if method == "button" {
+                header.buttons["navigation.back"].tap()
+            } else {
+                let window = app.windows.firstMatch
+                window.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: 0.48))
+                    .press(forDuration: 0.05, thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.57, dy: 0.48)),
+                           withVelocity: XCUIGestureVelocity(rawValue: 180), thenHoldForDuration: 0.1)
+            }
+            XCTAssertTrue(header.waitForNonExistence(timeout: 5), "The \(method) return completes before the held response")
+            let second = app.buttons["leaderboard.author.28037002"]
+            XCTAssertTrue(second.waitForExistence(timeout: 5))
+            XCTAssertTrue(second.isHittable)
+            second.tap()
+            XCTAssertTrue(header.waitForExistence(timeout: 5), "A subsequent real row tap navigates")
+            app.terminate()
+        }
+    }
+
+    func testAuthorPendingPaginationBottomTabRemainsOperable() {
+        openAuthorWithPendingContinuation(extra: ["--qa-author-paging-hold-covers"])
+        assertAuthorCoverRequestsPending()
+        mainTabButton("搜索").tap()
+        let field = app.textFields["search-title-input"]
+        XCTAssertTrue(field.waitForExistence(timeout: 5))
+        XCTAssertTrue(field.isHittable)
+        field.tap()
+        field.typeText("pagination")
+        XCTAssertEqual(field.value as? String, "pagination")
     }
 
     func testAuthorEdgeIntentPreservesVerticalScrollAndTap162() {
@@ -2871,7 +3655,7 @@ final class ResumePromptUITests: XCTestCase {
     func testRootVideoCanvasRemainsUnderFixedChrome165() {
         app = XCUIApplication()
         app.launchArguments = ["--qa-collection-paging", "--qa-height-audit", "--qa-theme-timeline",
-                               "--qa-header-motion", "--qa-body-motion", "-app.appearance", "light",
+                               "--qa-header-motion", "--qa-body-motion", "--qa-root-motion181", "-app.appearance", "light",
                                "-muted", "YES", "-autoplay", "YES", "-timeline.presentation", "stream"]
         XCUIDevice.shared.orientation = .portrait
         app.launch()
@@ -2879,15 +3663,31 @@ final class ResumePromptUITests: XCTestCase {
         heightCloseNotices()
         app.otherElements["timeline.media-kind"].buttons["视频"].tap()
         waitUntil("The source timeline video is ready") { self.watchFocus() == 28_037_102 }
+        let viewport = app.windows.firstMatch.frame
         let bottom = mainTabBar().frame
+        let playbackHeader = timelineTools().frame
         let body = app.staticTexts["body.motion.qa"]
+        let motion = app.staticTexts["root.motion181.qa"]
+        func assertLiveCanvas(_ prefix: String, tab: Int) -> String? {
+            let fields = rootMotionFields181(motion.valueDescription)
+            XCTAssertEqual(fields["outcome"], "completed", motion.valueDescription)
+            let departing = prefix == "source"
+            XCTAssertEqual(fields[departing ? "source" : "destination"], String(tab), motion.valueDescription)
+            let movement = departing ? "maxMoveSourceX" : "maxMoveTargetX"
+            XCTAssertGreaterThan(Double(fields[movement] ?? "0") ?? 0, 0.5, motion.valueDescription)
+            XCTAssertEqual(Double(fields[prefix + "Y"] ?? "999") ?? 999, viewport.minY, accuracy: 1)
+            XCTAssertEqual(Double(fields[prefix + "Height"] ?? "-1") ?? -1, viewport.height, accuracy: 1)
+            let surfaces = heightValues(body.valueDescription)
+            XCTAssertEqual(surfaces["snapshotAvailable"], 0, body.valueDescription)
+            XCTAssertEqual(surfaces["targetSnapshotAvailable"], 0, body.valueDescription)
+            return tokenValue181(fields["tokens"] ?? "", tab: tab)
+        }
         mainTabButton("搜索").tap()
         waitUntil("Video root departure completes") {
             self.mainTabButton("搜索").isSelected && body.valueDescription.contains("phase=completed")
         }
-        XCTAssertTrue(body.valueDescription.contains("sourceHeaderSnapshot=1"), body.valueDescription)
-        let departure = heightValues(body.valueDescription)
-        XCTAssertEqual(departure["sourceBandOffset"] ?? 0, departure["slideOffset"] ?? 1, accuracy: 1)
+        let timelineToken = assertLiveCanvas("source", tab: 0)
+        XCTAssertNotNil(timelineToken)
         XCTAssertEqual(mainTabBar().frame, bottom)
         print("ROOT165_VIDEO_SOURCE " + body.valueDescription)
         let window = app.windows.firstMatch
@@ -2900,24 +3700,844 @@ final class ResumePromptUITests: XCTestCase {
                 self.app.descendants(matching: .any)["page.interaction-lock"].valueDescription.contains("locks=0")
             }
         }
-        XCTAssertTrue(body.valueDescription.contains("targetHeaderSnapshot=1"), body.valueDescription)
-        XCTAssertEqual(heightValues(body.valueDescription)["targetBandOffset"] ?? 1, 0, accuracy: 1)
+        XCTAssertEqual(assertLiveCanvas("target", tab: 0), timelineToken)
         XCTAssertEqual(mainTabBar().frame, bottom)
+        XCTAssertEqual(timelineTools().frame, playbackHeader)
         XCTAssertEqual(watchFocus(), 28_037_102)
         print("ROOT165_VIDEO_TARGET " + body.valueDescription)
         attachScreenshot(named: "root165-video-header-canvas")
     }
 
+    func testIdleRoot178MountsStayInactiveUntilAcceptedNavigation() {
+        app = XCUIApplication()
+        app.launchArguments = ["--qa-collection-paging", "--qa-theme-timeline", "--qa-root-idle178", "--qa-header-motion", "--qa-body-motion",
+                               "--qa-collection-cache-key=\(UUID().uuidString)",
+                               "-app.appearance", "light", "-muted", "YES", "-autoplay", "NO"]
+        XCUIDevice.shared.orientation = .portrait
+        app.launch()
+        mainTabButton("搜索").tap()
+        let readback = app.staticTexts["root.idle178.qa"]
+        var previousMountState = ""
+        waitUntil("Both adjacent ordinary hosts mount without becoming selected") {
+            let value = readback.valueDescription
+            if value != previousMountState { print("IDLE178_STATE " + value); previousMountState = value }
+            return value.contains("selected=4;slots=0,2,3,4;") && value.contains("hidden=0,2,3;interactive=4;")
+        }
+        // The fixture's folders request completes after 1.4s. Hidden mounting
+        // must not start it, nor turn an inactive collection into a loaded one.
+        Thread.sleep(forTimeInterval: 1.8)
+        XCTAssertTrue(readback.valueDescription.contains("collectionsKnown=false"), readback.valueDescription)
+        XCTAssertTrue(readback.valueDescription.contains("folders=0;pages=0;"), readback.valueDescription)
+        XCTAssertFalse(app.buttons["media.grid.cell.28037100"].exists)
+        let header = app.otherElements["search.top-bar"].frame
+        let bottom = mainTabBar().frame
+        print("IDLE178_HIDDEN " + readback.valueDescription)
+        let window = app.windows.firstMatch
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0.98, dy: 0.5))
+            .press(forDuration: 0.05, thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.4, dy: 0.5)),
+                   withVelocity: XCUIGestureVelocity(rawValue: 180), thenHoldForDuration: 0.1)
+        waitUntil("Accepting navigation activates the real collection task") { self.mainTabButton("收藏").isSelected }
+        XCTAssertTrue(app.buttons["media.grid.cell.28037100"].waitForExistence(timeout: 12))
+        waitUntil("The confirmed collection can still persist its normal preview") { self.app.staticTexts["collection-cache.qa"].label == "stored" }
+        XCTAssertTrue(readback.valueDescription.contains("collectionsKnown=true"), readback.valueDescription)
+        let beforeRefresh = heightValues(readback.valueDescription)
+        app.buttons["collection-filter-menu"].tap()
+        app.buttons["刷新作品"].tap()
+        waitUntil("The actual user refresh starts its delayed page read") {
+            (self.heightValues(readback.valueDescription)["pages"] ?? 0) > (beforeRefresh["pages"] ?? 0)
+        }
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: 0.5))
+            .press(forDuration: 0.05, thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.6, dy: 0.5)),
+                   withVelocity: XCUIGestureVelocity(rawValue: 180), thenHoldForDuration: 0.1)
+        waitUntil("Returning restores the retained search and releases input") {
+            self.mainTabButton("搜索").isSelected && self.app.otherElements["search.top-bar"].isHittable
+                && self.app.staticTexts["page.interaction-lock"].valueDescription.contains("locks=0")
+        }
+        XCTAssertEqual(app.otherElements["search.top-bar"].frame, header)
+        XCTAssertEqual(mainTabBar().frame, bottom)
+        // The accepted refresh may finish, but its old View cannot start a
+        // new folders read after its retained root becomes inactive.
+        Thread.sleep(forTimeInterval: 5.2)
+        XCTAssertEqual(heightValues(readback.valueDescription)["folders"], beforeRefresh["folders"], readback.valueDescription)
+        XCTAssertTrue(mainTabButton("搜索").isSelected)
+        print("IDLE178_RETURN " + readback.valueDescription)
+        app.terminate()
+    }
+
+    func testRoot179CancelledTimelinePreviewDoesNotStartBlackCanvas() {
+        app = XCUIApplication()
+        app.launchArguments = ["--qa-collection-paging", "--qa-visual-controls", "--qa-header-motion", "--qa-body-motion",
+                               "--qa-canvas-cancel179", "--qa-root-motion181", "-app.appearance", "light", "-muted", "YES", "-autoplay", "NO"]
+        XCUIDevice.shared.orientation = .portrait
+        app.launch()
+        mainTabButton("作者榜").tap()
+        let header = app.otherElements["leaderboard.top-bar"]
+        let qa = app.staticTexts["canvas.cancel179.qa"]
+        let body = app.staticTexts["body.motion.qa"]
+        let rootMotion = app.staticTexts["root.motion181.qa"]
+        waitUntil("The real author board has released its entry shield") {
+            header.isHittable && rootMotion.exists && self.app.staticTexts["page.interaction-lock"].valueDescription.contains("locks=0")
+        }
+        let before = heightValues(qa.valueDescription)
+        let initialRoot = rootMotionFields181(rootMotion.valueDescription)
+        let top = header.frame, bottom = mainTabBar().frame
+        let window = app.windows.firstMatch
+        let start = window.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: 0.5))
+        for round in 1...3 {
+            print("CANCEL179_BEGIN round=\(round);epoch=\(Date().timeIntervalSince1970);" + qa.valueDescription)
+            start.press(forDuration: 0.05,
+                        thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.20, dy: 0.5)),
+                        withVelocity: XCUIGestureVelocity(rawValue: 60), thenHoldForDuration: 0.12)
+            waitUntil("Cancelled timeline preview restores the same board") {
+                self.mainTabButton("作者榜").isSelected && header.isHittable
+                    && rootMotion.valueDescription.contains("outcome=cancelled")
+                    && self.app.staticTexts["page.interaction-lock"].valueDescription.contains("locks=0")
+            }
+            print("CANCEL179_END round=\(round);epoch=\(Date().timeIntervalSince1970);" + qa.valueDescription + ";body=" + body.valueDescription)
+            XCTAssertEqual(heightValues(qa.valueDescription)["black"], before["black"], "Cancelling a preview must not create an opaque black canvas blend: " + qa.valueDescription)
+            XCTAssertEqual(heightValues(qa.valueDescription)["prepared"], (before["prepared"] ?? 0) + Double(round))
+            XCTAssertTrue(body.valueDescription.contains("kind=tab-edge;phase=cancelled"), body.valueDescription)
+            let motion = rootMotionFields181(rootMotion.valueDescription)
+            XCTAssertNotEqual(motion["pair"], "none", rootMotion.valueDescription)
+            XCTAssertEqual(motion["source"], "2", rootMotion.valueDescription)
+            XCTAssertEqual(motion["selected"], "2", rootMotion.valueDescription)
+            XCTAssertEqual(motion["visibleSlots"], "2", rootMotion.valueDescription)
+            XCTAssertGreaterThan(Int(motion["slotCount"] ?? "0") ?? 0, 0, rootMotion.valueDescription)
+            XCTAssertLessThanOrEqual(Int(motion["slotCount"] ?? "99") ?? 99, 4, rootMotion.valueDescription)
+            XCTAssertEqual(motion["sourceHidden"], "0", rootMotion.valueDescription)
+            XCTAssertEqual(motion["targetHidden"], "1", rootMotion.valueDescription)
+            XCTAssertEqual(motion["outcome"], "cancelled", rootMotion.valueDescription)
+            XCTAssertGreaterThan(Int(motion["moveSamples"] ?? "0") ?? 0, 0, rootMotion.valueDescription)
+            XCTAssertGreaterThan(Double(motion["maxMoveSourceX"] ?? "0") ?? 0, 0.5, rootMotion.valueDescription)
+            XCTAssertGreaterThan(Double(motion["maxMoveTargetX"] ?? "0") ?? 0, 0.5, rootMotion.valueDescription)
+            XCTAssertEqual(tokenValue181(initialRoot["tokens"] ?? "", tab: 2),
+                           tokenValue181(motion["tokens"] ?? "", tab: 2), "The cancelled flight must preserve its source host identity")
+            XCTAssertEqual(tokenValue181(motion["tokens"] ?? "", tab: 2), motion["sourceToken"], rootMotion.valueDescription)
+            XCTAssertTrue(body.valueDescription.contains("kind=tab-edge;phase=cancelled"), body.valueDescription)
+            XCTAssertEqual(heightValues(body.valueDescription)["snapshotAvailable"], 0,
+                            "The root pair uses the existing host views: " + body.valueDescription)
+            XCTAssertEqual(heightValues(body.valueDescription)["targetSnapshotAvailable"], 0,
+                            "The root pair has no target page snapshot: " + body.valueDescription)
+            XCTAssertEqual(header.frame, top)
+            XCTAssertEqual(mainTabBar().frame, bottom)
+        }
+        app.terminate()
+    }
+
+    func testCreator179CancelledReturnKeepsSourceCanvas() {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-page-return", "--qa-body-motion", "--qa-header-motion", "--qa-canvas-cancel179", "-autoplay", "NO"])
+        visualButton("media.author.28037100").tap()
+        let header = app.otherElements["creator.top-bar"]
+        XCTAssertTrue(header.waitForExistence(timeout: 5))
+        let qa = app.staticTexts["canvas.cancel179.qa"]
+        let before = heightValues(qa.valueDescription)
+        let window = app.windows.firstMatch
+        let top = header.frame, bottom = mainTabBar().frame
+        for (index, right) in [false, true, false].enumerated() {
+            let from = window.coordinate(withNormalizedOffset: CGVector(dx: right ? 0.98 : 0.02, dy: 0.5))
+            from.press(forDuration: 0.05,
+                       thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: right ? 0.91 : 0.09, dy: 0.5)),
+                       withVelocity: XCUIGestureVelocity(rawValue: 60), thenHoldForDuration: 0.12)
+            let motion = app.descendants(matching: .any)["page.return-motion.qa"]
+            waitUntil("Cancelled author return restores its real source") {
+                header.isHittable && motion.valueDescription.contains("phase=cancelled")
+            }
+            XCTAssertTrue(motion.valueDescription.contains("sourceMasked=false"), motion.valueDescription)
+            XCTAssertEqual(heightValues(qa.valueDescription)["black"], before["black"], qa.valueDescription)
+            XCTAssertEqual(header.frame, top)
+            XCTAssertEqual(mainTabBar().frame, bottom)
+            print("CREATOR_CANCEL179 round=\(index);" + qa.valueDescription + ";return=" + motion.valueDescription)
+        }
+        app.terminate()
+    }
+
+    func testCreator191CancelledReturnPreservesOrdinaryBodyColor() throws {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-page-return", "--qa-header-motion", "--qa-return-hold-travel-shot",
+                             "-autoplay", "NO", "-muted", "YES"])
+        visualButton("media.author.28037100").tap()
+        let header = app.otherElements["creator.top-bar"]
+        let back = header.buttons["navigation.back"]
+        let locks = app.staticTexts["page.interaction-lock"]
+        let motion = app.staticTexts.matching(identifier: "page.return-motion.qa").firstMatch
+        let grid = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "media.grid.cell.")).firstMatch
+        waitUntil("The light author grid is ready over the immersive timeline") {
+            back.isHittable && grid.isHittable && locks.valueDescription.contains("locks=0")
+        }
+        let topFrame = header.frame
+        let bottomFrame = mainTabBar().frame
+        let swipeDistance: CGFloat = 34
+        let patch = CGRect(x: app.frame.midX - 2, y: grid.frame.midY - 16, width: 4, height: 32)
+        // At this row the center gutter is white and the neighboring cover is colored.
+        waitUntil("The neighboring fixture cover has decoded") {
+            let screenshot = UIImage(data: self.app.screenshot().pngRepresentation)
+            guard let rgb = self.floating45MeanRGB(screenshot, in: patch.offsetBy(dx: swipeDistance, dy: 0)),
+                  let high = rgb.max(), let low = rgb.min() else { return false }
+            return high - low > 25
+        }
+        let before = captureChromePixels(named: "creator191-body-before")
+        let baseline = try XCTUnwrap(floating45MeanRGB(before, in: patch))
+        XCTAssertTrue(baseline.allSatisfy { $0 >= 235 }, "Expected the light grid gutter: \(baseline)")
+
+        let origin = app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: 0.52))
+        origin.press(forDuration: 0.05, thenDragTo: origin.withOffset(CGVector(dx: swipeDistance, dy: 0)),
+                     withVelocity: XCUIGestureVelocity(rawValue: 75), thenHoldForDuration: 0.40)
+        var state = logAuthorReturnMotion("CREATOR191_POST_DRAG", motion)
+        waitUntil("The captured author body holds the dragged offset over the immersive timeline", timeout: 4,
+                  onTimeout: { _ = self.logAuthorReturnMotion("CREATOR191_HOLD_TIMEOUT", motion) }) {
+            state = motion.exists ? motion.valueDescription : "missing"
+            return state.contains("event=return-travel-held-for-qa") && state.contains("liveSourceMotion=false")
+                && state.contains("sourceMasked=true") && state.contains("heldFinger=true")
+                && state.contains("navigationOutcome=pending")
+        }
+        let sample = numericReadback(state)
+        XCTAssertTrue(state.contains("globalBlocked=false"), state)
+        let offset = try XCTUnwrap(sample["sourceSnapshotTx"])
+        XCTAssertGreaterThan(try XCTUnwrap(sample["heldSourceTx"]), 12,
+                             "The captured author body must move visibly before finger lift: " + state)
+        XCTAssertGreaterThan(offset, 15, state)
+        let screenshot = captureChromePixels(named: "creator191-body-displaced-before-cancel")
+        let captured = logAuthorReturnMotion("CREATOR191_SCREENSHOT", motion)
+        XCTAssertTrue(captured.contains("event=return-travel-held-for-qa"),
+                      "The screenshot must be captured before the author returns to its origin")
+        let movedPatch = patch.offsetBy(dx: CGFloat(offset), dy: 0)
+        let held = try XCTUnwrap(floating45MeanRGB(screenshot, in: movedPatch))
+        let originalAtMovedPatch = try XCTUnwrap(floating45MeanRGB(before, in: movedPatch))
+        XCTAssertGreaterThan(zip(held, originalAtMovedPatch).map { abs($0.0 - $0.1) }.max() ?? 0, 25,
+                             "The gutter must replace the neighboring cover at its displaced position")
+        for channel in baseline.indices {
+            XCTAssertEqual(held[channel], baseline[channel], accuracy: 8,
+                           "The displaced ordinary body gutter must keep its color: before=\(baseline); held=\(held)")
+        }
+        waitUntil("Cancellation releases input on the same author page",
+                  onTimeout: { _ = self.logAuthorReturnMotion("CREATOR191_CANCEL_TIMEOUT", motion) }) {
+            motion.valueDescription.contains("phase=cancelled")
+                && back.isHittable && grid.isHittable && locks.valueDescription.contains("locks=0")
+        }
+        XCTAssertEqual(header.frame, topFrame)
+        XCTAssertEqual(mainTabBar().frame, bottomFrame)
+        attachScreenshot(named: "creator191-body-after-cancel")
+    }
+
+    func testReleaseDownloadSettingsEdgeHoldsAndReturns() {
+        app = XCUIApplication()
+        app.launchArguments = ["-muted", "YES", "-autoplay", "NO"]
+        XCUIDevice.shared.orientation = .portrait
+        app.launch()
+        heightCloseNotices()
+        openAccountSettings()
+        let settings = floatingPageTitle("账号与设置")
+        let downloads = app.buttons["settings.downloads"]
+        let header = floatingPageTitle("下载设置")
+        let back = header.buttons["navigation.back"]
+        let wifiOnly = app.switches["downloads.wifi-only"]
+        let window = app.windows.firstMatch
+        let bottom = mainTabBar()
+        waitUntil("The anonymous settings page is ready") {
+            settings.buttons["navigation.back"].isHittable && downloads.exists && bottom.exists
+        }
+        let settingsFrame = settings.frame
+        let bottomFrame = bottom.frame
+        attachScreenshot(named: "release-download-edge-settings-baseline")
+
+        for (label, right, cancel) in [("left-commit", false, false), ("right-commit", true, false), ("left-cancel", false, true)] {
+            tapAboveMainBar(downloads)
+            waitUntil("The local download settings controls are ready") { back.isHittable && wifiOnly.isHittable }
+            let headerFrame = header.frame
+            XCTAssertEqual(bottom.frame, bottomFrame)
+            attachScreenshot(named: "release-download-edge-\(label)-before")
+            let touch = window.coordinate(withNormalizedOffset: CGVector(dx: right ? 0.98 : 0.02, dy: 0.52))
+            // A short translation must stay below the 45-point acceptance threshold on every device size.
+            let travel: CGFloat = cancel ? 34 : window.frame.width * 0.45
+            let end = touch.withOffset(CGVector(dx: right ? -travel : travel, dy: 0))
+            print("RELEASE_DOWNLOAD_EDGE_BEGIN method=\(label);epoch=\(Date().timeIntervalSince1970);travel=\(travel);top=\(headerFrame);bottom=\(bottomFrame)")
+            touch.press(forDuration: 0.05, thenDragTo: end,
+                        withVelocity: XCUIGestureVelocity(rawValue: cancel ? 75 : 170), thenHoldForDuration: 1.8)
+            print("RELEASE_DOWNLOAD_EDGE_END method=\(label);epoch=\(Date().timeIntervalSince1970)")
+            if cancel {
+                waitUntil("A short edge returns to the same usable download settings") { back.isHittable && wifiOnly.isHittable }
+                XCTAssertEqual(header.frame, headerFrame)
+            } else {
+                waitUntil("The accepted edge returns to the real account settings") {
+                    !header.exists && settings.buttons["navigation.back"].isHittable && downloads.isHittable
+                }
+                XCTAssertEqual(settings.frame, settingsFrame)
+            }
+            XCTAssertEqual(bottom.frame, bottomFrame)
+            attachScreenshot(named: "release-download-edge-\(label)-after")
+        }
+    }
+
+    func testLeaderboardAuthorEdgeResetBeforeAssemblyNeverAcquiresInput() {
+        assertLeaderboardAuthorEdgeFaultReleasesInput(
+            flag: "--qa-reset-edge-before-assembly", reason: "begin-pan-reset", right: true, expectedPhase: "guard")
+    }
+
+    func testLeaderboardAuthorEdgeResetReleasesInputAfterMissingTerminalCallback() {
+        assertLeaderboardAuthorEdgeFaultReleasesInput(
+            flag: "--qa-drop-edge-return-pan-terminal", reason: "return-pan-reset", right: false)
+    }
+
+    func testLeaderboardAuthorLostEndAndResetReleasesInput() {
+        assertLeaderboardAuthorEdgeFaultReleasesInput(
+            flag: "--qa-drop-edge-return-pan-terminal-and-reset", reason: "return-touch-ended", right: false,
+            verifyNextSwipe: true)
+    }
+
+    func testLeaderboardAuthorTouchWatchRecoversWithoutTerminalCallbacks() {
+        assertLeaderboardAuthorEdgeFaultReleasesInput(
+            flag: "--qa-drop-edge-return-pan-terminal-reset-and-touch-end",
+            reason: "return-touch-ended", right: false, verifyNextSwipe: true, recoveryProof: .touchWatch)
+    }
+
+    func testLeaderboardAuthorNewTouchRecoversStaleEdgePan() {
+        assertLeaderboardAuthorEdgeFaultReleasesInput(
+            flag: "--qa-stale-edge-pan-touch", reason: "return-abandoned-on-new-touch",
+            right: false, verifyNextSwipe: true, recoveryProof: .nextTouch)
+    }
+
+    func testLeaderboardAuthorPendingEdgeReturnYieldsToFirstBottomTabTap() throws {
+        let pending = try startUnassembledAuthorEdgeReturn { self.mainTabButton("搜索") }
+        let field = app.textFields["search-title-input"]
+        tapScreenFrame(pending.frame)
+        waitUntil("One tap switches to Search while the accepted edge return waits for its canvas", timeout: 5) {
+            self.mainTabButton("搜索").isSelected && field.isHittable
+        }
+        assertLateAuthorEdgeCaptureWasRejected(receipt: pending.receipt)
+        XCTAssertTrue(mainTabButton("搜索").isSelected)
+        XCTAssertTrue(field.isHittable)
+        field.tap()
+        field.typeText("edge return")
+        XCTAssertEqual(field.value as? String, "edge return")
+    }
+
+    func testLeaderboardAuthorPendingEdgeReturnYieldsToFirstBackTapAndPreservesNewAuthor() throws {
+        let pending = try startUnassembledAuthorEdgeReturn { self.app.otherElements["creator.top-bar"].buttons["navigation.back"] }
+        let author = app.otherElements["creator.top-bar"]
+        let second = app.buttons["leaderboard.author.59002"]
+        tapScreenFrame(pending.frame)
+        waitUntil("One Back tap returns to the leaderboard while the accepted edge waits for its canvas", timeout: 5) {
+            !author.exists && second.isHittable
+        }
+        second.tap()
+        let newAuthor = app.staticTexts["@Pattern Creator 2"]
+        waitUntil("A different author opens before the first author's canvas is delivered", timeout: 5) {
+            author.buttons["navigation.back"].isHittable && newAuthor.isHittable
+        }
+        assertLateAuthorEdgeCaptureWasRejected(receipt: pending.receipt)
+        XCTAssertTrue(newAuthor.isHittable)
+        author.buttons["navigation.back"].tap()
+        waitUntil("The newer author keeps its own working Back action") { !author.exists && second.isHittable }
+    }
+
+    private func startUnassembledAuthorEdgeReturn(action button: () -> XCUIElement) throws -> (frame: CGRect, receipt: String) {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-author-activity58", "--qa-page-return", "--qa-header-motion",
+                             "--qa-hold-edge-return-assembly-for-independent-input", "-autoplay", "NO", "-muted", "YES"])
+        mainTabButton("作者榜").tap()
+        let row = app.buttons["leaderboard.author.59001"]
+        let locks = app.staticTexts["page.interaction-lock"]
+        waitUntil("The author leaderboard can receive row taps") {
+            row.isHittable && locks.valueDescription.contains("locks=0")
+        }
+        row.tap()
+        let work = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "media.grid.cell.")).firstMatch
+        let author = app.otherElements["creator.top-bar"]
+        let action = button()
+        waitUntil("The first author is visible with working chrome and a loaded grid") {
+            author.buttons["navigation.back"].isHittable && work.isHittable && action.isHittable
+                && locks.valueDescription.contains("locks=0")
+        }
+        let acquired = try XCTUnwrap(heightValues(locks.valueDescription)["acquired"])
+        let frame = action.frame
+        let window = app.windows.firstMatch
+        let start = window.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: 0.52))
+        start.press(forDuration: 0.05,
+                    thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.57, dy: 0.52)),
+                    withVelocity: XCUIGestureVelocity(rawValue: 900), thenHoldForDuration: 0)
+        let motion = app.staticTexts["page.return-motion.qa"]
+        XCTAssertTrue(motion.waitForValueToContain("event=settlement-deferred", timeout: 3), motion.valueDescription)
+        let pending = motion.valueDescription
+        XCTAssertTrue(pending.contains("settlementDeferred=true") && pending.contains("assembled=false")
+                      && pending.contains("navigationOutcome=pending") && pending.contains("globalBlocked=false"), pending)
+        let lockState = heightValues(locks.valueDescription)
+        XCTAssertEqual(lockState["locks"], 0)
+        XCTAssertEqual(lockState["acquired"], acquired)
+        XCTAssertTrue(action.isHittable, "The live control must remain tappable while its canvas is pending")
+        XCTAssertEqual(action.frame, frame, "The live control must keep its original position")
+        let receipt = try XCTUnwrap(rootMotionFields181(pending)["receipt"])
+        return (frame, receipt)
+    }
+
+    private func assertLateAuthorEdgeCaptureWasRejected(receipt: String) {
+        let terminal = app.staticTexts["page.return-motion.qa"].valueDescription
+        let motion = rootMotionFields181(terminal)
+        XCTAssertEqual(motion["receipt"], receipt, terminal)
+        XCTAssertTrue(terminal.contains("return-abandoned-on-new-touch"), terminal)
+        XCTAssertEqual(motion["navigationOutcome"], "cancelled", terminal)
+        let callback = app.staticTexts["page.return-late-capture.qa"]
+        XCTAssertFalse(callback.exists, "The new page must become actionable before the old canvas arrives")
+        XCTAssertTrue(callback.waitForValueToContain("rejected=true", timeout: 12), callback.valueDescription)
+        let result = rootMotionFields181(callback.valueDescription)
+        XCTAssertEqual(result["delivered"], "true", callback.valueDescription)
+        XCTAssertEqual(result["captured"], "true", callback.valueDescription)
+        XCTAssertEqual(result["receipt"], receipt, callback.valueDescription)
+    }
+
+    func testLeaderboardAuthorAcceptedEdgePanReleasesWhenAssemblyNeverStarts() {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-author-activity58", "--qa-page-return", "--qa-header-motion",
+                             "--qa-drop-return-assembly-entry", "--qa-return-assembly-delay181",
+                             "-autoplay", "NO", "-muted", "YES"])
+        mainTabButton("作者榜").tap()
+        let row = app.buttons["leaderboard.author.59001"]
+        let author = app.otherElements["creator.top-bar"]
+        let back = author.buttons["navigation.back"]
+        let locks = app.staticTexts["page.interaction-lock"]
+        let motion = app.descendants(matching: .any)["page.return-motion.qa"]
+        let work = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "media.grid.cell.")).firstMatch
+        waitUntil("The leaderboard can open the fixture author") {
+            row.isHittable && locks.valueDescription.contains("locks=0")
+        }
+        row.tap()
+        waitUntil("The author grid has finished opening") {
+            back.isHittable && work.isHittable && locks.valueDescription.contains("locks=0")
+        }
+
+        let initialAcquisitions = heightValues(locks.valueDescription)["acquired"]
+        XCTAssertNotNil(initialAcquisitions)
+        let window = app.windows.firstMatch
+        let origin = window.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: 0.52))
+        origin.press(forDuration: 0.05,
+                     thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.57, dy: 0.52)),
+                     withVelocity: XCUIGestureVelocity(rawValue: 900), thenHoldForDuration: 0)
+        waitUntil("The accepted edge returns to the actual leaderboard even though no canvas was assembled") {
+            let state = motion.valueDescription
+            return state.contains("return-assembly-timeout") && state.contains("assembled=false")
+                && state.contains("sourceMasked=false") && !author.exists && row.isHittable
+                && locks.valueDescription.contains("locks=0")
+        }
+        XCTAssertEqual(heightValues(locks.valueDescription)["acquired"], initialAcquisitions)
+        XCTAssertTrue(mainTabButton("作者榜").isSelected)
+        row.tap()
+        waitUntil("The restored leaderboard accepts a real tap to reopen the author") {
+            back.isHittable && work.isHittable && locks.valueDescription.contains("locks=0")
+        }
+
+        origin.press(forDuration: 0.05, thenDragTo: origin.withOffset(CGVector(dx: 28, dy: 0)),
+                     withVelocity: XCUIGestureVelocity(rawValue: 160), thenHoldForDuration: 0)
+        waitUntil("A rejected edge before capture keeps the author and releases input") {
+            let state = motion.valueDescription
+            return state.contains("phase=cancelled") && state.contains("navigationOutcome=cancelled")
+                && state.contains("assembled=false") && state.contains("sourceMasked=false")
+                && back.isHittable && work.isHittable && locks.valueDescription.contains("locks=0")
+        }
+        back.tap()
+        waitUntil("The author Back button still accepts input after the rejected edge") {
+            !author.exists && row.isHittable && locks.valueDescription.contains("locks=0")
+        }
+    }
+
+    func testLeaderboardAuthorEdgeFollowsFingerWhenLegacyCaptureIsUnavailable() {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-author-activity58", "--qa-page-return", "--qa-header-motion",
+                             "--qa-forbid-return-source-capture", "-autoplay", "NO", "-muted", "YES"])
+        mainTabButton("作者榜").tap()
+        let board = app.otherElements["leaderboard.top-bar"]
+        let row = app.buttons["leaderboard.author.59001"]
+        let author = app.otherElements["creator.top-bar"]
+        let back = author.buttons["navigation.back"]
+        let work = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "media.grid.cell.")).firstMatch
+        let motion = app.staticTexts.matching(identifier: "page.return-motion.qa").firstMatch
+        let locks = app.staticTexts["page.interaction-lock"]
+        waitUntil("The leaderboard is ready before opening the author") {
+            row.isHittable && board.isHittable && locks.valueDescription.contains("locks=0")
+        }
+        let boardFrame = board.frame
+        let bottomFrame = mainTabBar().frame
+        row.tap()
+        waitUntil("The author page is ready before either swipe") {
+            back.isHittable && work.isHittable && locks.valueDescription.contains("locks=0")
+        }
+        let authorFrame = author.frame
+        let window = app.windows.firstMatch
+        let left = window.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: 0.52))
+        left.press(forDuration: 0.05, thenDragTo: left.withOffset(CGVector(dx: 34, dy: 0)),
+                   withVelocity: XCUIGestureVelocity(rawValue: 75), thenHoldForDuration: 0.40)
+        _ = logAuthorReturnMotion("AUTHOR_EDGE_LIVE_SOURCE_AFTER_SHORT", motion)
+        waitUntil("The normal short drag cancels and preserves the usable author page",
+                  onTimeout: { _ = self.logAuthorReturnMotion("AUTHOR_EDGE_LIVE_SOURCE_CANCEL_TIMEOUT", motion) }) {
+            motion.valueDescription.contains("phase=cancelled") && back.isHittable && work.isHittable
+                && locks.valueDescription.contains("locks=0")
+        }
+        let cancelled = logAuthorReturnMotion("AUTHOR_EDGE_LIVE_SOURCE_CANCEL", motion)
+        XCTAssertTrue(cancelled.contains("firstMovement=true") && cancelled.contains("heldFinger=true"), cancelled)
+        XCTAssertGreaterThan(numericReadback(cancelled)["heldSourceTx"] ?? 0, 12, cancelled)
+        XCTAssertEqual(author.frame, authorFrame)
+        XCTAssertEqual(mainTabBar().frame, bottomFrame)
+
+        let right = window.coordinate(withNormalizedOffset: CGVector(dx: 0.98, dy: 0.52))
+        let width = window.frame.width
+        right.press(forDuration: 0.05, thenDragTo: right.withOffset(CGVector(dx: -width * 0.45, dy: 0)),
+                    withVelocity: XCUIGestureVelocity(rawValue: 170), thenHoldForDuration: 1.25)
+        _ = logAuthorReturnMotion("AUTHOR_EDGE_LIVE_SOURCE_AFTER_LONG", motion)
+        waitUntil("The normal long drag commits to the original leaderboard",
+                  onTimeout: { _ = self.logAuthorReturnMotion("AUTHOR_EDGE_LIVE_SOURCE_COMMIT_TIMEOUT", motion) }) {
+            motion.valueDescription.contains("phase=completed") && !author.exists && row.isHittable
+                && locks.valueDescription.contains("locks=0")
+        }
+        let committed = logAuthorReturnMotion("AUTHOR_EDGE_LIVE_SOURCE_COMMIT", motion)
+        XCTAssertTrue(committed.contains("firstMovement=true") && committed.contains("heldFinger=true"), committed)
+        XCTAssertLessThan(numericReadback(committed)["heldSourceTx"] ?? 0, -Double(width * 0.30), committed)
+        XCTAssertEqual(board.frame, boardFrame)
+        XCTAssertEqual(mainTabBar().frame, bottomFrame)
+    }
+
+    func testLeaderboardAuthorEdgeReturnReleasesInputAfterMissingSettlementCompletion() {
+        assertLeaderboardAuthorEdgeFaultReleasesInput(
+            flag: "--qa-drop-edge-return-settlement-completion", reason: "return-settlement-timeout", right: true)
+    }
+
+    func testLeaderboardAuthorPendingReturnInvalidationKeepsAuthor() {
+        assertLeaderboardAuthorEdgeFaultReleasesInput(
+            flag: "--qa-invalidate-accepted-return-capture", reason: "source-canvas-invalid-after-capture",
+            right: false, dragVelocity: XCUIGestureVelocity(rawValue: 500), dragHold: 0.05)
+    }
+
+    func testOfflineNavigationDiagnosticsWithAuthorEdgeAndMainDelay() {
+        assertLeaderboardAuthorEdgeFaultReleasesInput(
+            flag: "--qa-drop-edge-return-settlement-completion", reason: "return-settlement-timeout", right: true,
+            extra: ["--qa-navigation-diagnostics", "--qa-navigation-main-delay", "--qa-navigation-observe-shield"])
+        XCUIDevice.shared.press(.home)
+        waitUntil("The diagnostic app leaves the foreground without a live profiling session", timeout: 5) {
+            self.app.state == .runningBackground || self.app.state == .runningBackgroundSuspended
+        }
+        app.terminate()
+        app.launchArguments.removeAll { $0.hasPrefix("--qa-navigation-") }
+        app.launch()
+        XCTAssertTrue(mainTabButton("作者榜").waitForExistence(timeout: 8))
+    }
+
+    private enum AuthorEdgeRecoveryProof {
+        case defaultRecovery, touchWatch, nextTouch
+    }
+
+    private func assertLeaderboardAuthorEdgeFaultReleasesInput(flag: String, reason: String,
+                                                               right: Bool, expectedPhase: String = "aborted", extra: [String] = [],
+                                                               verifyNextSwipe: Bool = false,
+                                                               recoveryProof: AuthorEdgeRecoveryProof = .defaultRecovery,
+                                                               dragVelocity: XCUIGestureVelocity = XCUIGestureVelocity(rawValue: 175),
+                                                               dragHold: TimeInterval = 0.90) {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-author-activity58", "--qa-page-return", "--qa-header-motion",
+                             "-autoplay", "NO", "-muted", "YES", flag] + extra)
+        mainTabButton("作者榜").tap()
+        let row = app.buttons["leaderboard.author.59001"]
+        XCTAssertTrue(row.waitForExistence(timeout: 8))
+        row.tap()
+        let header = app.otherElements["creator.top-bar"]
+        let back = header.buttons["navigation.back"]
+        let locks = app.staticTexts["page.interaction-lock"]
+        let firstWork = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "media.grid.cell.")).firstMatch
+        waitUntil("The author grid is loaded and actionable before the edge gesture") {
+            firstWork.isHittable && back.isHittable && locks.valueDescription.contains("locks=0")
+        }
+        let backFrame = back.frame
+        let initialAcquisitions = heightValues(locks.valueDescription)["acquired"]
+        XCTAssertNotNil(initialAcquisitions)
+        let window = app.windows.firstMatch
+        let motion = app.descendants(matching: .any)["page.return-motion.qa"]
+        let origin = window.coordinate(withNormalizedOffset: CGVector(dx: right ? 0.98 : 0.02, dy: 0.52))
+        origin.press(forDuration: 0.05,
+                     thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: right ? 0.79 : 0.21, dy: 0.52)),
+                     withVelocity: dragVelocity, thenHoldForDuration: dragHold)
+        print("AUTHOR_EDGE_POST_DRAG reason=\(reason);" + locks.valueDescription + ";" + motion.valueDescription)
+        if extra.contains("--qa-navigation-observe-shield") {
+            XCTAssertTrue(motion.waitForValueToContain("event=settlement-completion-dropped", timeout: 3), motion.valueDescription)
+            let state = motion.valueDescription
+            XCTAssertTrue(state.contains("phase=settling") && state.contains("globalBlocked=false"), state)
+            XCTAssertEqual(heightValues(locks.valueDescription)["locks"], 0)
+        }
+        if recoveryProof == .nextTouch {
+            // Keep the released gesture in the foreground through four of the old 180 ms checks.
+            Thread.sleep(forTimeInterval: 0.75)
+            let state = motion.valueDescription
+            XCTAssertEqual(app.state, .runningForeground)
+            XCTAssertEqual(heightValues(locks.valueDescription)["locks"], 0)
+            XCTAssertTrue(state.contains("event=pan-terminal-dropped") && state.contains("globalBlocked=false"), state)
+            XCTAssertTrue(state.contains("watchdogRecovered=false"), state)
+            XCTAssertTrue(state.contains("sourceWindow=true") && state.contains("navigationOutcome=pending"), state)
+            tapScreenFrame(backFrame)
+        }
+        waitUntil("The fault clears the edge return and keeps the page actionable") {
+            let state = motion.valueDescription
+            let pageActionable = recoveryProof == .nextTouch ? !header.exists && row.isHittable
+                : firstWork.isHittable && back.isHittable
+            return state.contains("phase=\(expectedPhase)") && state.contains(reason) &&
+                (recoveryProof != .touchWatch || state.contains("watchdogRecovered=true")) &&
+                state.contains("sourceMasked=false") && state.contains("globalBlocked=false") &&
+                locks.valueDescription.contains("locks=0") && pageActionable
+        }
+        XCTAssertEqual(heightValues(locks.valueDescription)["acquired"], initialAcquisitions,
+                       "The edge return and its recovery must leave window input unshielded")
+        print("AUTHOR_EDGE_INPUT_RECOVERED reason=\(reason);" + locks.valueDescription + ";" + motion.valueDescription)
+        if recoveryProof == .nextTouch {
+            row.tap()
+            waitUntil("A real list tap reopens the author without suspending the app") {
+                back.isHittable && firstWork.isHittable
+            }
+        }
+        if verifyNextSwipe {
+            XCTAssertEqual(app.state, .runningForeground)
+            origin.press(forDuration: 0.05,
+                         thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.50, dy: 0.52)),
+                         withVelocity: XCUIGestureVelocity(rawValue: 175), thenHoldForDuration: 0.90)
+            waitUntil("The next real held edge swipe commits and restores the author list") {
+                !header.exists && row.isHittable && locks.valueDescription.contains("locks=0")
+            }
+            row.tap()
+            waitUntil("A real list tap can reopen the author after the next swipe") { back.isHittable && firstWork.isHittable }
+        }
+        back.tap()
+        XCTAssertTrue(header.waitForNonExistence(timeout: 5))
+        XCTAssertTrue(row.isHittable, "The next real press works and returns to the author list")
+        XCTAssertTrue(locks.valueDescription.contains("locks=0"))
+        if verifyNextSwipe {
+            mainTabButton("搜索").tap()
+            waitUntil("The bottom bar can take a real tap after the recovered return") {
+                self.mainTabButton("搜索").isSelected && self.app.otherElements["search.top-bar"].isHittable
+            }
+        }
+    }
+
+    func testContent179AuthorAndCollectionDragAndDetails() {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-height-audit", "--qa-content-performance179", "--qa-header-motion", "--qa-body-motion",
+                             "--qa-drag-performance167", "-muted", "YES", "-autoplay", "NO"])
+        visualButton("media.author.28037100").tap()
+        let window = app.windows.firstMatch
+        let qa = app.descendants(matching: .any)["content179.state"]
+        let progress = app.buttons["content179.progress"]
+        let first = app.buttons["media.grid.cell.179000000"]
+        let upper = window.coordinate(withNormalizedOffset: CGVector(dx: 0.55, dy: 0.30))
+        let lower = window.coordinate(withNormalizedOffset: CGVector(dx: 0.55, dy: 0.73))
+        for collection in [false, true] {
+            let name = collection ? "collection" : "creator"
+            if collection { mainTabButton("收藏").tap() }
+            XCTAssertTrue(first.waitForExistence(timeout: 12))
+            Thread.sleep(forTimeInterval: 2)
+            let grids = app.descendants(matching: .any).matching(identifier: "collection.qa.grid").allElementsBoundByIndex
+            print("CONTENT179_GRIDS page=\(name);values=" + grids.map { $0.label }.joined(separator: "|"))
+            XCTAssertTrue(grids.contains { $0.label.contains("count=300;") }, "The real accumulated feed must contain 300 decoded-bitmap works")
+            let before = qa.valueDescription
+            progress.tap()
+            Thread.sleep(forTimeInterval: 3)
+            print("CONTENT179_IDLE page=\(name);before=\(before);after=\(qa.valueDescription)")
+            XCTAssertGreaterThan(heightValues(qa.valueDescription)["ticks"] ?? 0, heightValues(before)["ticks"] ?? 0)
+            print("CONTENT179_PHASE page=\(name);phase=drag;epoch=\(Date().timeIntervalSince1970)")
+            for _ in 0..<4 {
+                lower.press(forDuration: 0.02, thenDragTo: upper, withVelocity: XCUIGestureVelocity(rawValue: 400), thenHoldForDuration: 0.05)
+                upper.press(forDuration: 0.02, thenDragTo: lower, withVelocity: XCUIGestureVelocity(rawValue: 400), thenHoldForDuration: 0.05)
+            }
+            progress.tap()
+            print("CONTENT179_PHASE page=\(name);phase=details;epoch=\(Date().timeIntervalSince1970);" + qa.valueDescription)
+            waitUntil("The first real work is visible after reverse scrolling") { first.isHittable }
+            first.tap()
+            let detailsAction = visualButton("media.details.179000000")
+            XCTAssertTrue(detailsAction.waitForExistence(timeout: 8))
+            for round in 0..<3 {
+                detailsAction.tap()
+                let details = floatingPageTitle("作品详情")
+                XCTAssertTrue(details.waitForExistence(timeout: 5))
+                app.buttons["details.back"].tap()
+                waitUntil("Details returns to the same real media work") { detailsAction.isHittable && !details.isHittable }
+                print("CONTENT179_DETAILS page=\(name);round=\(round);epoch=\(Date().timeIntervalSince1970)")
+            }
+            let from = window.coordinate(withNormalizedOffset: CGVector(dx: 0.98, dy: 0.5))
+            from.press(forDuration: 0.05, thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.50, dy: 0.5)),
+                       withVelocity: XCUIGestureVelocity(rawValue: 180), thenHoldForDuration: 0.1)
+            waitUntil("The viewer returns to its retained content grid") { first.isHittable }
+            print("CONTENT179_SAMPLE page=\(name);epoch=\(Date().timeIntervalSince1970);state=\(qa.valueDescription);cadence=" + app.staticTexts["performance.cadence172"].valueDescription)
+        }
+        app.terminate()
+    }
+
+    func testContent179FixtureSetupReadback() {
+        app = XCUIApplication()
+        app.launchArguments = ["--qa-collection-paging", "--qa-visual-controls", "--qa-height-audit", "--qa-content-performance179",
+                               "-app.appearance", "light", "-muted", "YES", "-autoplay", "NO"]
+        XCUIDevice.shared.orientation = .portrait
+        app.launch()
+        let qa = app.descendants(matching: .any)["content179.state"]
+        XCTAssertTrue(qa.waitForExistence(timeout: 10))
+        Thread.sleep(forTimeInterval: 3)
+        print("CONTENT179_SETUP " + qa.valueDescription)
+        print("CONTENT179_SETUP_AX " + String(app.debugDescription.prefix(6500)))
+        XCTAssertTrue(qa.valueDescription.contains("setup=ready;"), qa.valueDescription)
+        app.terminate()
+    }
+
+    func testPerformance181GridScrollAndCancelledReturn() {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-height-audit", "--qa-content-performance179", "--qa-header-motion",
+                             "--qa-body-motion", "--qa-drag-performance167", "--qa-page-return",
+                             "-muted", "YES", "-autoplay", "NO"])
+        visualButton("media.author.28037100").tap()
+        let first = app.buttons["media.grid.cell.179000000"].firstMatch
+        waitUntil("The same 300-work local author workload is ready", timeout: 15) { first.isHittable }
+        let state = app.descendants(matching: .any)["content179.state"]
+        let window = app.windows.firstMatch
+        let lower = window.coordinate(withNormalizedOffset: CGVector(dx: 0.52, dy: 0.73))
+        let upper = window.coordinate(withNormalizedOffset: CGVector(dx: 0.52, dy: 0.30))
+        let top = app.otherElements["creator.top-bar"].frame
+        func tabBarGeometry() -> CGRect {
+            let tabs = mainTabBar()
+            if tabs.exists { return tabs.frame }
+            return app.descendants(matching: .any)["main.tabs.compact.drawable"].frame
+        }
+        let bottom = tabBarGeometry()
+        print("PERF181_START epoch=\(Date().timeIntervalSince1970);state=" + state.valueDescription
+              + ";cadence=" + app.staticTexts["performance.cadence172"].valueDescription)
+        for _ in 0..<4 {
+            lower.press(forDuration: 0.05, thenDragTo: upper, withVelocity: XCUIGestureVelocity(rawValue: 400), thenHoldForDuration: 0.05)
+            upper.press(forDuration: 0.05, thenDragTo: lower, withVelocity: XCUIGestureVelocity(rawValue: 400), thenHoldForDuration: 0.05)
+        }
+        waitUntil("The same first work returns after the reverse workload") { first.isHittable }
+        for _ in 0..<3 {
+            window.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: 0.5))
+                    .press(forDuration: 0.05, thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.07, dy: 0.5)),
+                       withVelocity: XCUIGestureVelocity(rawValue: 60), thenHoldForDuration: 0.1)
+            waitUntil("A short author edge drag keeps its real source and releases input") {
+                first.isHittable && self.app.staticTexts["page.interaction-lock"].valueDescription.contains("locks=0")
+            }
+        }
+        print("PERF181_END epoch=\(Date().timeIntervalSince1970);state=" + state.valueDescription
+              + ";cadence=" + app.staticTexts["performance.cadence172"].valueDescription)
+        XCTAssertEqual(app.otherElements["creator.top-bar"].frame, top)
+        XCTAssertEqual(tabBarGeometry(), bottom)
+        attachScreenshot(named: "performance181-author-scroll-and-cancel")
+        app.terminate()
+    }
+
+    func testRoot181RejectedBeforeReadyDoesNotReplayMovement() {
+        app = XCUIApplication()
+        app.launchArguments = ["--qa-collection-paging", "--qa-theme-timeline", "--qa-header-motion", "--qa-body-motion",
+                               "--qa-root-motion181", "--qa-root-layout-mismatch175", "-app.appearance", "light",
+                               "-muted", "YES", "-autoplay", "NO", "-timeline.presentation", "stream"]
+        XCUIDevice.shared.orientation = .portrait
+        app.launch()
+        XCTAssertTrue(timelineTools().waitForExistence(timeout: 10))
+        func idle() {
+            waitUntil("The real source controls release their transition lease") {
+                self.app.staticTexts["page.interaction-lock"].valueDescription.contains("locks=0")
+            }
+        }
+        for title in ["搜索", "时间线", "作者榜"] { mainTabButton(title).tap(); idle() }
+        let header = rootHeader181("作者榜")
+        let top = header.frame, bottom = mainTabBar().frame
+        let motion = app.staticTexts["root.motion181.qa"]
+        let body = app.staticTexts["body.motion.qa"]
+        let window = app.windows.firstMatch
+        for right in [false, true] {
+            let before = rootMotionFields181(motion.valueDescription)
+            let start = window.coordinate(withNormalizedOffset: CGVector(dx: right ? 0.98 : 0.02, dy: 0.5))
+            start.press(forDuration: 0.01, thenDragTo: start.withOffset(CGVector(dx: right ? -12 : 12, dy: 0)),
+                        withVelocity: XCUIGestureVelocity(rawValue: 600), thenHoldForDuration: 0)
+            waitUntil("A rejected gesture restores the source without waiting for the late target") {
+                body.valueDescription.contains("kind=tab-edge") && body.valueDescription.contains("phase=cancelled")
+                    && self.mainTabButton("作者榜").isSelected
+                    && self.app.staticTexts["page.interaction-lock"].valueDescription.contains("locks=0")
+            }
+            let after = rootMotionFields181(motion.valueDescription)
+            XCTAssertEqual(after["pair"], before["pair"], "No new body pair starts after this short gesture has ended")
+            XCTAssertEqual(after["tokens"], before["tokens"])
+            XCTAssertEqual(header.frame, top)
+            XCTAssertEqual(mainTabBar().frame, bottom)
+            XCTAssertTrue(header.isHittable)
+        }
+        mainTabButton("搜索").tap(); idle()
+        XCTAssertTrue(rootHeader181("搜索").isHittable, "The next real root switch remains usable")
+        app.terminate()
+    }
+
+    func testPerformance181RootEdgesAndTimelineLanes() {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-height-audit", "--qa-content-performance179", "--qa-header-motion",
+                             "--qa-body-motion", "--qa-drag-performance167", "-muted", "YES", "-autoplay", "NO"])
+        let window = app.windows.firstMatch
+        let bottom = mainTabBar().frame
+        let state = app.descendants(matching: .any)["content179.state"]
+        let cadence = app.staticTexts["performance.cadence172"]
+        func idle() {
+            waitUntil("The root transition releases its input lease") {
+                let locks = self.app.staticTexts["page.interaction-lock"]
+                return locks.exists && locks.valueDescription.contains("locks=0")
+            }
+        }
+        func select(_ title: String) {
+            mainTabButton(title).tap()
+            waitUntil("The root selection is \(title)") { self.mainTabButton(title).isSelected }
+            idle()
+        }
+        for title in ["作者榜", "搜索", "收藏", "时间线"] { select(title) }
+        let source = app.otherElements["timeline.source"]
+        let media = app.otherElements["timeline.media-kind"]
+        for title in ["关注", "推荐"] { source.buttons[title].tap(); idle() }
+        for title in ["视频", "图片"] { media.buttons[title].tap(); idle() }
+        let startState = state.valueDescription
+        let startCadence = cadence.valueDescription
+        print("PERFROOT181_START epoch=\(Date().timeIntervalSince1970);state=" + startState + ";cadence=" + startCadence)
+        for _ in 0..<2 {
+            for title in ["作者榜", "搜索", "收藏", "时间线"] { select(title) }
+        }
+        select("作者榜")
+        for (right, target) in [(true, "搜索"), (true, "收藏"), (false, "搜索"), (false, "作者榜")] {
+            window.coordinate(withNormalizedOffset: CGVector(dx: right ? 0.98 : 0.02, dy: 0.5))
+                .press(forDuration: 0.05,
+                       thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)),
+                       withVelocity: XCUIGestureVelocity(rawValue: 180), thenHoldForDuration: 0.1)
+            waitUntil("The accepted root edge selects \(target)") { self.mainTabButton(target).isSelected }
+            idle()
+        }
+        for right in [false, true] {
+            let from = window.coordinate(withNormalizedOffset: CGVector(dx: right ? 0.98 : 0.02, dy: 0.5))
+            from.press(forDuration: 0.05, thenDragTo: from.withOffset(CGVector(dx: right ? -20 : 20, dy: 0)),
+                       withVelocity: XCUIGestureVelocity(rawValue: 60), thenHoldForDuration: 0.1)
+            idle()
+            XCTAssertTrue(mainTabButton("作者榜").isSelected)
+        }
+        select("时间线")
+        for _ in 0..<2 {
+            for upper in [true, false] {
+                let target = upper ? (source.buttons["关注"].isSelected ? "推荐" : "关注")
+                    : (media.buttons["视频"].isSelected ? "图片" : "视频")
+                window.coordinate(withNormalizedOffset: CGVector(dx: 0.98, dy: upper ? 0.34 : 0.58))
+                    .press(forDuration: 0.05,
+                           thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.3, dy: upper ? 0.34 : 0.58)),
+                           withVelocity: XCUIGestureVelocity(rawValue: 180), thenHoldForDuration: 0.1)
+                waitUntil("The timeline edge selects \(target)") { (upper ? source : media).buttons[target].isSelected }
+                idle()
+            }
+        }
+        let end = Date().timeIntervalSince1970
+        print("PERFROOT181_END epoch=\(end);state=" + state.valueDescription + ";cadence=" + cadence.valueDescription)
+        XCTAssertEqual(mainTabBar().frame, bottom)
+        XCTAssertTrue(mainTabButton("时间线").isSelected)
+        app.terminate()
+    }
+
     func testRootEdgesSwitchAndCancel165() {
         app = XCUIApplication()
         app.launchArguments = ["--qa-collection-paging", "--qa-height-audit", "--qa-theme-timeline",
-                               "--qa-header-motion", "--qa-body-motion", "-app.appearance", "light",
+                               "--qa-header-motion", "--qa-body-motion", "--qa-root-motion181", "-app.appearance", "light",
                                "-muted", "YES", "-autoplay", "NO", "-timeline.presentation", "stream"]
         app.launch()
         XCTAssertTrue(timelineTools().waitForExistence(timeout: 10))
         let bottom = mainTabBar().frame
         let window = app.windows.firstMatch
         let body = app.staticTexts["body.motion.qa"]
+        let rootMotion = app.staticTexts["root.motion181.qa"]
         func idle() {
             waitUntil("Root body releases its input lease") {
                 self.app.descendants(matching: .any)["page.interaction-lock"].valueDescription.contains("locks=0")
@@ -2927,21 +4547,58 @@ final class ResumePromptUITests: XCTestCase {
                       ("收藏", "时间线", false), ("作者榜", "时间线", true)] {
             mainTabButton(route.0).tap()
             idle()
+            let tokensBeforeGesture = rootMotionFields181(rootMotion.valueDescription)["tokens"] ?? ""
+            let rootHeader = rootHeader181(route.0)
+            let headerFrame = rootHeader.frame
+            let bodyGeometry = heightValues(body.valueDescription)
             let from = window.coordinate(withNormalizedOffset: CGVector(dx: route.2 ? 0.02 : 0.98, dy: 0.5))
             let cancel = window.coordinate(withNormalizedOffset: CGVector(dx: route.2 ? 0.09 : 0.91, dy: 0.5))
             from.press(forDuration: 0.05, thenDragTo: cancel,
                        withVelocity: XCUIGestureVelocity(rawValue: 100), thenHoldForDuration: 0.15)
             idle()
             XCTAssertTrue(mainTabButton(route.0).isSelected, "Short drag must keep source")
+            waitUntil("The short drag records a cancelled host-pair flight") {
+                let fields = self.rootMotionFields181(rootMotion.valueDescription)
+                return fields["outcome"] == "cancelled" && (Int(fields["moveSamples"] ?? "0") ?? 0) > 0
+            }
+            let cancelled = rootMotionFields181(rootMotion.valueDescription)
+            XCTAssertEqual(cancelled["outcome"], "cancelled", rootMotion.valueDescription)
+            XCTAssertEqual(cancelled["selected"], rootTabID181(route.0), rootMotion.valueDescription)
+            XCTAssertGreaterThan(Int(cancelled["moveSamples"] ?? "0") ?? 0, 0, rootMotion.valueDescription)
+            XCTAssertEqual(tokenValue181(tokensBeforeGesture, tab: Int(rootTabID181(route.0)) ?? -1),
+                           tokenValue181(cancelled["tokens"] ?? "", tab: Int(rootTabID181(route.0)) ?? -1), rootMotion.valueDescription)
+            XCTAssertEqual(rootHeader.frame, headerFrame)
             from.press(forDuration: 0.05, thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)),
                        withVelocity: XCUIGestureVelocity(rawValue: 180), thenHoldForDuration: 0.1)
             waitUntil("Accepted root edge selects target exactly once") { self.mainTabButton(route.1).isSelected }
             idle()
             XCTAssertTrue(body.valueDescription.contains("kind=tab-edge"), body.valueDescription)
             XCTAssertTrue(body.valueDescription.contains("phase=completed"), body.valueDescription)
-            XCTAssertGreaterThan(heightValues(body.valueDescription)["settleFrames"] ?? 0, 1, body.valueDescription)
+            let motion = rootMotionFields181(rootMotion.valueDescription)
+            XCTAssertEqual(motion["source"], rootTabID181(route.0), rootMotion.valueDescription)
+            XCTAssertEqual(motion["destination"], rootTabID181(route.1), rootMotion.valueDescription)
+            XCTAssertEqual(motion["outcome"], "completed", rootMotion.valueDescription)
+            XCTAssertEqual(motion["selected"], rootTabID181(route.1), rootMotion.valueDescription)
+            XCTAssertEqual(motion["visibleSlots"], rootTabID181(route.1), rootMotion.valueDescription)
+            XCTAssertGreaterThan(Int(motion["slotCount"] ?? "0") ?? 0, 0, rootMotion.valueDescription)
+            XCTAssertLessThanOrEqual(Int(motion["slotCount"] ?? "99") ?? 99, 4, rootMotion.valueDescription)
+            XCTAssertEqual(motion["sourceHidden"], "1", rootMotion.valueDescription)
+            XCTAssertEqual(motion["targetHidden"], "0", rootMotion.valueDescription)
+            XCTAssertGreaterThan(Int(motion["moveSamples"] ?? "0") ?? 0, 0, rootMotion.valueDescription)
+            XCTAssertGreaterThan(Double(motion["maxMoveSourceX"] ?? "0") ?? 0, 0.5, rootMotion.valueDescription)
+            XCTAssertGreaterThan(Double(motion["maxMoveTargetX"] ?? "0") ?? 0, 0.5, rootMotion.valueDescription)
+            XCTAssertTrue(motion["lastEndpoint"]?.contains("selected=\(rootTabID181(route.1))") == true, rootMotion.valueDescription)
+            XCTAssertEqual(tokenValue181(motion["tokens"] ?? "", tab: Int(rootTabID181(route.1)) ?? -1),
+                           motion["destinationToken"], rootMotion.valueDescription)
+            XCTAssertEqual(tokenValue181(tokensBeforeGesture, tab: Int(rootTabID181(route.0)) ?? -1),
+                           tokenValue181(motion["tokens"] ?? "", tab: Int(rootTabID181(route.0)) ?? -1), rootMotion.valueDescription)
             XCTAssertEqual(mainTabBar().frame, bottom)
+            XCTAssertEqual(heightValues(body.valueDescription)["top"] ?? -1, bodyGeometry["top"] ?? -2, accuracy: 1,
+                           "The content viewport remains below the fixed header")
+            XCTAssertEqual(heightValues(body.valueDescription)["bottom"] ?? -1, bodyGeometry["bottom"] ?? -2, accuracy: 1,
+                           "The content viewport remains above the fixed footer")
             print("ROOT165 source=\(route.0);target=\(route.1);" + body.valueDescription)
+            print("ROOT181 source=\(route.0);target=\(route.1);" + rootMotion.valueDescription)
             attachScreenshot(named: "root165-\(route.0)-\(route.1)")
         }
     }
@@ -2949,28 +4606,72 @@ final class ResumePromptUITests: XCTestCase {
     func testRootTabsAllHaveBodyTransitions164() {
         app = XCUIApplication()
         app.launchArguments = ["--qa-collection-paging", "--qa-height-audit", "--qa-theme-timeline",
-                               "--qa-header-motion", "--qa-body-motion", "-app.appearance", "light",
+                               "--qa-header-motion", "--qa-body-motion", "--qa-root-motion181", "-app.appearance", "light",
                                "-muted", "YES", "-autoplay", "NO", "-timeline.presentation", "stream"]
         app.launch()
         XCTAssertTrue(timelineTools().waitForExistence(timeout: 10))
         let bottom = mainTabBar().frame
-        for title in ["作者榜", "搜索", "收藏", "时间线", "收藏", "搜索", "作者榜", "时间线"] {
+        let rootMotion = app.staticTexts["root.motion181.qa"]
+        XCTAssertTrue(rootMotion.waitForExistence(timeout: 5))
+        let bodyQA = app.staticTexts["body.motion.qa"]
+        let canvas = app.windows.firstMatch.frame
+        var seenHostTokens: [String: String] = [:]
+        func transition(to title: String) {
+            let previous = rootMotionFields181(rootMotion.valueDescription)
+            let sourceTitle = ["作者榜", "搜索", "收藏", "时间线"].first { mainTabButton($0).isSelected } ?? "时间线"
             mainTabButton(title).tap()
-            waitUntil("The root navigation commits its accepted target") { self.mainTabButton(title).isSelected }
+            waitUntil("The real root host pair completes the selected tab handoff") {
+                let fields = self.rootMotionFields181(rootMotion.valueDescription)
+                return self.mainTabButton(title).isSelected && fields["pair"] != previous["pair"] && fields["outcome"] == "completed"
+            }
+            let fields = rootMotionFields181(rootMotion.valueDescription)
+            XCTAssertEqual(fields["source"], rootTabID181(sourceTitle), rootMotion.valueDescription)
+            XCTAssertEqual(fields["destination"], rootTabID181(title), rootMotion.valueDescription)
+            XCTAssertEqual(fields["selected"], rootTabID181(title), rootMotion.valueDescription)
+            XCTAssertEqual(fields["visibleSlots"], rootTabID181(title), rootMotion.valueDescription)
+            XCTAssertGreaterThan(Int(fields["slotCount"] ?? "0") ?? 0, 0, rootMotion.valueDescription)
+            XCTAssertLessThanOrEqual(Int(fields["slotCount"] ?? "99") ?? 99, 4, rootMotion.valueDescription)
+            XCTAssertEqual(fields["sourceHidden"], "1", rootMotion.valueDescription)
+            XCTAssertEqual(fields["targetHidden"], "0", rootMotion.valueDescription)
+            XCTAssertGreaterThan(Int(fields["moveSamples"] ?? "0") ?? 0, 0, rootMotion.valueDescription)
+            XCTAssertGreaterThan(Double(fields["maxMoveSourceX"] ?? "0") ?? 0, 0.5, rootMotion.valueDescription)
+            XCTAssertGreaterThan(Double(fields["maxMoveTargetX"] ?? "0") ?? 0, 0.5, rootMotion.valueDescription)
+            XCTAssertTrue(fields["lastEndpoint"]?.contains("selected=\(rootTabID181(title))") == true, rootMotion.valueDescription)
+            let destinationTab = Int(rootTabID181(title)) ?? -1
+            let destinationToken = tokenValue181(fields["tokens"] ?? "", tab: destinationTab)
+            XCTAssertEqual(destinationToken, fields["destinationToken"], rootMotion.valueDescription)
+            if let priorToken = seenHostTokens[rootTabID181(title)] {
+                XCTAssertEqual(destinationToken, priorToken, "The retained root host token must survive later routes")
+            }
+            if let destinationToken { seenHostTokens[rootTabID181(title)] = destinationToken }
+            waitUntil("The tab handoff releases input") {
+                self.app.descendants(matching: .any)["page.interaction-lock"].valueDescription.contains("locks=0")
+            }
+            XCTAssertEqual(mainTabBar().frame, bottom)
+            for prefix in ["source", "target"] {
+                XCTAssertEqual(Double(fields[prefix + "Width"] ?? "-1") ?? -1, canvas.width, accuracy: 1)
+                XCTAssertEqual(Double(fields[prefix + "Height"] ?? "-1") ?? -1, canvas.height, accuracy: 1,
+                               "The actual canvas extends behind both floating bars")
+                XCTAssertEqual(Double(fields[prefix + "Y"] ?? "999") ?? 999, 0, accuracy: 1,
+                               "Header clearance changes do not translate the whole page vertically")
+            }
+            print("TAB181 source=\(sourceTitle);destination=\(title);" + rootMotion.valueDescription)
+        }
+        for title in ["作者榜", "搜索", "收藏", "时间线", "收藏", "搜索", "作者榜", "时间线"] {
+            transition(to: title)
             let qa = app.staticTexts["body.motion.qa"]
             print("TAB164_CURRENT title=\(title);" + qa.valueDescription)
             waitUntil("Every root tab has a completed body handoff") {
                 qa.valueDescription.contains("kind=tab") && qa.valueDescription.contains("phase=completed")
             }
             let values = heightValues(qa.valueDescription)
-            XCTAssertGreaterThan(values["frames"] ?? 0, 2, qa.valueDescription)
-            XCTAssertTrue(qa.valueDescription.contains("snapshotAvailable=1"), qa.valueDescription)
-            waitUntil("The tab handoff releases input") {
-                self.app.descendants(matching: .any)["page.interaction-lock"].valueDescription.contains("locks=0")
-            }
+            XCTAssertEqual(values["snapshotAvailable"], 0, "The root pair uses retained host views: " + qa.valueDescription)
+            XCTAssertEqual(values["targetSnapshotAvailable"], 0, "The root pair has no target page snapshot: " + qa.valueDescription)
             XCTAssertEqual(mainTabBar().frame, bottom)
-            print("TAB164_BODY title=\(title);" + qa.valueDescription)
+            print("TAB164_BODY_METADATA title=\(title);" + qa.valueDescription)
         }
+        for _ in 0..<3 { transition(to: "作者榜"); transition(to: "时间线") }
+        print("ROOT181_PIXEL_REVIEW intermediate host-pair texture continuity requires external silent screen recording; UIView transform readback is not GPU frame evidence")
     }
 
     func testEdgeReturnIdentityClearsHoldingAndHandoff165() {
@@ -3052,36 +4753,375 @@ final class ResumePromptUITests: XCTestCase {
         XCTAssertTrue(timelineTools().isHittable)
     }
 
+    func testAuthor183ReturnsAfterForegroundFromTimelineAndLeaderboard() {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-page-return", "--qa-header-motion", "-autoplay", "NO", "-muted", "YES"])
+        let authorBar = app.otherElements["creator.top-bar"]
+        let locks = app.staticTexts["page.interaction-lock"]
+        func reactivate() {
+            XCUIDevice.shared.press(.home)
+            waitUntil("The app must leave the foreground", timeout: 5) {
+                self.app.state == .runningBackground || self.app.state == .runningBackgroundSuspended
+            }
+            app.activate()
+        }
+        reactivate()
+        for fromLeaderboard in [false, true] {
+            if fromLeaderboard {
+                mainTabButton("作者榜").tap()
+                let row = app.buttons["leaderboard.author.28037001"]
+                XCTAssertTrue(row.waitForExistence(timeout: 8))
+                row.tap()
+            } else {
+                visualButton("media.author.28037100").tap()
+            }
+            XCTAssertTrue(authorBar.waitForExistence(timeout: 5))
+            XCTAssertTrue(locks.waitForValueToContain("locks=0", timeout: 3))
+            let back = authorBar.buttons["navigation.back"]
+            XCTAssertTrue(back.isHittable, "The author's Back button is reachable before reactivation")
+            reactivate()
+            print("AUTHOR183_RESUME fromLeaderboard=\(fromLeaderboard);application=\(app.state.rawValue);back=\(back.isHittable);" + locks.valueDescription)
+            XCTAssertTrue(locks.waitForValueToContain("locks=0", timeout: 3))
+            let window = app.windows.firstMatch
+            let right = fromLeaderboard
+            window.coordinate(withNormalizedOffset: CGVector(dx: right ? 0.98 : 0.02, dy: 0.48))
+                .press(forDuration: 0.05,
+                       thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: right ? 0.45 : 0.55, dy: 0.48)),
+                       withVelocity: XCUIGestureVelocity(rawValue: 180), thenHoldForDuration: 0.1)
+            XCTAssertTrue(authorBar.waitForNonExistence(timeout: 5),
+                          app.staticTexts["page.return-motion.qa"].valueDescription)
+            if fromLeaderboard { XCTAssertTrue(app.otherElements["leaderboard.top-bar"].exists) }
+            else { XCTAssertTrue(timelineTools().isHittable) }
+            XCTAssertTrue(locks.waitForValueToContain("locks=0", timeout: 3))
+            print("AUTHOR183_FOREGROUND source=\(fromLeaderboard ? "leaderboard" : "timeline");edge=\(right ? "right" : "left");" + locks.valueDescription)
+        }
+    }
+
+    func testLeaderboardAuthorAcceptsInputWhileFirstPageIsPending() {
+        assertLeaderboardAuthorAcceptsInputWhileLoading(dropPushCompletion: false)
+    }
+
+    func testLeaderboardAuthorAcceptsInputAfterMissingPushCompletion() {
+        assertLeaderboardAuthorAcceptsInputWhileLoading(dropPushCompletion: true)
+    }
+
+    private func assertLeaderboardAuthorAcceptsInputWhileLoading(dropPushCompletion: Bool) {
+        let fault = dropPushCompletion ? ["--qa-drop-native-push-completion"] : []
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-author-activity58", "--qa-author-paging176", "--qa-hold-author-first-page",
+                             "--qa-header-motion", "--qa-drag-performance167", "-muted", "YES", "-autoplay", "NO"] + fault)
+        mainTabButton("作者榜").tap()
+        let row = app.buttons["leaderboard.author.59001"]
+        let state = app.staticTexts["author176.state"]
+        let locks = app.staticTexts["page.interaction-lock"]
+        let header = app.otherElements["creator.top-bar"]
+        XCTAssertTrue(row.waitForExistence(timeout: 8))
+        XCTAssertTrue(locks.waitForValueToContain("locks=0", timeout: 3))
+        let beforeOpening = heightValues(locks.valueDescription)["acquired"]
+        row.tap()
+        XCTAssertTrue(header.waitForExistence(timeout: 5))
+        XCTAssertTrue(state.waitForValueToContain("requests=1", timeout: 5), state.valueDescription)
+        XCTAssertTrue(locks.waitForValueToContain("locks=0", timeout: 3), locks.valueDescription)
+        let afterOpening = heightValues(locks.valueDescription)["acquired"]
+        XCTAssertNotNil(beforeOpening)
+        XCTAssertEqual(afterOpening, beforeOpening, "A native push never installs an extra window-wide input shield")
+        print("AUTHOR_NATIVE_PUSH_INPUT fault=\(dropPushCompletion);before=\(beforeOpening ?? -1);after=\(afterOpening ?? -1)")
+        XCTAssertTrue(state.valueDescription.contains("committed=0"))
+        let cadence = app.staticTexts["performance.cadence172"].valueDescription
+        print("AUTHOR_ENTRY_CADENCE_186 fault=\(dropPushCompletion);cadence=" + cadence)
+        if dropPushCompletion {
+            let sample = try? JSONSerialization.jsonObject(with: Data(cadence.utf8)) as? [String: Any]
+            let cost = sample?["cost174"] as? [String: Any]
+            let totals = cost?["totals"] as? [String: [Double]]
+            XCTAssertEqual(totals?["nativeHeader.pushCompletionDropped"]?.first, 1)
+            XCTAssertEqual(totals?["nativeHeader.deadline"]?.first, 1)
+        }
+        let video = header.buttons["视频"]
+        XCTAssertTrue(video.isHittable)
+        video.tap()
+        XCTAssertTrue(state.waitForValueToContain("requests=2", timeout: 5), state.valueDescription)
+        XCTAssertTrue(video.isSelected)
+        XCTAssertTrue(locks.waitForValueToContain("locks=0", timeout: 3), locks.valueDescription)
+        XCTAssertTrue(state.valueDescription.contains("committed=0"))
+        let back = header.buttons["navigation.back"]
+        XCTAssertTrue(back.isHittable)
+        print("AUTHOR_LOADING_CAN_INTERACT fault=\(dropPushCompletion);" + state.valueDescription + ";" + locks.valueDescription)
+        back.tap()
+        XCTAssertTrue(header.waitForNonExistence(timeout: 5))
+        XCTAssertTrue(locks.waitForValueToContain("locks=0", timeout: 3))
+        XCTAssertTrue(state.valueDescription.contains("committed=0"))
+        XCTAssertTrue(row.isHittable)
+        app.buttons["leaderboard.author.59002"].tap()
+        XCTAssertTrue(header.waitForExistence(timeout: 5), "The board accepts a second author while the first request was held")
+    }
+
+    func testLeaderboardAuthorReturnRestoresTheActualList() {
+        assertLeaderboardAuthorReturn(restoringAfterDroppedCompletion: false)
+    }
+
+    func testLeaderboardAuthorReturnSurvivesMissingNativeCompletion() {
+        assertLeaderboardAuthorReturn(restoringAfterDroppedCompletion: true)
+    }
+
+    private func assertLeaderboardAuthorReturn(restoringAfterDroppedCompletion: Bool) {
+        let injected = restoringAfterDroppedCompletion ? ["--qa-drop-native-pop-completion"] : []
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-author-activity58", "--qa-page-return", "--qa-header-motion",
+                             "--qa-drag-performance167", "-muted", "YES", "-autoplay", "NO"] + injected)
+        mainTabButton("作者榜").tap()
+        let first = app.buttons["leaderboard.author.59001"]
+        let second = app.buttons["leaderboard.author.59002"]
+        let author = app.otherElements["creator.top-bar"]
+        let locks = app.staticTexts["page.interaction-lock"]
+        let cadence = app.staticTexts["performance.cadence172"]
+        guard first.waitForExistence(timeout: 8), locks.waitForValueToContain("locks=0", timeout: 3) else {
+            XCTFail("The 1,000-row author board needs to accept input before return testing")
+            return
+        }
+        let initialY = first.frame.minY
+        func edge(_ right: Bool, cancelling: Bool = false) {
+            let window = app.windows.firstMatch
+            let from = window.coordinate(withNormalizedOffset: CGVector(dx: right ? 0.98 : 0.02, dy: 0.48))
+            let to = cancelling
+                ? from.withOffset(CGVector(dx: right ? -34 : 34, dy: 0))
+                : window.coordinate(withNormalizedOffset: CGVector(dx: right ? 0.43 : 0.57, dy: 0.48))
+            from.press(forDuration: 0.05, thenDragTo: to,
+                       withVelocity: XCUIGestureVelocity(rawValue: cancelling ? 75 : 200), thenHoldForDuration: 0.12)
+        }
+        func nativeEventCount(_ name: String) -> Double {
+            guard let sample = try? JSONSerialization.jsonObject(with: Data(cadence.valueDescription.utf8)) as? [String: Any],
+                  let cost = sample["cost174"] as? [String: Any], let totals = cost["totals"] as? [String: [Double]] else { return 0 }
+            return totals[name]?.first ?? 0
+        }
+        for (index, method) in (restoringAfterDroppedCompletion ? ["button", "button"] : ["button", "left", "right"]).enumerated() {
+            first.tap()
+            XCTAssertTrue(author.waitForExistence(timeout: 5))
+            XCTAssertTrue(locks.waitForValueToContain("locks=0", timeout: 3))
+            if method == "left" {
+                let acquired = heightValues(locks.valueDescription)["acquired"]
+                XCTAssertNotNil(acquired)
+                edge(true, cancelling: true)
+                let motion = app.staticTexts["page.return-motion.qa"]
+                XCTAssertTrue(motion.waitForValueToContain("phase=cancelled", timeout: 3), motion.valueDescription)
+                XCTAssertTrue(locks.waitForValueToContain("locks=0", timeout: 3))
+                XCTAssertEqual(heightValues(locks.valueDescription)["acquired"], acquired)
+                XCTAssertTrue(author.buttons["navigation.back"].isHittable, "Cancelled gesture leaves the author operable")
+            }
+            let before = heightValues(locks.valueDescription)["acquired"]
+            XCTAssertNotNil(before)
+            if method == "button" { author.buttons["navigation.back"].tap() }
+            else { edge(method == "right") }
+            XCTAssertTrue(author.waitForNonExistence(timeout: 5), app.staticTexts["page.return-motion.qa"].valueDescription)
+            XCTAssertTrue(locks.waitForValueToContain("locks=0", timeout: 3), locks.valueDescription)
+            let after = heightValues(locks.valueDescription)["acquired"]
+            XCTAssertEqual(after, before, "Back and edge return both leave window input unshielded")
+            XCTAssertTrue(first.isHittable)
+            XCTAssertEqual(first.frame.minY, initialY, accuracy: 2)
+            if restoringAfterDroppedCompletion {
+                XCTAssertEqual(nativeEventCount("nativeHeader.popCompletionDropped"), Double(index + 1))
+                XCTAssertEqual(nativeEventCount("nativeHeader.deadline"), Double(index + 1))
+            }
+            print("LEADERBOARD_AUTHOR_RETURN method=\(method);fault=\(restoringAfterDroppedCompletion);" + locks.valueDescription + ";" + cadence.valueDescription)
+        }
+        second.tap()
+        XCTAssertTrue(author.waitForExistence(timeout: 5), "The returned ranking accepts a new row action")
+    }
+
+    func testAuthor183MissingLiveAcknowledgementDoesNotBlockInput() {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-page-return", "--qa-header-motion", "--qa-drop-author-live-ack183",
+                             "-autoplay", "NO", "-muted", "YES"])
+        visualButton("media.author.28037100").tap()
+        let authorBar = app.otherElements["creator.top-bar"]
+        XCTAssertTrue(authorBar.waitForExistence(timeout: 5))
+        let locks = app.staticTexts["page.interaction-lock"]
+        guard locks.waitForValueToContain("locks=0", timeout: 3) else {
+            XCTFail("A lost visual acknowledgement must not leave a window-wide input shield: " + locks.valueDescription)
+            return
+        }
+        let window = app.windows.firstMatch
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0.98, dy: 0.48))
+            .press(forDuration: 0.05, thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.45, dy: 0.48)),
+                   withVelocity: XCUIGestureVelocity(rawValue: 180), thenHoldForDuration: 0.1)
+        XCTAssertTrue(authorBar.waitForNonExistence(timeout: 5))
+        XCTAssertTrue(timelineTools().isHittable)
+        XCTAssertTrue(locks.waitForValueToContain("locks=0", timeout: 3))
+    }
+
+    func testEdgeReturnWithoutPlatformReceiptRestoresSourceInput() {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-page-return", "--qa-header-motion", "--qa-drop-edge-return-action",
+                             "-autoplay", "NO", "-muted", "YES"])
+        visualButton("media.author.28037100").tap()
+        let authorBar = app.otherElements["creator.top-bar"]
+        XCTAssertTrue(authorBar.waitForExistence(timeout: 5))
+        let locks = app.staticTexts["page.interaction-lock"]
+        XCTAssertTrue(locks.waitForValueToContain("locks=0", timeout: 3))
+        let window = app.windows.firstMatch
+        func dragBack() {
+            window.coordinate(withNormalizedOffset: CGVector(dx: 0.98, dy: 0.48))
+                .press(forDuration: 0.05, thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.45, dy: 0.48)),
+                       withVelocity: XCUIGestureVelocity(rawValue: 180), thenHoldForDuration: 0.1)
+        }
+        dragBack()
+        let motion = app.staticTexts["page.return-motion.qa"]
+        XCTAssertTrue(motion.waitForValueToContain("return-navigation-receipt-timeout", timeout: 6),
+                      motion.valueDescription)
+        XCTAssertTrue(motion.valueDescription.contains("navigationOutcome=pending"))
+        XCTAssertTrue(locks.waitForValueToContain("locks=0", timeout: 3), locks.valueDescription)
+        XCTAssertTrue(authorBar.buttons["navigation.back"].isHittable)
+        dragBack()
+        XCTAssertTrue(authorBar.waitForNonExistence(timeout: 5), motion.valueDescription)
+        XCTAssertTrue(timelineTools().isHittable)
+        XCTAssertTrue(locks.waitForValueToContain("locks=0", timeout: 3))
+    }
+
+    func testEdgeReturnAwaitingPlatformReceiptYieldsToFirstBottomTabTap() throws {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-page-return", "--qa-header-motion", "--qa-drop-edge-return-action",
+                             "--qa-hold-edge-navigation-receipt", "-autoplay", "NO", "-muted", "YES"])
+        visualButton("media.author.28037100").tap()
+        let back = app.otherElements["creator.top-bar"].buttons["navigation.back"]
+        let locks = app.staticTexts["page.interaction-lock"]
+        let search = mainTabButton("搜索")
+        waitUntil("The author and bottom tab are actionable before the edge gesture") {
+            back.isHittable && search.isHittable && locks.valueDescription.contains("locks=0")
+        }
+        let target = search.frame
+        let window = app.windows.firstMatch
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0.98, dy: 0.48))
+            .press(forDuration: 0.05, thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.45, dy: 0.48)),
+                   withVelocity: XCUIGestureVelocity(rawValue: 180), thenHoldForDuration: 0.1)
+        let motion = app.staticTexts["page.return-motion.qa"]
+        XCTAssertTrue(motion.waitForValueToContain("event=return-action-dropped", timeout: 3), motion.valueDescription)
+        let pending = rootMotionFields181(motion.valueDescription)
+        XCTAssertEqual(pending["phase"], "awaitingDisappearance")
+        XCTAssertEqual(pending["navigationOutcome"], "pending")
+        XCTAssertEqual(pending["globalBlocked"], "false")
+        let receipt = try XCTUnwrap(pending["receipt"])
+
+        tapScreenFrame(target)
+        let field = app.textFields["search-title-input"]
+        waitUntil("The first tab tap switches to Search before the pending return deadline", timeout: 4) {
+            search.isSelected && field.isHittable && locks.valueDescription.contains("locks=0")
+        }
+        let superseded = rootMotionFields181(motion.valueDescription)
+        XCTAssertEqual(superseded["receipt"], receipt)
+        XCTAssertEqual(superseded["reason"], "return-visual-superseded")
+        XCTAssertEqual(superseded["navigationOutcome"], "pending")
+
+        let elapsed = expectation(description: "The six-second return receipt deadline passes")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6.2) { elapsed.fulfill() }
+        wait(for: [elapsed], timeout: 8)
+        XCTAssertTrue(search.isSelected)
+        XCTAssertTrue(field.isHittable)
+        XCTAssertEqual(rootMotionFields181(motion.valueDescription)["reason"], "return-visual-superseded")
+        field.tap()
+        field.typeText("new tab")
+        XCTAssertEqual(field.value as? String, "new tab")
+    }
+
+    func testCommittedEdgeReturnHandoffYieldsFirstBackToDestination() throws {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-page-return", "--qa-header-motion", "--qa-hold-committed-edge-handoff",
+                             "-autoplay", "NO", "-muted", "YES"])
+        openAccountSettings()
+        let settings = floatingPageTitle("账号与设置")
+        let targetBack = settings.buttons["navigation.back"]
+        let downloads = app.buttons["settings.downloads"]
+        waitUntil("Account settings is ready before opening download settings") {
+            targetBack.isHittable && downloads.isHittable
+        }
+        let targetFrame = targetBack.frame
+        tapAboveMainBar(downloads)
+        let source = floatingPageTitle("下载设置")
+        waitUntil("Download settings is the current page") {
+            source.buttons["navigation.back"].isHittable && self.app.switches["downloads.wifi-only"].isHittable
+        }
+
+        let window = app.windows.firstMatch
+        let edge = window.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: 0.52))
+        edge.press(forDuration: 0.05,
+                   thenDragTo: edge.withOffset(CGVector(dx: window.frame.width * 0.45, dy: 0)),
+                   withVelocity: XCUIGestureVelocity(rawValue: 180), thenHoldForDuration: 0.1)
+        let motion = app.staticTexts["page.return-motion.qa"]
+        XCTAssertTrue(motion.waitForValueToContain("event=committed-handoff-held", timeout: 5), motion.valueDescription)
+        let committed = rootMotionFields181(motion.valueDescription)
+        XCTAssertEqual(committed["phase"], "revealing")
+        XCTAssertEqual(committed["navigationOutcome"], "committed")
+        XCTAssertEqual(committed["visualOutcome"], "pending")
+        XCTAssertEqual(committed["globalBlocked"], "false")
+        XCTAssertFalse(source.exists)
+        let receipt = try XCTUnwrap(committed["receipt"])
+
+        tapScreenFrame(targetFrame)
+        let account = app.buttons["timeline.account"]
+        waitUntil("The first Back tap during handoff returns from account settings to the timeline", timeout: 4) {
+            account.isHittable && !settings.exists
+        }
+        let superseded = rootMotionFields181(motion.valueDescription)
+        XCTAssertEqual(superseded["receipt"], receipt)
+        XCTAssertEqual(superseded["navigationOutcome"], "committed")
+        XCTAssertEqual(superseded["reason"], "return-visual-superseded")
+
+        account.tap()
+        waitUntil("A fresh account settings route is live before the old handoff resumes", timeout: 4) {
+            targetBack.isHittable && downloads.isHittable
+        }
+        XCTAssertFalse(motion.valueDescription.contains("lateCommittedHandoffRejected=true"))
+        XCTAssertTrue(motion.waitForValueToContain("lateCommittedHandoffRejected=true", timeout: 9), motion.valueDescription)
+        let late = rootMotionFields181(motion.valueDescription)
+        XCTAssertEqual(late["receipt"], receipt)
+        XCTAssertEqual(late["navigationOutcome"], "committed")
+        XCTAssertEqual(late["reason"], "return-visual-superseded")
+        XCTAssertTrue(targetBack.isHittable && downloads.isHittable)
+    }
+
     func testAuthorDragAndButtonReturnHandoff164() {
         visualLaunch(width: 0, large: false, landscape: false,
                      extra: ["--qa-page-return", "--qa-header-motion", "-autoplay", "NO", "-muted", "YES"])
         let bottom = mainTabBar().frame
         let window = app.windows.firstMatch
+        let timeline = timelineTools()
+        let header = app.otherElements.matching(identifier: "creator.top-bar").firstMatch
+        let back = header.buttons.matching(identifier: "navigation.back").firstMatch
+        let motion = app.staticTexts.matching(identifier: "page.return-motion.qa").firstMatch
+        let locks = app.staticTexts["page.interaction-lock"]
         for video in [false, true] {
             app.otherElements["timeline.media-kind"].buttons[video ? "视频" : "图片"].tap()
             let id = video ? 28_037_102 : 28_037_100
             waitUntil("The requested work is visible") { self.watchFocus() == id }
             for edge in [0, 1, 2] {
                 visualButton("media.author.\(id)").tap()
-                let header = app.descendants(matching: .any)["creator.top-bar"]
-                XCTAssertTrue(header.waitForExistence(timeout: 5))
+                let label = "AUTHOR164 video=\(video);edge=\(edge)"
+                waitUntil("The active author page accepts input before returning", timeout: 5,
+                          onTimeout: { _ = self.logAuthorReturnMotion(label + ";entry-timeout", motion) }) {
+                    back.isHittable && locks.valueDescription.contains("locks=0")
+                }
                 if edge > 0 {
                     window.coordinate(withNormalizedOffset: CGVector(dx: edge == 1 ? 0.98 : 0.02, dy: 0.48))
                         .press(forDuration: 0.05,
                                thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: edge == 1 ? 0.45 : 0.55, dy: 0.48)),
                                withVelocity: XCUIGestureVelocity(rawValue: 180), thenHoldForDuration: 0.1)
-                } else { header.buttons["navigation.back"].tap() }
-                XCTAssertTrue(header.waitForNonExistence(timeout: 5))
-                XCTAssertTrue(timelineTools().isHittable)
+                    _ = logAuthorReturnMotion(label + ";post-drag", motion)
+                } else { back.tap() }
+                waitUntil("Return restores input to the real timeline", timeout: 5, onTimeout: {
+                    _ = self.logAuthorReturnMotion(label + ";return-timeout", motion)
+                    print("\(label);authorHeaderExists=\(header.exists);authorBackHittable=\(back.isHittable);timelineHittable=\(timeline.isHittable);\(locks.valueDescription)")
+                }) {
+                    timeline.isHittable && !back.isHittable && locks.valueDescription.contains("locks=0")
+                }
+                if edge > 0 {
+                    let state = logAuthorReturnMotion(label + ";returned", motion)
+                    XCTAssertTrue(state.contains("navigationOutcome=committed") && state.contains("phase=completed"), state)
+                    XCTAssertTrue(state.contains("sharedHeader=true"), "Same-geometry author return must actually use the shared chrome progress: " + state)
+                    XCTAssertTrue(state.contains("footerProtected=true"), "The accepted return must own its fixed footer until the live handoff: " + state)
+                    if video {
+                        XCTAssertTrue(state.contains("mediaCanvasProtected=true"), "Media return must own captured playback pixels across the complete window: " + state)
+                    }
+                }
                 XCTAssertEqual(mainTabBar().frame, bottom)
                 XCTAssertEqual(watchFocus(), id)
-                if edge > 0 {
-                    let qa = app.descendants(matching: .any)["page.return-motion.qa"]
-                    XCTAssertTrue(qa.valueDescription.contains("sharedHeader=true"), "Same-geometry author return must actually use the shared chrome progress: " + qa.valueDescription)
-                    XCTAssertTrue(qa.valueDescription.contains("footerProtected=true"), "The accepted return must own its fixed footer until the live handoff: " + qa.valueDescription)
-                    if video { XCTAssertTrue(qa.valueDescription.contains("mediaBand=true"), "Media return must own its under-header canvas: " + qa.valueDescription) }
-                    print("AUTHOR164_RETURN video=\(video);edge=\(edge);" + qa.valueDescription)
-                }
                 attachScreenshot(named: "author164-return-\(video ? "video" : "image")-\(edge == 0 ? "button" : edge == 1 ? "right" : "left")")
             }
         }
@@ -3180,6 +5220,93 @@ final class ResumePromptUITests: XCTestCase {
         attachEdgeTrace("upper-video-wrap")
         waitUntil("Dragging right from following wraps to recommendation") { source.buttons["推荐"].isSelected }
         XCTAssertTrue(media.buttons["图片"].isSelected, "Each source keeps its media selection")
+    }
+
+    func testTimelineKeepsWarmCoverUntilOriginalArrives() throws {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-timeline-cover-handoff", "--qa-pager-touch-trace",
+                             "-wifiVideoPrefetch", "NO", "-muted", "YES", "-autoplay", "NO"])
+        let picker = app.otherElements["timeline.media-kind"]
+        picker.buttons["视频"].tap()
+        waitUntil("Video is active before dragging to the neighboring image") {
+            picker.buttons["视频"].isSelected && self.watchFocus() == 28_037_102
+        }
+
+        let window = app.windows.firstMatch
+        let edge = window.coordinate(withNormalizedOffset: CGVector(dx: 0.98, dy: 0.69))
+        edge.press(forDuration: 0.05,
+                   thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.23, dy: 0.69)),
+                   withVelocity: XCUIGestureVelocity(rawValue: 230), thenHoldForDuration: 0.12)
+        let motion = app.staticTexts["timeline.page-motion.qa"]
+        waitUntil("The edge preview has been removed and the real image is focused") {
+            picker.buttons["图片"].isSelected && self.watchFocus() == 28_037_100
+                && motion.valueDescription.contains("phase=completed")
+        }
+
+        let center = CGRect(x: window.frame.midX - 8, y: window.frame.midY - 8, width: 16, height: 16)
+        let pending = try XCTUnwrap(floating45MeanRGB(captureChromePixels(named: "timeline-cover-handoff-original-held"), in: center))
+        XCTAssertGreaterThan(pending[0], pending[1] + 40, "The real page should show the warmed purple image while the blue original waits. RGB \(pending)")
+        XCTAssertGreaterThan(pending[2], pending[1] + 80, "The purple cover should be visible past the animation. RGB \(pending)")
+        XCTAssertTrue(app.staticTexts["media.qa.parent-ready"].valueDescription.contains("ready=false"))
+
+        let page = app.descendants(matching: .any)["media-page-28037100"].firstMatch
+        page.swipeUp()
+        waitUntil("The next image takes focus while the previous original is still held") {
+            self.watchFocus() == 28_037_101 && self.app.staticTexts["media.qa.parent-ready"].valueDescription.contains("ready=true")
+        }
+        let advanced = try XCTUnwrap(floating45MeanRGB(captureChromePixels(named: "timeline-cover-handoff-next-work"), in: center))
+        XCTAssertGreaterThan(advanced[1], advanced[0] + 70, "The next work must show its own green original. RGB \(advanced)")
+        app.descendants(matching: .any)["media-page-28037101"].firstMatch.swipeDown()
+        waitUntil("The prior image is still waiting for its original") {
+            self.watchFocus() == 28_037_100 && self.app.staticTexts["media.qa.parent-ready"].valueDescription.contains("ready=false")
+        }
+
+        app.buttons["timeline-cover.qa.release"].tap()
+        waitUntil("The original now qualifies as ready") {
+            self.watchFocus() == 28_037_100 && self.app.staticTexts["media.qa.parent-ready"].valueDescription.contains("ready=true")
+        }
+        let original = try XCTUnwrap(floating45MeanRGB(captureChromePixels(named: "timeline-cover-handoff-original-ready"), in: center))
+        XCTAssertGreaterThan(original[2], original[0] + 120, "The loaded blue original should replace the purple cover. RGB \(original)")
+        print("TIMELINE_COVER_HANDOFF held=\(pending) next=\(advanced) original=\(original)")
+    }
+
+    func testTimelineMissingSettlementReleasesInputForNextSwitch() {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-drop-timeline-settlement", "--qa-pager-touch-trace",
+                             "--qa-header-motion", "-muted", "YES", "-autoplay", "NO"])
+        let source = app.otherElements["timeline.source"]
+        let media = app.otherElements["timeline.media-kind"]
+        let motion = app.staticTexts["timeline.page-motion.qa"]
+        let locks = app.staticTexts["page.interaction-lock"]
+        var previousFlight: String?
+        func verifyRecovered() {
+            func flightID() -> String? {
+                motion.valueDescription.split(separator: ";").first(where: { $0.hasPrefix("flight=") }).map(String.init)
+            }
+            waitUntil("This timeline action recovers from its own missing callback", timeout: 4) {
+                motion.valueDescription.contains("reason=settlement-timeout") && flightID() != nil && flightID() != previousFlight
+            }
+            previousFlight = flightID()
+            XCTAssertTrue(motion.valueDescription.contains("phase=completed"), motion.valueDescription)
+            XCTAssertTrue(locks.waitForValueToContain("locks=0", timeout: 3), locks.valueDescription)
+            print("TIMELINE_SETTLEMENT_RECOVERY " + motion.valueDescription + ";" + locks.valueDescription)
+        }
+        media.buttons["视频"].tap()
+        verifyRecovered()
+        XCTAssertTrue(media.buttons["视频"].isSelected)
+
+        let window = app.windows.firstMatch
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0.98, dy: 0.34))
+            .press(forDuration: 0.05,
+                   thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.44, dy: 0.34)),
+                   withVelocity: XCUIGestureVelocity(rawValue: 180), thenHoldForDuration: 0.15)
+        verifyRecovered()
+        XCTAssertTrue(source.buttons["关注"].isSelected)
+        mainTabButton("作者榜").tap()
+        XCTAssertTrue(app.otherElements["leaderboard.top-bar"].waitForExistence(timeout: 5))
+        XCTAssertTrue(locks.waitForValueToContain("locks=0", timeout: 3))
+        mainTabButton("时间线").tap()
+        waitUntil("The live timeline can still be entered") { source.buttons["关注"].isHittable }
     }
 
     func testTimelineFirstPageStopsAtTheBeginning() {
@@ -4029,6 +6156,28 @@ final class ResumePromptUITests: XCTestCase {
         }
     }
 
+    func testPerformance175OwnedProfilerWindow() {
+        app = XCUIApplication()
+        app.launchArguments = ["--qa-collection-paging", "--qa-author-activity58", "--qa-drag-performance167",
+                               "-app.appearance", "light", "-muted", "YES", "-autoplay", "NO"]
+        app.launch()
+        mainTabButton("作者榜").tap()
+        waitUntil("Ranking is loaded before the diagnostic recording") {
+            self.app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "leaderboard.author."))
+                .allElementsBoundByIndex.prefix(48).contains { $0.isHittable }
+        }
+        print("PERF175_PROFILE_READY epoch=\(Date().timeIntervalSince1970)")
+        // Diagnostic attachment and symbol-loading window, not app latency.
+        Thread.sleep(forTimeInterval: 30)
+        Thread.sleep(forTimeInterval: 30)
+        runSustainedDragProfilerRound167(round: 1, window: app.windows.firstMatch,
+                                        picker: app.otherElements["leaderboard.board"])
+        print("PERF175_PROFILE_ACTIONS_END epoch=\(Date().timeIntervalSince1970)")
+        // Keep the exact app process alive until recorder finalisation.
+        for _ in 0..<3 { Thread.sleep(forTimeInterval: 30) }
+        app.terminate()
+    }
+
     func testContinuousDragPerformanceWorkload167() {
         app = XCUIApplication()
         app.launchArguments = ["--qa-collection-paging", "--qa-author-activity58", "--qa-drag-performance167", "-app.appearance", "light",
@@ -4085,13 +6234,21 @@ final class ResumePromptUITests: XCTestCase {
     }
 
     func testSustainedDragProfilerWindow167() { runSustainedDragWorkload172(eagerAuthors: false) }
+    func testSustainedDragIdleMountControl178() { runSustainedDragWorkload172(eagerAuthors: false, controlIdleMount: true) }
     func testSustainedDragEagerAuthors172() { runSustainedDragWorkload172(eagerAuthors: true) }
 
-    private func runSustainedDragWorkload172(eagerAuthors: Bool) {
+    func testSustainedDragLiveToneControl175() { runSustainedDragWorkload172(eagerAuthors: false, controlLiveTone: true) }
+
+    func testSustainedDragLayoutPlanControl175() { runSustainedDragWorkload172(eagerAuthors: false, controlLayoutPlan: true) }
+
+    private func runSustainedDragWorkload172(eagerAuthors: Bool, controlLiveTone: Bool = false, controlLayoutPlan: Bool = false, controlIdleMount: Bool = false) {
         app = XCUIApplication()
         app.launchArguments = ["--qa-collection-paging", "--qa-author-activity58", "--qa-drag-performance167", "-app.appearance", "light",
                                "-muted", "YES", "-autoplay", "NO"]
         if eagerAuthors { app.launchArguments.append("--qa-eager-authors172") }
+        if controlLiveTone { app.launchArguments.append("--qa-root-live-tone-control175") }
+        if controlLayoutPlan { app.launchArguments.append("--qa-root-layout-plan-control175") }
+        if controlIdleMount { app.launchArguments.append("--qa-root-idle-control178") }
         print("CADENCE172_MODE eager=\(eagerAuthors)")
         XCUIDevice.shared.orientation = .portrait
         app.launch()
@@ -4156,9 +6313,12 @@ final class ResumePromptUITests: XCTestCase {
         if cadence.exists { print("CADENCE172 round=\(round);sample=\(cadence.valueDescription)") }
     }
 
-    func testLoadedLeaderboardToSearchRemainsResponsive() {
+    func testLoadedLeaderboardToSearchRemainsResponsive() { assertLoadedLeaderboardToSearch175() }
+    func testWarmLayout175MismatchReplansWithoutChangingState() { assertLoadedLeaderboardToSearch175(injectStaleLayout: true) }
+    private func assertLoadedLeaderboardToSearch175(injectStaleLayout: Bool = false) {
         app = XCUIApplication()
         app.launchArguments = ["--qa-collection-paging", "--qa-author-activity58", "--qa-transition-performance", "--qa-header-motion", "-app.appearance", "light", "-muted", "YES"]
+        if injectStaleLayout { app.launchArguments += ["--qa-root-layout-mismatch175", "--qa-drag-performance167"] }
         app.launch()
         let authors = mainTabButton("作者榜"), search = mainTabButton("搜索")
         for round in 1...3 {
@@ -4184,19 +6344,90 @@ final class ResumePromptUITests: XCTestCase {
             field.tap(); field.typeText("test")
             XCTAssertEqual(field.value as? String, "test")
             app.buttons["search.clear"].tap()
-            app.buttons["main.tab.3"].tap()
+            let collection = mainTabButton("收藏")
+            // The synthesized-event archive showed XCTest reusing the prior
+            // ranking snapshot (y=816) after the live footer moved above the
+            // keyboard. Resolve the live scoped element and validate its
+            // visible hit rectangle before sending a physical touch.
+            waitUntil("The live search footer is above the keyboard and unlocked") {
+                let keyboard = self.app.keyboards.firstMatch
+                let frame = collection.frame
+                return self.mainTabButton("搜索").isSelected && collection.isHittable
+                    && frame.width >= 44 && frame.height >= 44
+                    && (!keyboard.exists || frame.maxY <= keyboard.frame.minY + 1)
+                    && self.app.staticTexts["page.interaction-lock"].valueDescription.contains("locks=0")
+            }
+            let hit = collection.frame
+            print("LEADERBOARD_COLLECTION_HIT round=\(round);frame=\(hit);keyboard=\(app.keyboards.firstMatch.frame)")
+            app.windows.firstMatch.coordinate(withNormalizedOffset: .zero)
+                .withOffset(CGVector(dx: hit.midX, dy: hit.midY)).tap()
             waitUntil("Collection navigation settles before another root action") {
                 self.mainTabButton("收藏").isSelected
                     && self.app.staticTexts["page.interaction-lock"].valueDescription.contains("locks=0")
             }
             XCTAssertFalse(app.keyboards.firstMatch.exists, "A hidden search page cannot retain its keyboard")
         }
+        if injectStaleLayout {
+            let raw = app.staticTexts["performance.cadence172"].valueDescription.data(using: .utf8) ?? Data()
+            let value = (try? JSONSerialization.jsonObject(with: raw)) as? [String: Any]
+            let costs = value?["cost174"] as? [String: Any]
+            let totals = costs?["totals"] as? [String: Any]
+            let rejected = (totals?["warmLayoutRejected175"] as? [NSNumber])?.first?.intValue ?? 0
+            print("WARM175_STALE_REPLAN_COUNT \(rejected)")
+            XCTAssertGreaterThan(rejected, 0, "Stale metadata must take the guarded replan path before staging")
+        }
         app.terminate()
     }
 
-    func testVideoDetailsReturnUsesCachedPreviewAndKeepsChrome() {
+    func testDetails175TagRevealHasVisibleIntermediateFrames() { assertDetailsReveal175(late: false) }
+    func testDetails175LateTagsRevealAfterEntry() { assertDetailsReveal175(late: true) }
+    private func assertDetailsReveal175(late: Bool) {
+        var options = ["--qa-details-tags", "--qa-details-reveal175", "--qa-body-motion", "-muted", "YES", "-autoplay", "NO"]
+        if late { options += ["--qa-details-reveal175-late", "--qa-details-input-tags-unknown175"] }
         visualLaunch(width: 0, large: false, landscape: false,
-                     extra: ["--qa-page-return", "--qa-details-tags", "-muted", "YES", "-autoplay", "YES"])
+                     extra: options)
+        visualButton("media.details.28037100").tap()
+        let probe = app.staticTexts["details.reveal175.28037100"]
+        XCTAssertTrue(probe.waitForExistence(timeout: 8))
+        let value = probe.valueDescription
+        print("DETAILS175_VISIBLE_REVEAL " + value)
+        attachScreenshot(named: "details175-reveal-settled")
+        XCTAssertGreaterThan(heightValues(value)["visible"] ?? 0, 0, "Tag expansion must have visible intermediate frames after entry pixels release")
+        XCTAssertEqual(heightValues(value)["covered"] ?? 0, 0, "The expansion cannot finish behind a frozen entry snapshot")
+        app.terminate()
+    }
+
+    func testVideoDetailsReturnUsesCachedPreviewAndKeepsChrome() { assertVideoDetailsReturn175(primeOtherRoots: false) }
+    func testVideo175ReturnUsesActiveRootPreview() { assertVideoDetailsReturn175(primeOtherRoots: true) }
+    private func assertVideoDetailsReturn175(primeOtherRoots: Bool) {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-page-return", "--qa-details-tags", "--qa-drag-performance167", "--qa-header-motion", "-muted", "YES", "-autoplay", "YES"])
+        if primeOtherRoots {
+            func idle() {
+                waitUntil("The root and its return pixels release input") {
+                    self.app.staticTexts["page.interaction-lock"].valueDescription.contains("locks=0")
+                }
+            }
+            mainTabButton("收藏").tap(); idle()
+            let downloads = app.buttons["collections.downloads"].firstMatch
+            waitUntil("The collection exposes its download page") { downloads.isHittable }
+            downloads.tap()
+            let back = floatingPageTitle("下载管理").buttons["navigation.back"]
+            XCTAssertTrue(back.waitForExistence(timeout: 5)); idle()
+            back.tap(); idle()
+            mainTabButton("搜索").tap(); idle()
+            let picker = app.buttons["search-author-picker"]
+            waitUntil("Search exposes its author picker") { picker.isHittable }
+            picker.tap()
+            let field = app.textFields["author-picker.input"]
+            XCTAssertTrue(field.waitForExistence(timeout: 5)); idle()
+            let window = app.windows.firstMatch
+            let edge = window.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: 0.5))
+            edge.press(forDuration: 0.05, thenDragTo: edge.withOffset(CGVector(dx: 200, dy: 0)),
+                       withVelocity: XCUIGestureVelocity(rawValue: 180), thenHoldForDuration: 0.1)
+            XCTAssertTrue(field.waitForNonExistence(timeout: 5)); idle()
+            mainTabButton("时间线").tap(); idle()
+        }
         app.otherElements["timeline.media-kind"].buttons["视频"].tap()
         let details = visualButton("media.details.28037102")
         waitUntil("Video details are ready on the active video") { details.isHittable }
@@ -4213,14 +6444,52 @@ final class ResumePromptUITests: XCTestCase {
                     withVelocity: XCUIGestureVelocity(rawValue: 180), thenHoldForDuration: 1.5)
         XCTAssertTrue(header.waitForNonExistence(timeout: 5))
         let qa = app.descendants(matching: .any)["page.return-motion.qa"]
-        waitUntil("Video return completes and clears the source mask") { qa.valueDescription.contains("phase=completed") }
+        waitUntil("Video return completes and clears the source mask") {
+            let value = qa.valueDescription
+            print("VIDEO175_RETURN_STATE " + value)
+            print("VIDEO175_RETURN_COST " + self.app.staticTexts["performance.cadence172"].valueDescription)
+            return value.contains("phase=completed")
+        }
         XCTAssertTrue(qa.valueDescription.contains("previewKind=cached"), qa.valueDescription)
+        XCTAssertTrue(qa.valueDescription.contains("sharedHeader=true"), "The completed return uses the coordinated shared header")
         XCTAssertTrue(qa.valueDescription.contains("sourceMasked=false"))
         XCTAssertGreaterThanOrEqual(heightValues(qa.valueDescription)["minY"] ?? 0, top.maxY - 1)
         XCTAssertLessThanOrEqual(heightValues(qa.valueDescription)["maxY"] ?? 9999, bottom.minY + 1)
         XCTAssertEqual(mainTabBar().frame, bottom)
         waitUntil("Playback details become usable after the return") { details.isHittable }
         attachScreenshot(named: "video-return-after-details")
+        print("EDGE175_COST " + app.staticTexts["performance.cadence172"].valueDescription)
+        app.terminate()
+    }
+
+    func testOpenSource181SeparatesComponentAndFullLicense() {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-header-motion", "--qa-body-motion", "-muted", "YES", "-autoplay", "NO"])
+        openAccountSettings()
+        tapAboveMainBar(app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "开源组件")).firstMatch)
+        let component = floatingPageTitle("开源组件")
+        XCTAssertTrue(component.waitForExistence(timeout: 5))
+        let bottom = mainTabBar().frame
+        let website = app.descendants(matching: .any)["opensource.ffmpeg-website"]
+        XCTAssertTrue(website.isHittable)
+        let fullText = app.staticTexts["opensource.ffmpeg-license-text"]
+        XCTAssertFalse(fullText.exists, "The component page does not lay out the long license body")
+        app.buttons["opensource.ffmpeg-license"].tap()
+        XCTAssertTrue(floatingPageTitle("FFmpeg 许可证").waitForExistence(timeout: 5))
+        XCTAssertTrue(fullText.waitForExistence(timeout: 5))
+        let text = fullText.label
+        XCTAssertGreaterThan(text.utf8.count, 25000, "The bundled license is available without truncation")
+        XCTAssertTrue(text.contains("END OF TERMS AND CONDITIONS"))
+        XCTAssertEqual(mainTabBar().frame, bottom)
+        let window = app.windows.firstMatch
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0.98, dy: 0.5))
+            .press(forDuration: 0.05, thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.30, dy: 0.5)),
+                   withVelocity: XCUIGestureVelocity(rawValue: 180), thenHoldForDuration: 0.1)
+        waitUntil("The license returns to its original component page") {
+            component.isHittable && website.isHittable
+        }
+        XCTAssertEqual(mainTabBar().frame, bottom)
+        attachScreenshot(named: "opensource181-component-directory")
         app.terminate()
     }
 
@@ -4671,6 +6940,108 @@ final class ResumePromptUITests: XCTestCase {
         attachScreenshot(named: "buffer62-paused-large-type-without-spinner")
         app.terminate()
     }
+    func testStartup177AutoplayDoesNotPresentPausedWhilePreparing() {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-startup-held177", "-autoplay", "YES", "-muted", "YES"])
+        app.otherElements["timeline.media-kind"].buttons["视频"].tap()
+        waitUntil("The actual player preparation is held before it can bind a player") { self.playerFields()["startupHeld177"] == "true" }
+        let held = playerFields()
+        print("STARTUP177 held=\(held)")
+        attachScreenshot(named: "startup177-before-preparation-finishes")
+        XCTAssertEqual(held["pausedHUD"], "false", "Autoplay preparation must never impersonate a user pause")
+        app.buttons["media.qa.finish-prepare177"].tap()
+        waitPlayingFixture()
+        XCTAssertEqual(playerFields()["pausedHUD"], "false")
+    }
+
+    func testStartup177PauseDuringPreparationChangesIntent() {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-startup-held177", "-autoplay", "YES", "-muted", "YES"])
+        app.otherElements["timeline.media-kind"].buttons["视频"].tap()
+        waitUntil("Preparation is held while autoplay is requested") { self.playerFields()["startupHeld177"] == "true" }
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.45)).tap()
+        waitUntil("A tap reverses autoplay intent even before the native player exists") {
+            self.playerFields()["wantsPlayback"] == "false"
+        }
+        app.buttons["media.qa.finish-prepare177"].tap()
+        waitUntil("The paused native player has a drawable frame") { self.playerFields()["nativeVisible"] == "true" }
+        let paused = playerFields()
+        XCTAssertEqual(paused["intent"], "false"); XCTAssertEqual(paused["pausedHUD"], "true")
+        XCTAssertEqual(paused["rate"], "0.0"); XCTAssertEqual(paused["muted"], "true")
+        print("STARTUP177 explicit-pause=\(paused)")
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.45)).tap()
+        waitPlayingFixture()
+        XCTAssertEqual(playerFields()["pausedHUD"], "false")
+    }
+
+    func testStartup177NativePrerollDoesNotRevealPausedFrame() {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-native-start-held177", "-autoplay", "YES", "-muted", "YES"])
+        app.otherElements["timeline.media-kind"].buttons["视频"].tap()
+        waitUntil("The actual native layer is ready but its transport remains paused") {
+            let state = self.playerFields()
+            return state["ready"] == "true" && state["layerReady"] == "true" && state["timeStatus"] == "0"
+        }
+        let before = playerFields()
+        XCTAssertEqual(before["nativeVisible"], "false")
+        XCTAssertEqual(before["pausedHUD"], "false")
+        XCTAssertEqual(before["preview177"], "poster")
+        print("STARTUP177 native-held=\(before)")
+        attachScreenshot(named: "startup177-native-preroll-keeps-cover")
+        app.buttons["media.qa.native-start177"].tap()
+        waitPlayingFixture()
+        waitUntil("Native playback replaces the cover after it really starts") { self.playerFields()["nativeVisible"] == "true" }
+        XCTAssertEqual(playerFields()["posterMode"], "hidden")
+        XCTAssertEqual(playerFields()["player"], before["player"])
+        XCTAssertEqual(playerFields()["created"], before["created"])
+    }
+
+    func testStartup177LateWarmFrameKeepsAlreadyVisibleCover() {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-buffering62", "--qa-neighbor-first-frame", "--qa-late-transition177", "-autoplay", "YES", "-muted", "YES"])
+        app.otherElements["timeline.media-kind"].buttons["视频"].tap()
+        waitPlayingFixture()
+        XCTAssertTrue(app.staticTexts["media.qa.transition-frames"].waitForValueToContain("frames=1", timeout: 8))
+        heightDeck().swipeUp()
+        waitUntil("The next work displays its cover while a warm image is held back") {
+            let state = self.playerFields()
+            return self.watchFocus() == 28_037_104 && state["preview177"] == "poster" && state["lateTransition177"] == "false"
+        }
+        let before = playerFields()
+        app.buttons["media.qa.release-warm177"].tap()
+        waitUntil("The decoded neighbor frame arrives after the existing cover") { self.playerFields()["lateTransition177"] == "true" }
+        let after = playerFields()
+        XCTAssertEqual(after["preview177"], "poster", "An already visible valid cover must not swap to a late warm frame")
+        XCTAssertEqual(after["transitionFrame"], "false"); XCTAssertEqual(after["nativeVisible"], "false")
+        XCTAssertEqual(after["pausedHUD"], "false"); XCTAssertEqual(after["player"], before["player"])
+        print("STARTUP177 late-warm before=\(before);after=\(after)")
+        attachScreenshot(named: "startup177-late-warm-keeps-existing-cover")
+        app.buttons["media.qa.buffering-toggle"].tap()
+        waitPlayingFixture()
+        waitUntil("The same native player replaces the retained cover") { self.playerFields()["nativeVisible"] == "true" }
+        XCTAssertEqual(playerFields()["posterMode"], "hidden")
+    }
+
+    func testPoster177SameSourceRefreshKeepsExistingImage() {
+        app = XCUIApplication()
+        app.launchArguments = ["--qa-collection-paging", "--qa-playback-diagnostics43=poster-stream49",
+                               "--qa-poster-details50", "--qa-cover-refresh177", "-muted", "YES"]
+        app.launch()
+        let poster = app.descendants(matching: .any)["details.preview"].descendants(matching: .any)["poster.qa.146087479"]
+        XCTAssertTrue(poster.waitForValueToContain("state=ready", timeout: 15))
+        let producer = app.buttons["poster.qa.generate51"]
+        producer.tap()
+        waitUntil("The real cache producer confirms a completed write", timeout: 10) { producer.valueDescription == "written" }
+        print("POSTER177 producer=\(producer.valueDescription)")
+        XCTAssertTrue(poster.waitForValueToContain("refreshing177=true", timeout: 5))
+        print("POSTER177 refreshing=\(poster.valueDescription)")
+        attachScreenshot(named: "poster177-during-same-source-refresh")
+        XCTAssertTrue(poster.valueDescription.contains("state=ready"), "A same-source refresh must keep the already decoded frame visible")
+        app.buttons["poster.qa.release177.146087479"].tap()
+        XCTAssertTrue(poster.waitForValueToContain("refreshing177=false", timeout: 5))
+        XCTAssertTrue(poster.valueDescription.contains("state=ready"))
+    }
+
     func testAutoplayUsesCoverOnlyWhileFirstFrameIsLate() {
         visualLaunch(width: 0, large: false, landscape: false,
                      extra: ["--qa-buffering62", "--qa-first-frame-poster", "-autoplay", "YES", "-muted", "YES"])
@@ -4765,7 +7136,7 @@ final class ResumePromptUITests: XCTestCase {
             }
             let candidate = (playerFields()["candidate"] ?? "").split(separator: ":").map(String.init)
             XCTAssertEqual(candidate.count, 3)
-            XCTAssertLessThanOrEqual(Int(playerFields()["poolCount"] ?? "99") ?? 99, 2)
+            XCTAssertLessThanOrEqual(Int(playerFields()["poolCount"] ?? "99") ?? 99, 3)
             XCTAssertEqual(Int(playerFields()["poolPlaying"] ?? "99"), 1)
             heightDeck().swipeUp()
             waitUntil("Focus commits the warmed next video") { self.watchFocus() == next }
@@ -4773,9 +7144,120 @@ final class ResumePromptUITests: XCTestCase {
             let promoted = playerFields()
             XCTAssertEqual(promoted["player"], candidate[1], "Promotion reuses the exact warmed AVPlayer")
             XCTAssertEqual(promoted["created"], "0", "A warmed page does not create a second player on activation")
-            XCTAssertLessThanOrEqual(Int(promoted["poolCount"] ?? "99") ?? 99, 2)
+            XCTAssertLessThanOrEqual(Int(promoted["poolCount"] ?? "99") ?? 99, 3)
             XCTAssertEqual(promoted["poolPlaying"], "1")
             print("PLAYBACK172_PROMOTION work=\(next);state=\(promoted)")
+        }
+    }
+
+    func testFastSwipeNetworkPlaybackReachesFinalVisibleFrame() async throws {
+        app = XCUIApplication()
+        let run = UUID().uuidString
+        app.launchArguments = ["--qa-collection-paging", "--qa-visual-controls", "--qa-continuous59",
+                               "--qa-native-layout64", "--qa-fast-swipe-network=\(run)",
+                               "-autoplay", "YES", "-muted", "YES", "-wifiVideoPrefetch", "NO"]
+        let control = URL(string: "http://localhost:49371/\(run)/")!
+        func command(_ name: String) async throws {
+            let (_, response) = try await URLSession.shared.data(from: control.appendingPathComponent(name))
+            XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+        }
+        try await command("ready")
+        app.launch()
+        XCTAssertTrue(timelineTools().waitForExistence(timeout: 10))
+        app.otherElements["timeline.media-kind"].buttons["视频"].tap()
+        waitPlayingFixture()
+        for id in 28_193_401...28_193_403 {
+            heightDeck().swipeUp()
+            waitUntil("The next video becomes active while the server is still holding its bytes") {
+                self.watchFocus() == id && self.playerFields()["player"] != "none" &&
+                    self.playerFields()["source"] == "network"
+            }
+            XCTAssertEqual(playerFields()["nativeCommitted"], "false")
+            XCTAssertEqual(playerFields()["muted"], "true")
+        }
+        let finalPlayer = try XCTUnwrap(playerFields()["player"])
+        let start = ProcessInfo.processInfo.systemUptime
+        try await command("release-final")
+        waitUntil("The final video draws a real frame and plays", timeout: 8) {
+            let fields = self.playerFields()
+            return self.watchFocus() == 28_193_403 && fields["nativeCommitted"] == "true" &&
+                fields["rate"] == "1.0" && (Double(fields["position"] ?? "") ?? -1) > 0.2
+        }
+        let timeToPlaying = Int((ProcessInfo.processInfo.systemUptime - start) * 1000)
+        let playing = playerFields()
+        try await command("release-skipped")
+        waitUntil("Late responses for skipped works leave playback on the final video") {
+            self.playerFields()["player"] == finalPlayer &&
+                (Double(self.playerFields()["position"] ?? "") ?? -1) > (Double(playing["position"] ?? "") ?? 0) + 0.3
+        }
+        let final = playerFields()
+        XCTAssertEqual(watchFocus(), 28_193_403)
+        XCTAssertEqual(final["player"], finalPlayer)
+        XCTAssertEqual(final["nativeCommitted"], "true")
+        XCTAssertEqual(final["poolPlaying"], "1")
+        XCTAssertEqual(final["muted"], "true")
+        print("FAST_SWIPE_NETWORK run=\(run) work=28193403 releaseToPlayingMS=\(timeToPlaying) nativeFirstFrameMS=\(final["firstFrameMS"] ?? "missing")")
+    }
+
+    func testTimelineReusesLocalPlayersOnImmediateReverseSwipe() throws {
+        app = XCUIApplication()
+        app.launchArguments = ["--qa-collection-paging", "--qa-visual-controls", "--qa-playback-sessions172",
+                               "--qa-continuous59", "--qa-native-layout64", "-autoplay", "YES", "-muted", "YES"]
+        app.launch()
+        XCTAssertTrue(timelineTools().waitForExistence(timeout: 10))
+        app.otherElements["timeline.media-kind"].buttons["视频"].tap()
+        waitPlayingFixture()
+        let firstID = 28_172_000
+        let firstPlayer = try XCTUnwrap(playerFields()["player"])
+        func waitForNext(_ id: Int) {
+            waitUntil("The next local video has completed preroll") {
+                let candidate = self.playerFields()["candidate"] ?? ""
+                return candidate.hasPrefix("\(id):") && candidate.hasSuffix(":true")
+            }
+        }
+        func checkPlaying(_ id: Int) -> [String: String] {
+            waitUntil("The requested timeline work has focus and a visible native frame") {
+                self.watchFocus() == id && self.playerFields()["layerReady"] == "true"
+            }
+            self.waitPlayingFixture()
+            let fields = self.playerFields()
+            print("TIMELINE_BUFFER work=\(id) player=\(fields["player"] ?? "-") pool=\(fields["poolCount"] ?? "-") firstFrameMS=\(fields["firstFrameMS"] ?? "-")")
+            XCTAssertEqual(fields["poolPlaying"], "1")
+            XCTAssertLessThanOrEqual(Int(fields["poolCount"] ?? "99") ?? 99, 3)
+            return fields
+        }
+        waitForNext(firstID + 1)
+        heightDeck().swipeUp()
+        let secondPlayer = try XCTUnwrap(checkPlaying(firstID + 1)["player"])
+        waitForNext(firstID + 2)
+        let middle = playerFields()
+        XCTAssertEqual(middle["retainedNeighbor"], "\(firstID):\(firstPlayer)")
+        XCTAssertEqual(middle["poolCount"], "3")
+        heightDeck().swipeDown()
+        XCTAssertEqual(checkPlaying(firstID)["player"], firstPlayer, "Reversing must reuse the original AVPlayer")
+        heightDeck().swipeUp()
+        XCTAssertEqual(checkPlaying(firstID + 1)["player"], secondPlayer, "The second visit must reuse its AVPlayer too")
+    }
+
+    func testPlayingTimelineResumesAfterViewingLeaderboard() {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-header-motion", "--qa-body-motion", "-autoplay", "YES", "-muted", "YES"])
+        app.otherElements["timeline.media-kind"].buttons["视频"].tap()
+        waitPlayingFixture()
+        let work = watchFocus()
+        mainTabButton("作者榜").tap()
+        waitUntil("The leaderboard is active") {
+            self.mainTabButton("作者榜").isSelected && self.app.staticTexts["page.interaction-lock"].valueDescription.contains("locks=0")
+        }
+        mainTabButton("时间线").tap()
+        waitUntil("The same timeline work is active again") {
+            self.mainTabButton("时间线").isSelected && self.watchFocus() == work
+        }
+        waitPlayingFixture()
+        let initial = Double(playerFields()["position"] ?? "") ?? -1
+        XCTAssertGreaterThanOrEqual(initial, 0)
+        waitUntil("Playback advances after returning to the timeline") {
+            (Double(self.playerFields()["position"] ?? "") ?? -1) > initial + 0.15
         }
     }
 
@@ -4810,6 +7292,8 @@ final class ResumePromptUITests: XCTestCase {
         XCTAssertEqual(Double(playerFields()["rate"] ?? "-1"), 0)
         XCTAssertEqual(playerFields()["player"], paused["player"], "A short root departure preserves the exact playback session")
         XCTAssertEqual(playerFields()["created"], paused["created"], "Root reattachment does not recreate the decoder")
+        waitUntil("A returned layer has its actual frame before exposing the retained native surface") { self.playerFields()["nativeVisible"] == "true" }
+        XCTAssertEqual(playerFields()["entryNative177"], "true", "The stable entry retains presentation across a leaf reattachment")
         XCTAssertEqual(playerFields()["seekCallbacks"], paused["seekCallbacks"], "The retained item needs no duplicate restore seek")
         XCTAssertEqual(Double(playerFields()["prepare"] ?? "0") ?? 0,
                        (Double(paused["prepare"] ?? "0") ?? 0) + 1,
@@ -5608,23 +8092,23 @@ final class ResumePromptUITests: XCTestCase {
         app.launch()
         mainTabButton("作者榜").tap()
         app.buttons["leaderboard.recent-filter"].tap()
-        app.buttons["近 24 小时"].tap()
-        let spinner = app.descendants(matching: .any)["leaderboard.activity.loading"].firstMatch
-        XCTAssertTrue(spinner.waitForExistence(timeout: 4))
-        XCTAssertLessThanOrEqual(spinner.frame.width, 28)
-        XCTAssertLessThanOrEqual(spinner.frame.height, 28)
-        attachScreenshot(named: "author70-small-inline-loading")
-        let summary = app.descendants(matching: .any)["leaderboard.activity.summary"].firstMatch
-        XCTAssertTrue(summary.waitForExistence(timeout: 8))
-        waitUntil("Only the bounded first forty authors are checked") { summary.valueDescription.contains("符合 10 位") && summary.valueDescription.contains("40/1,000") }
+        let day = app.scrollViews["value-selector.options"].buttons.matching(identifier: "value-selector.option.day").firstMatch
+        XCTAssertTrue(day.waitForExistence(timeout: 5))
+        day.tap()
         let first = app.buttons["leaderboard.author.59004"]
-        XCTAssertTrue(first.exists && first.isHittable)
-        XCTAssertLessThan(first.frame.minY, app.frame.height * 0.45, "The results begin in the upper half of the screen")
-        XCTAssertFalse(app.buttons["leaderboard.activity.more"].exists)
-        attachScreenshot(named: "author70-results")
-        app.buttons["leaderboard.activity.next"].tap()
-        waitUntil("An explicit next batch checks forty more and preserves the denominator") { summary.valueDescription.contains("符合 20 位") && summary.valueDescription.contains("80/1,000") }
-        XCTAssertTrue(first.exists)
+        XCTAssertTrue(first.waitForExistence(timeout: 10))
+        XCTAssertTrue(first.isHittable)
+        XCTAssertFalse(app.staticTexts["符合更新范围"].exists)
+        XCTAssertFalse(app.descendants(matching: .any)["leaderboard.activity.loading"].exists)
+        XCTAssertLessThan(first.frame.minY, app.frame.height * 0.45)
+        let next = app.buttons["leaderboard.activity.next"]
+        heightTap(next)
+        // The next batch appends matches below the current results.
+        for _ in 0..<8 {
+            if next.exists && next.valueDescription.contains("80/1,000") { break }
+            app.swipeUp()
+        }
+        XCTAssertTrue(next.valueDescription.contains("符合 20 位") && next.valueDescription.contains("80/1,000"))
         attachScreenshot(named: "author70-explicit-second-batch")
     }
 
@@ -5758,12 +8242,20 @@ final class ResumePromptUITests: XCTestCase {
             XCTAssertTrue(editor.waitForExistence(timeout: 5))
             let tabs = app.otherElements["business.tabs"]
             XCTAssertTrue(tabs.waitForExistence(timeout: 5))
+            var buttonsFrame = CGRect.null
             for id in ["main.tab.timeline", "main.tab.2", "main.tab.4", "main.tab.3"] {
                 let buttons = app.buttons.matching(identifier: id).allElementsBoundByIndex.filter(\.isHittable)
-                XCTAssertEqual(buttons.count, 1, "Business page must own exactly one usable tab action: " + id)
+                guard buttons.count == 1, let button = buttons.first else {
+                    XCTFail("Business page must own exactly one usable tab action: " + id)
+                    return
+                }
+                buttonsFrame = buttonsFrame.union(button.frame)
             }
-            XCTAssertEqual(editor.frame.minX, tabs.frame.minX, accuracy: 1)
-            XCTAssertEqual(editor.frame.maxX, tabs.frame.maxX, accuracy: 1)
+            // The tab accessibility container also includes the transparent page margins.
+            // Its visible panel surrounds the four hit targets with 4 pt of inner padding.
+            let panel = buttonsFrame.insetBy(dx: -4, dy: 0)
+            XCTAssertEqual(editor.frame.minX, panel.minX, accuracy: 1)
+            XCTAssertEqual(editor.frame.maxX, panel.maxX, accuracy: 1)
             attachScreenshot(named: "dimensions-business-favorite-nested-\(nested)")
             tabs.buttons["main.tab.4"].tap()
             XCTAssertTrue(app.otherElements["search.top-bar"].waitForExistence(timeout: 5))
@@ -5834,9 +8326,10 @@ final class ResumePromptUITests: XCTestCase {
         XCTAssertTrue(favorite.isEnabled)
     }
 
-    func testAuthorSelectionCommitsOnlyOnDone() {
+    func testAuthorSelectionCommitsOnSuccessfulReturn() {
         app = XCUIApplication()
-        app.launchArguments = ["--qa-collection-paging", "--qa-height-audit", "-app.appearance", "light", "-muted", "YES"]
+        app.launchArguments = ["--qa-collection-paging", "--qa-height-audit", "--qa-header-motion", "--qa-body-motion",
+                               "-app.appearance", "light", "-muted", "YES", "-autoplay", "NO"]
         XCUIDevice.shared.orientation = .portrait
         app.launch()
         mainTabButton("搜索").tap()
@@ -5847,9 +8340,15 @@ final class ResumePromptUITests: XCTestCase {
         let done = app.buttons["author-picker.done"]
 
         func chooseDraft() {
+            let hasSelection = picker.valueDescription.contains("@PagingFixture")
             picker.tap()
+            let header = floatingPageTitle("选择作者")
+            let locks = app.staticTexts["page.interaction-lock"]
+            waitUntil("The author picker header is settled and all input locks are released") {
+                header.exists && header.isHittable && locks.valueDescription.contains("locks=0")
+            }
             XCTAssertTrue(done.waitForExistence(timeout: 5))
-            XCTAssertFalse(done.isEnabled)
+            XCTAssertEqual(done.isEnabled, hasSelection)
             field.tap()
             field.typeText("@Pagi")
             XCTAssertTrue(result.waitForExistence(timeout: 6))
@@ -5860,7 +8359,7 @@ final class ResumePromptUITests: XCTestCase {
         chooseDraft()
         floatingPageTitle("选择作者").buttons["navigation.back"].tap()
         XCTAssertTrue(picker.waitForExistence(timeout: 5))
-        XCTAssertEqual(picker.value as? String, "未选择")
+        XCTAssertEqual(picker.value as? String, "@PagingFixture")
         chooseDraft()
         done.tap()
         XCTAssertTrue(picker.waitForExistence(timeout: 5))
@@ -5880,7 +8379,7 @@ final class ResumePromptUITests: XCTestCase {
         XCTAssertTrue(sort.waitForValueToContain("最新", timeout: 5))
         XCTAssertLessThan(sort.frame.midX, app.frame.midX)
         sort.tap()
-        app.buttons["热度"].tap()
+        app.buttons["value-selector.option.Most Reactions"].tap()
         XCTAssertTrue(sort.waitForValueToContain("热度", timeout: 5))
         XCTAssertTrue(app.buttons["search.range"].label.contains("视频"))
         XCTAssertTrue(results.exists)
@@ -5905,7 +8404,9 @@ final class ResumePromptUITests: XCTestCase {
         attachScreenshot(named: "search-author-clear-row")
         clear.tap()
         floatingPageTitle("选择作者").buttons["navigation.back"].tap()
-        XCTAssertTrue(picker.waitForValueToContain("@PagingFixture", timeout: 5))
+        XCTAssertTrue(picker.waitForValueToContain("未选择", timeout: 5))
+        chooseDraft()
+        done.tap()
         picker.tap()
         XCTAssertTrue(clear.waitForExistence(timeout: 5))
         clear.tap()
@@ -5913,6 +8414,143 @@ final class ResumePromptUITests: XCTestCase {
         XCTAssertTrue(picker.waitForValueToContain("未选择", timeout: 5))
         XCTAssertEqual(title.value as? String, "Paging")
         XCTAssertFalse(app.descendants(matching: .any)["search.results"].exists)
+    }
+
+    func testCovered181FooterWaitsForNestedDismissalsAndSlidesRoot() {
+        for appearance in ["light", "dark"] {
+            app = XCUIApplication()
+            app.launchArguments = ["--qa-collection-paging", "--qa-height-audit", "--qa-header-motion",
+                                   "--qa-body-motion", "--qa-page-return", "-app.appearance", appearance,
+                                   "-muted", "YES", "-autoplay", "NO", "-civitviewer.automaticRotation", "NO"]
+            XCUIDevice.shared.orientation = .portrait
+            app.launch()
+            let rootTabs = mainTabBar()
+            let ready = rootTabs.waitForExistence(timeout: 10)
+            if !ready { print("COVER181_ROOT_AX " + app.debugDescription) }
+            XCTAssertTrue(ready)
+            mainTabButton("收藏").tap()
+            let video = app.otherElements["collection.media-kind"].buttons["视频"]
+            XCTAssertTrue(video.waitForExistence(timeout: 8)); video.tap()
+            let cell = app.buttons["media.grid.cell.28037102"].firstMatch
+            waitUntil("The retained video card is ready for input") { cell.isHittable }
+            cell.tap()
+            let detailsAction = visualButton("media.details.28037102")
+            waitUntil("The real player entry releases input") {
+                detailsAction.isHittable && self.app.staticTexts["page.interaction-lock"].valueDescription.contains("locks=0")
+            }
+            detailsAction.tap()
+            let details = floatingPageTitle("作品详情")
+            XCTAssertTrue(details.waitForExistence(timeout: 8))
+            let tabs = app.descendants(matching: .any)["details.tabs"]
+            let search = tabs.buttons["main.tab.4"]
+            waitUntil("The nested details footer is ready for input") {
+                search.isHittable && self.app.staticTexts["page.interaction-lock"].valueDescription.contains("locks=0")
+            }
+            let footerFrame = tabs.frame
+            search.tap()
+            let body = app.staticTexts["body.motion.qa"]
+            waitUntil("Nested platform dismissals end in the one root canvas transition", timeout: 10) {
+                body.valueDescription.contains("kind=cover-tab;phase=completed")
+                    && self.app.textFields["search-title-input"].isHittable
+                    && self.app.staticTexts["page.interaction-lock"].valueDescription.contains("locks=0")
+            }
+            XCTAssertTrue(mainTabButton("搜索").isSelected)
+            XCTAssertFalse(details.isHittable)
+            XCTAssertFalse(app.buttons["playback.close"].isHittable)
+            XCTAssertEqual(mainTabBar().frame, footerFrame)
+            print("COVER181_ROOT appearance=\(appearance);" + body.valueDescription)
+            attachScreenshot(named: "covered181-nested-to-search-\(appearance)")
+            mainTabButton("收藏").tap()
+            waitUntil("Returning to the root retains the video selection and card") { video.isSelected && cell.isHittable }
+            app.terminate()
+        }
+    }
+
+    func testCovered181ManualRotationRestoresAfterRootExitAndBackground() {
+        for background in [false, true] {
+            app = XCUIApplication()
+            app.launchArguments = ["--qa-collection-paging", "--qa-height-audit", "--qa-header-motion",
+                                   "--qa-body-motion", "-app.appearance", "light", "-muted", "YES", "-autoplay", "NO",
+                                   "-civitviewer.automaticRotation", "NO"]
+            if background { app.launchArguments.append("--qa-cover-root-hold181") }
+            XCUIDevice.shared.orientation = .portrait
+            app.launch()
+            XCTAssertTrue(mainTabBar().waitForExistence(timeout: 10))
+            mainTabButton("收藏").tap()
+            let video = app.otherElements["collection.media-kind"].buttons["视频"]
+            XCTAssertTrue(video.waitForExistence(timeout: 6)); video.tap()
+            let cell = app.buttons["media.grid.cell.28037102"].firstMatch
+            waitUntil("The offline card can open its real player") { cell.isHittable }
+            cell.tap()
+            waitUntil("Player entry is complete before rotating") {
+                self.app.buttons["playback.close"].isHittable
+                    && self.app.staticTexts["page.interaction-lock"].valueDescription.contains("locks=0")
+            }
+            visualEnsureLandscape()
+            XCTAssertGreaterThan(app.windows.firstMatch.frame.width, app.windows.firstMatch.frame.height)
+            let footer = app.descendants(matching: .any)["playback.tabs"]
+            let search = footer.buttons["main.tab.4"]
+            waitUntil("The rotated player footer is ready") { search.isHittable }
+            search.tap()
+            if background {
+                // Interrupt the explicit held handoff after the actual cover
+                // dismissal; the restore intent must survive the same scene.
+                XCUIDevice.shared.press(.home)
+                app.activate()
+            }
+            waitUntil("Root choice and original orientation both survive cover teardown", timeout: 12) {
+                self.mainTabButton("搜索").isSelected && self.app.textFields["search-title-input"].isHittable
+                    && self.app.windows.firstMatch.frame.height > self.app.windows.firstMatch.frame.width
+                    && self.app.staticTexts["page.interaction-lock"].valueDescription.contains("locks=0")
+            }
+            XCTAssertFalse(app.buttons["playback.close"].exists)
+            attachScreenshot(named: "covered181-rotation-root-background-\(background)")
+            app.terminate()
+        }
+        XCUIDevice.shared.orientation = .portrait
+    }
+
+    func testNative181SearchFilterHeaderMovesDuringNavigationAndBack() {
+        app = XCUIApplication()
+        app.launchArguments = ["--qa-collection-paging", "--qa-height-audit", "--qa-header-motion",
+                               "--qa-body-motion", "-muted", "YES", "-autoplay", "NO", "-app.appearance", "light"]
+        XCUIDevice.shared.orientation = .portrait
+        app.launch()
+        XCTAssertTrue(mainTabBar().waitForExistence(timeout: 10))
+        mainTabButton("搜索").tap()
+        let field = app.textFields["search-title-input"]
+        XCTAssertTrue(field.waitForExistence(timeout: 6))
+        let bottom = mainTabBar().frame
+        let top = app.otherElements["search.top-bar"].frame.minY
+        let motion = app.descendants(matching: .any)["header.layout-motion.qa"]
+        func assertConcurrentHeightChange(_ opening: Bool) {
+            let value = motion.valueDescription
+            print("NATIVE181_HEADER opening=\(opening);" + value)
+            let numbers = numericReadback(value)
+            XCTAssertGreaterThan(numbers["nativeSamples"] ?? 0, 0, value)
+            XCTAssertGreaterThan(numbers["nativeHeightOverlap"] ?? 0, 0, value)
+            XCTAssertGreaterThan(abs((numbers["source"] ?? 0) - (numbers["target"] ?? 0)), 20, value)
+            XCTAssertLessThanOrEqual(abs((numbers["topMax"] ?? -100) - (numbers["topMin"] ?? 100)), 1, value)
+            XCTAssertEqual(mainTabBar().frame, bottom)
+        }
+        for _ in 0..<2 {
+            heightTap(app.buttons["search.range"])
+            let filter = floatingPageTitle("浏览条件")
+            XCTAssertTrue(filter.waitForExistence(timeout: 6))
+            waitUntil("Native push hands the fixed header to real filter controls") {
+                filter.buttons["完成"].isHittable
+                    && self.app.staticTexts["page.interaction-lock"].valueDescription.contains("locks=0")
+            }
+            assertConcurrentHeightChange(true)
+            filter.buttons["完成"].tap()
+            waitUntil("Button return restores the original search header") {
+                field.isHittable && self.app.buttons["search.range"].isHittable
+                    && self.app.staticTexts["page.interaction-lock"].valueDescription.contains("locks=0")
+            }
+            assertConcurrentHeightChange(false)
+            XCTAssertEqual(app.otherElements["search.top-bar"].frame.minY, top, accuracy: 1)
+        }
+        app.terminate()
     }
 
     func testGlobalAuthorSearchDoesNotChangeWorkCriteria() {
@@ -6836,8 +9474,18 @@ final class ResumePromptUITests: XCTestCase {
         XCTAssertTrue(mainTabButton("作者榜").isSelected)
     }
 
+    func testDetails175FailedRefreshKeepsKnownTags() {
+        visualLaunch(width: 0, large: false, landscape: false,
+                     extra: ["--qa-details-tags", "--qa-details-tags-failure", "-muted", "YES"])
+        visualButton("media.details.28037100").tap()
+        XCTAssertTrue(app.buttons["details.tag.portrait"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["details.publication"].exists)
+        XCTAssertFalse(app.buttons["details.refresh"].exists)
+        XCTAssertFalse(app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", "标签读取失败")).firstMatch.exists)
+    }
+
     func testDetailsTagRefreshFailureLeavesWorkCardWithoutTagControls() {
-        visualLaunch(width: 0, large: false, landscape: false, extra: ["--qa-details-tags", "--qa-details-tags-failure"])
+        visualLaunch(width: 0, large: false, landscape: false, extra: ["--qa-details-tags", "--qa-details-tags-failure", "--qa-details-input-tags-unknown175"])
         app.buttons["media.details.28037100"].tap()
         XCTAssertTrue(app.staticTexts["details.publication"].waitForExistence(timeout: 5))
         XCTAssertFalse(app.descendants(matching: .any)["details.tags"].exists)
@@ -6912,11 +9560,36 @@ final class ResumePromptUITests: XCTestCase {
 
     func testOfflineTagBlockKeepsExitAndClearsShare() {
         app = XCUIApplication()
-        app.launchArguments = ["--qa-collection-paging", "--qa-height-audit", "--qa-details-tags", "-muted", "YES", "-autoplay", "NO"]
+        app.launchArguments = ["--qa-collection-paging", "--qa-height-audit", "--qa-details-tags", "--qa-header-motion", "-muted", "YES", "-autoplay", "NO"]
         XCUIDevice.shared.orientation = .portrait
         app.launch()
+        // Recover only this synthetic test tag after an interrupted prior run.
+        openAccountSettings()
+        tapAboveMainBar(app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "屏蔽标签")).firstMatch)
+        let previousBlock = app.buttons["删除屏蔽标签 portrait"]
+        if previousBlock.exists {
+            waitUntil("The blocked-tag row becomes interactive after navigation") { previousBlock.isHittable }
+            previousBlock.tap()
+            XCTAssertTrue(previousBlock.waitForNonExistence(timeout: 5))
+        }
+        let blockedBack = floatingPageTitle("屏蔽标签").buttons["navigation.back"]
+        waitUntil("The blocked-tag return button is live") { blockedBack.isHittable }
+        blockedBack.tap()
+        let settingsHeader = floatingPageTitle("账号与设置")
+        waitUntil("The actual Settings header and transition ownership have settled") {
+            settingsHeader.isHittable &&
+                (!self.app.staticTexts["page.interaction-lock"].exists || self.app.staticTexts["page.interaction-lock"].valueDescription.contains("locks=0"))
+        }
+        let backs = app.descendants(matching: .any).matching(identifier: "navigation.back")
+        // XCTest reports this floating button as non-hittable after a pop.
+        // Tap its validated on-screen hit rectangle, then verify the actual route.
+        let settingsBack = backs.allElementsBoundByIndex.first { $0.isEnabled && $0.frame.minY >= 0 && $0.frame.midY < 120 }!
+        XCTAssertEqual(settingsBack.frame.width, 44, accuracy: 1)
+        XCTAssertEqual(settingsBack.frame.height, 44, accuracy: 1)
+        app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: settingsBack.frame.midX, dy: settingsBack.frame.midY)).tap()
+        waitUntil("The physical back button returns to the actual timeline") { self.app.buttons["timeline.account"].isHittable }
         heightOpen("offline", expected: 28_037_102)
-        let playback = floatingPageTitle("离线播放")
+        let playback = floatingPageTitle("作品")
         let share = playback.buttons["playback.share"]
         XCTAssertTrue(share.waitForExistence(timeout: 5))
         visualOpenDetails(itemID: 28_037_102)
@@ -6925,12 +9598,13 @@ final class ResumePromptUITests: XCTestCase {
         tag.press(forDuration: 0.8)
         app.buttons["屏蔽此标签"].tap()
         app.buttons["details.back"].tap()
-        XCTAssertTrue(app.staticTexts["media.empty.message"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.descendants(matching: .any)["media.empty.state"].waitForExistence(timeout: 5))
         XCTAssertFalse(share.isHittable)
-        let close = playback.buttons["offline.playback.close"]
+        let close = playback.buttons["playback.close"]
         XCTAssertTrue(close.isHittable); close.tap()
+        XCTAssertTrue(close.waitForNonExistence(timeout: 5))
 
-        app.buttons["navigation.back"].tap()
+        openAccountSettings()
         tapAboveMainBar(app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "屏蔽标签")).firstMatch)
         let remove = app.buttons["删除屏蔽标签 portrait"]
         XCTAssertTrue(remove.waitForExistence(timeout: 5))
@@ -6984,13 +9658,13 @@ final class ResumePromptUITests: XCTestCase {
     func testOfflineAndHistoryUseSharedPlaybackAndDetailTabs() {
         app = XCUIApplication()
         app.launchArguments = ["--qa-collection-paging", "--qa-height-audit", "-muted", "YES", "-autoplay", "NO"]
-        for (route, title) in [("offline", "离线播放"), ("history", "最近浏览")] {
+        for (route, title) in [("offline", "作品"), ("history", "最近浏览")] {
             XCUIDevice.shared.orientation = .portrait
             app.launch()
             heightOpen(route, expected: 28_037_102)
             let tabs = app.descendants(matching: .any)["playback.tabs"]
             XCTAssertTrue(tabs.waitForExistence(timeout: 8), route)
-            XCTAssertTrue(tabs.buttons["main.tab.timeline"].isSelected)
+            XCTAssertTrue(tabs.buttons[route == "offline" ? "main.tab.3" : "main.tab.timeline"].isSelected)
             let share = floatingPageTitle(title).buttons["playback.share"]
             XCTAssertTrue(share.waitForExistence(timeout: 5), route)
             XCTAssertTrue(share.isHittable)
@@ -7166,6 +9840,40 @@ final class ResumePromptUITests: XCTestCase {
         heightDeck().swipeDown()
         XCTAssertTrue(app.descendants(matching: .any)["media.boundary.state"].waitForNonExistence(timeout: 5))
         waitPlayingFixture()
+    }
+
+    func testNative67WaitingTailKeepsTimelineEdgeSwitchInteractive() {
+        launchContinuation("sparse-long64", extra: ["--qa-native-layout64", "--qa-pager-touch-trace", "-muted", "YES"])
+        waitPlayingFixture()
+        waitUntil("The real timeline continuation is held") { self.continuationFields()["gate"] == "waiting" }
+        heightDeck().swipeUp(); heightDeck().swipeUp(); heightDeck().swipeUp()
+        let waiting = app.descendants(matching: .any)["media.boundary.state"]
+        XCTAssertTrue(waiting.waitForExistence(timeout: 5))
+        XCTAssertEqual(watchFocus(), 64_000_102)
+        let details = app.buttons["media.details.64000102"]
+        XCTAssertFalse(details.exists && details.isHittable, "The outgoing work's details cannot be invoked from the waiting canvas")
+
+        let window = app.windows.firstMatch
+        let start = window.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: 0.34))
+        let requestCount = continuationFields()["requests"]
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 30, dy: 0)),
+                    withVelocity: XCUIGestureVelocity(rawValue: 90), thenHoldForDuration: 0.15)
+        let motion = app.descendants(matching: .any)["timeline.page-motion.qa"]
+        waitUntil("The waiting viewport renders a cancelled edge gesture", timeout: 5) {
+            motion.valueDescription.contains("phase=cancelled")
+        }
+        XCTAssertGreaterThan(heightValues(motion.valueDescription)["peak"] ?? 0, 8, "The waiting page must move before cancellation")
+        XCTAssertTrue(waiting.exists, "Cancelling the edge drag preserves the waiting destination")
+        XCTAssertEqual(continuationFields()["requests"], requestCount)
+
+        start.press(forDuration: 0.05,
+                    thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.68, dy: 0.34)),
+                    withVelocity: XCUIGestureVelocity(rawValue: 210), thenHoldForDuration: 0.1)
+        let following = app.otherElements["timeline.source"].buttons["关注"]
+        waitUntil("A held response must not prevent switching to the following timeline", timeout: 8) {
+            following.isSelected && !waiting.exists
+        }
+        XCTAssertEqual(continuationFields()["gate"], "waiting", "The original response is still deliberately unreleased")
     }
 
     func testNative67ReverseDragRevealsPreviousWithoutSkippingWork() {
@@ -7779,7 +10487,7 @@ final class ResumePromptUITests: XCTestCase {
     }
 
     private func launchContinuation(_ scenario: String, extra: [String] = []) {
-        app = XCUIApplication(); app.launchArguments = ["--qa-collection-paging", "--qa-theme-timeline", "--qa-auto-continuation=\(scenario)", "-timeline.presentation", "stream"]
+        app = XCUIApplication(); app.launchArguments = ["--qa-collection-paging", "--qa-theme-timeline", "--qa-auto-continuation=\(scenario)", "-timeline.presentation", "stream", "-muted", "YES"]
         app.launchArguments += extra
         XCUIDevice.shared.orientation = .portrait; app.launch()
         XCTAssertTrue(app.staticTexts["continuation.qa.state"].waitForExistence(timeout: 10))
@@ -7928,6 +10636,9 @@ final class ResumePromptUITests: XCTestCase {
             return parts.count == 2 ? (String(parts[0]), String(parts[1])) : nil
         }, uniquingKeysWith: { _, new in new })
     }
+    private func numericReadback(_ text: String) -> [String: Double] {
+        qaFields(text).compactMapValues(Double.init)
+    }
     private func waitPlayingFixture() {
         XCTAssertTrue(app.staticTexts.matching(identifier: "media.qa.player").firstMatch.waitForExistence(timeout: 10))
         waitUntil("A real muted AVPlayer must be advancing before gestures") {
@@ -8003,9 +10714,17 @@ final class ResumePromptUITests: XCTestCase {
         let frame = heightDeck().frame
         app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: frame.midX, dy: frame.midY)).press(forDuration: 0.7)
     }
-    private func waitUntil(_ message: String, timeout: TimeInterval = 8, _ predicate: @escaping () -> Bool) {
+    private func logAuthorReturnMotion(_ stage: String, _ motion: XCUIElement) -> String {
+        let value = motion.exists ? motion.valueDescription : "missing"
+        print("\(stage);page.return-motion.qa=\(value)")
+        return value
+    }
+
+    private func waitUntil(_ message: String, timeout: TimeInterval = 8,
+                           onTimeout: (() -> Void)? = nil, _ predicate: @escaping () -> Bool) {
         let expectation = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in predicate() }, object: nil)
         let result = XCTWaiter.wait(for: [expectation], timeout: timeout)
+        if result != .completed { onTimeout?() }
         if result != .completed && (message.hasPrefix("Actual missing-file") || message.hasPrefix("The current failure and three")) {
             print("FAILURE66_DIAGNOSTIC_BEGIN\n\(app.debugDescription)\nFAILURE66_DIAGNOSTIC_END")
             attachScreenshot(named: "failure66-current-native-player-state")
@@ -8022,6 +10741,32 @@ final class ResumePromptUITests: XCTestCase {
 
     private func mainTabBar() -> XCUIElement {
         app.descendants(matching: .any).matching(identifier: "main.tabs.compact").firstMatch
+    }
+
+    private func rootMotionFields181(_ value: String) -> [String: String] {
+        Dictionary(value.split(separator: ";").compactMap { item in
+            guard let separator = item.firstIndex(of: "=") else { return nil }
+            let key = String(item[..<separator])
+            let fieldValue = String(item[item.index(after: separator)...])
+            return (key, fieldValue)
+        }, uniquingKeysWith: { _, new in new })
+    }
+
+    private func tokenValue181(_ value: String, tab: Int) -> String? {
+        value.split(separator: ",").first { $0.hasPrefix("\(tab):") }.map { String($0.dropFirst(String(tab).count + 1)) }
+    }
+
+    private func rootTabID181(_ title: String) -> String {
+        ["时间线": "0", "作者榜": "2", "搜索": "4", "收藏": "3"][title] ?? "-1"
+    }
+
+    private func rootHeader181(_ title: String) -> XCUIElement {
+        switch title {
+        case "作者榜": return app.otherElements["leaderboard.top-bar"]
+        case "搜索": return app.otherElements["search.top-bar"]
+        case "收藏": return app.otherElements["collections.top-bar"]
+        default: return app.buttons["timeline.account"]
+        }
     }
 
     private func floatingPageTitle(_ title: String) -> XCUIElement {
@@ -8235,9 +10980,19 @@ final class ResumePromptUITests: XCTestCase {
         }
     }
 
+    func testPlayback174SearchEntry() {
+        auditWatchingRoute("search", rotates: false)
+    }
+
+    func testPlayback174AuthorVideoRotation() {
+        auditWatchingRoute("author-video", rotates: true)
+    }
+
+    func testWatching175SearchRouteCompletes() { auditWatchingRoute("search", rotates: false, extra: ["--qa-terminal-tone175"]) }
+
     func testWatchingViewportOtherEntriesHeightAndRotation() {
-        for route in ["author", "author-video", "search", "collections", "offline", "history", "history-resume"] {
-            auditWatchingRoute(route, rotates: ["author-video", "offline", "history-resume"].contains(route))
+        for route in ["author", "author-video", "search", "collections", "collections-video", "history", "history-resume"] {
+            auditWatchingRoute(route, rotates: ["author-video", "collections-video", "history-resume"].contains(route))
         }
     }
 
@@ -8295,9 +11050,9 @@ final class ResumePromptUITests: XCTestCase {
         app.launch()
         heightOpen("offline", expected: 28_037_100)
 
-        let close = app.buttons["offline.playback.close"]
+        let close = app.buttons["playback.close"]
         XCTAssertTrue(close.waitForExistence(timeout: 5))
-        XCTAssertTrue(app.staticTexts["离线播放"].exists)
+        XCTAssertTrue(app.staticTexts["作品"].exists)
         XCTAssertTrue(close.isHittable)
         let viewport = heightDeck().frame
         XCTAssertLessThan(viewport.minY, close.frame.midY)
@@ -8310,7 +11065,7 @@ final class ResumePromptUITests: XCTestCase {
         centralPress()
         waitUntil("The floating bar should return on a long press") { close.isHittable }
         close.tap()
-        XCTAssertTrue(floatingPageTitle("离线收藏与空间").waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["media.grid.cell.28037100"].waitForExistence(timeout: 5))
     }
 
     func testWatchingViewportHistoryResumeHeightAndRotation() {
@@ -8395,8 +11150,9 @@ final class ResumePromptUITests: XCTestCase {
         app.terminate(); XCUIDevice.shared.orientation = .portrait
     }
 
-    private func auditWatchingRoute(_ route: String, rotates: Bool, compact: Bool = false) {
-        app = XCUIApplication(); app.launchArguments = ["--qa-collection-paging", "--qa-height-audit", "-muted", "YES"]
+    private func auditWatchingRoute(_ route: String, rotates: Bool, compact: Bool = false, extra: [String] = []) {
+        app = XCUIApplication(); app.launchArguments = ["--qa-collection-paging", "--qa-height-audit", "--qa-pager-touch-trace", "--qa-caption-hit174", "-muted", "YES"]
+        app.launchArguments += extra
         if compact { app.launchArguments += ["--qa-theme-compact"] }
         // Enter settings through the timeline without recording a new inline
         // viewing session over the seeded video checkpoint.
@@ -8406,7 +11162,7 @@ final class ResumePromptUITests: XCTestCase {
         if route == "timeline-resume" { app.launchArguments += ["--qa-chrome-geometry", "-civitviewer.automaticRotation", "NO"] }
         XCUIDevice.shared.orientation = .portrait
         app.launch()
-        let videoStart = route == "author-video" || route == "history-resume" || route == "timeline-resume"
+        let videoStart = route == "author-video" || route == "collections-video" || route == "history-resume" || route == "timeline-resume"
         let start = 28_037_100 + (videoStart ? 2 : 0)
         heightOpen(route, expected: start)
         heightAssert(route, phase: "entry", expected: start)
@@ -8426,7 +11182,9 @@ final class ResumePromptUITests: XCTestCase {
         let details = app.buttons.matching(NSPredicate(format: "label == %@", "作品详情")).allElementsBoundByIndex.first(where: { $0.isHittable })
         XCTAssertNotNil(details); details?.tap()
         XCTAssertTrue(floatingPageTitle("作品详情").waitForExistence(timeout: 5))
-        app.buttons["details.back"].tap()
+        let detailsBack = app.buttons["details.back"]
+        detailsBack.tap()
+        XCTAssertTrue(detailsBack.waitForNonExistence(timeout: 5), "Details must finish closing before the next media gesture")
         heightAssert(route, phase: "details-return", expected: start)
         if rotates {
             app.buttons["手动切换横竖屏"].tap()
@@ -8492,6 +11250,7 @@ final class ResumePromptUITests: XCTestCase {
         app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: deckFrame.midX, dy: (firstY + lastY) / 2)).doubleTap()
         XCTAssertTrue(app.descendants(matching: .any)["creator.top-bar"].waitForExistence(timeout: 8))
         if route == "author" || route == "author-video" {
+            XCTAssertTrue(app.buttons["playback.close"].waitForNonExistence(timeout: 5), "Returning to the author grid must finish before reopening media")
             XCTAssertTrue(app.buttons["media.grid.cell.\(start)"].waitForExistence(timeout: 5))
             heightTap(app.buttons["media.grid.cell.\(start)"])
         } else {
@@ -8499,9 +11258,15 @@ final class ResumePromptUITests: XCTestCase {
             XCTAssertNotNil(back); back?.tap()
         }
         heightAssert(route, phase: "author-return", expected: start)
+        if extra.contains("--qa-terminal-tone175") {
+            waitUntil("The visible playback bar releases its completed fallback tone") {
+                self.app.staticTexts["playback.tone175"].valueDescription == "idle"
+            }
+        }
         if !inline {
             let close = app.buttons[route.hasPrefix("history") ? "关闭浏览记录" : "关闭作品"]
             XCTAssertTrue(close.waitForExistence(timeout: 5)); close.tap()
+            XCTAssertTrue(close.waitForNonExistence(timeout: 5), "Playback must finish dismissing before reopening its source")
             heightOpen(route, expected: start)
             heightAssert(route, phase: "reentry", expected: start)
         }
@@ -8541,7 +11306,7 @@ final class ResumePromptUITests: XCTestCase {
             heightTap(visualButton("media.grid.cell.\(expected)")); return
         }
         if route == "search" {
-            if !app.descendants(matching: .any)["search.results"].isHittable {
+            if !app.scrollViews["search.results"].exists {
                 mainTabButton("搜索").tap()
                 let field = app.textFields["search-title-input"]
                 XCTAssertTrue(field.waitForExistence(timeout: 5))
@@ -8551,32 +11316,23 @@ final class ResumePromptUITests: XCTestCase {
             }
             heightTap(visualButton("media.grid.cell.\(expected)")); return
         }
-        if route == "collections" {
+        if ["collections", "collections-video", "offline"].contains(route) {
+            // Offline works are opened from the local collection grid.
             mainTabButton("收藏").tap()
             if expected == 28_037_102 {
                 let kind = app.otherElements["collection.media-kind"].buttons["视频"]
                 XCTAssertTrue(kind.waitForExistence(timeout: 5)); kind.tap()
             }
             heightTap(visualButton("media.grid.cell.\(expected)"))
-        } else if route == "offline" {
-            let row = app.buttons["offline.item.\(expected)"]
-            if !floatingPageTitle("离线收藏与空间").exists {
-                openAccountSettings()
-                heightTap(app.buttons["settings.offline-library"])
-            }
-            if expected == 28_037_102 {
-                let kind = app.otherElements["offline.media-kind"].buttons["视频"]
-                if !kind.isSelected { heightTap(kind) }
-            }
-            tapAboveMainBar(row)
         } else {
             if !floatingPageTitle("最近浏览").exists {
                 openAccountSettings()
                 heightTap(app.buttons["最近浏览与接着看"])
             }
             if route == "history-resume" {
-                let videoCheckpoint = NSPredicate(format: "label CONTAINS %@ AND label CONTAINS %@", "推荐时间线", "视频")
-                heightTap(app.buttons.matching(videoCheckpoint).firstMatch)
+                let videoSubtitle = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "视频 ·")).firstMatch
+                XCTAssertTrue(videoSubtitle.waitForExistence(timeout: 5), "The seeded recommendation checkpoint must be a video")
+                heightTap(app.buttons.matching(NSPredicate(format: "label == %@", "推荐时间线")).firstMatch)
             } else {
                 if expected == 28_037_102 {
                     let kind = app.otherElements["history.media-kind"].buttons["视频"]
@@ -8628,7 +11384,13 @@ final class ResumePromptUITests: XCTestCase {
             let f = self.heightDeck().frame, window = self.app.windows.firstMatch.frame
             return f.width > 0 && f.height > 0 && (window.width > window.height) == landscape
         }
-        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: stable, object: nil)], timeout: 8), .completed)
+        let result = XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: stable, object: nil)], timeout: 8)
+        if result != .completed, app.staticTexts["pager.qa.trace"].exists {
+            print("ROTATE174_PARENT " + app.staticTexts["media.qa.parent-ready"].valueDescription)
+            print("ROTATE174_TRACE " + app.staticTexts["pager.qa.trace"].valueDescription)
+            attachScreenshot(named: "rotation174-failure")
+        }
+        XCTAssertEqual(result, .completed)
         // The manual app request changes its geometry before the simulator's
         // device orientation. Match the device so screenshots use one orientation.
         XCUIDevice.shared.orientation = landscape ? .landscapeLeft : .portrait

@@ -20,6 +20,12 @@ source_root = baseline if args.baseline52 else root
 if not source_root.is_dir():
     raise SystemExit(f"source tree missing: {source_root}")
 
+
+def production_source(relative_path):
+    # Archived builds predate the feature folders and retain their original source paths.
+    path = Path(relative_path)
+    return source_root / "CivitViewer" / (path.name if args.baseline52 else path)
+
 fixture = root / "Tests" / "Fixtures" / "short.mp4"
 if not fixture.is_file():
     raise SystemExit(f"required neutral short MP4 prefix missing: {fixture}")
@@ -123,8 +129,8 @@ threading.Thread(target=server.serve_forever, daemon=True).start()
 
 build = root / "build"
 build.mkdir(exist_ok=True)
-cache_source = (source_root / "CivitViewer" / "MediaCache.swift").read_text()
-model_source = (source_root / "CivitViewer" / "Models.swift").read_text()
+cache_source = (production_source("Media/Loading/MediaCache.swift")).read_text()
+model_source = (production_source("Feed/Models.swift")).read_text()
 # The generated test copy accepts only the loopback HTTP fixture. Production Models.swift stays unchanged.
 model_source = model_source.replace('url.scheme == "https"', '(url.scheme == "https" || (url.scheme == "http" && url.host == "127.0.0.1"))')
 cache_file = build / "LongPrefetchMediaCacheUnderTest.swift"
@@ -136,13 +142,13 @@ cache_file.write_text(cache_source.replace(
 ))
 model_file.write_text(model_source)
 inputs = [
-    source_root / "CivitViewer" / "VideoDuration.swift",
+    production_source("Media/VideoDuration.swift"),
     model_file,
-    source_root / "CivitViewer" / "MediaLoadQueue.swift",
-    source_root / "CivitViewer" / "MediaFormat.swift",
-    source_root / "CivitViewer" / "MediaRepairStore.swift",
-    source_root / "CivitViewer" / "PlaybackDiagnostics.swift",
-    source_root / "CivitViewer" / "LocalDiagnostics.swift",
+    production_source("Media/Loading/MediaLoadQueue.swift"),
+    production_source("Media/MediaFormat.swift"),
+    production_source("Media/MediaRepairStore.swift"),
+    production_source("Diagnostics/PlaybackDiagnostics.swift"),
+    production_source("Diagnostics/LocalDiagnostics.swift"),
     cache_file,
     root / "Tests" / "LongPrefetchChecks.swift",
 ]

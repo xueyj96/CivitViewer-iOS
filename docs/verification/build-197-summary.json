@@ -1,0 +1,285 @@
+{
+  "regression": {
+    "build": 197,
+    "baseline": 196,
+    "bundleID": "com.xueyj.civitviewer",
+    "diffSHA256": "c06e092775482d792e9df638c36c21fdcbb1bb7c76895597a95048d29667b9cb",
+    "sourceManifestSHA256": "5bbe1f3174b0ca172f4700db7416a0aa2133211b343d92219fc2771fcf77e564",
+    "architectureChecks": {
+      "swiftSources": 107,
+      "bundledResourceEntries": 2,
+      "presentationStateChecks": 144
+    },
+    "passedScenarios": [
+      "testAuthorBatchFavoriteRetriesOnlyUnconfirmedWork",
+      "testAuthorPendingPaginationButtonAndEdgeReturnRemainOperable",
+      "testBusinessFavoritePageHasOneTabBarAndUnwindsNestedPlayback",
+      "testCenterSegmentsAndAuthorEdgeReturn162",
+      "testCommittedSearchAcceptsNextFooterTapBeforeHeaderAcknowledgement",
+      "testFavoritesLoadsNextPageSilentlyWhileCardsAreVisible",
+      "testFavoritesOpensLocalWorkWhileCloudListIsLoading",
+      "testFavoritesRestoreCachedListBeforeFreshAccountResponse"
+    ],
+    "performance": {
+      "base.log": {
+        "300": [
+          {
+            "round": 1,
+            "tapMS": 51.8,
+            "firstCardMS": 349.4,
+            "firstCoverMS": 453.3,
+            "largestDisplayCallbackGapMS": 315.6
+          },
+          {
+            "round": 2,
+            "tapMS": 5.2,
+            "firstCardMS": 78.1,
+            "firstCoverMS": 136.3,
+            "largestDisplayCallbackGapMS": 81.2
+          },
+          {
+            "round": 3,
+            "tapMS": 4.9,
+            "firstCardMS": 154.0,
+            "firstCoverMS": 162.6,
+            "largestDisplayCallbackGapMS": 79.0
+          }
+        ],
+        "20": [
+          {
+            "round": 1,
+            "tapMS": 33.5,
+            "firstCardMS": 326.5,
+            "firstCoverMS": 371.4,
+            "largestDisplayCallbackGapMS": 202.0
+          },
+          {
+            "round": 2,
+            "tapMS": 4.6,
+            "firstCardMS": 68.6,
+            "firstCoverMS": 113.6,
+            "largestDisplayCallbackGapMS": 66.2
+          },
+          {
+            "round": 3,
+            "tapMS": 3.6,
+            "firstCardMS": 66.6,
+            "firstCoverMS": 125.4,
+            "largestDisplayCallbackGapMS": 71.4
+          }
+        ]
+      },
+      "cand.log": {
+        "300": [
+          {
+            "round": 1,
+            "tapMS": 31.3,
+            "firstCardMS": 368.0,
+            "firstCoverMS": 396.3,
+            "largestDisplayCallbackGapMS": 238.3
+          },
+          {
+            "round": 2,
+            "tapMS": 4.8,
+            "firstCardMS": 69.1,
+            "firstCoverMS": 114.7,
+            "largestDisplayCallbackGapMS": 66.9
+          },
+          {
+            "round": 3,
+            "tapMS": 5.7,
+            "firstCardMS": 86.3,
+            "firstCoverMS": 139.5,
+            "largestDisplayCallbackGapMS": 83.5
+          }
+        ],
+        "20": [
+          {
+            "round": 1,
+            "tapMS": 26.2,
+            "firstCardMS": 226.4,
+            "firstCoverMS": 338.9,
+            "largestDisplayCallbackGapMS": 218.2
+          },
+          {
+            "round": 2,
+            "tapMS": 4.2,
+            "firstCardMS": 79.3,
+            "firstCoverMS": 133.9,
+            "largestDisplayCallbackGapMS": 78.1
+          },
+          {
+            "round": 3,
+            "tapMS": 3.5,
+            "firstCardMS": 62.1,
+            "firstCoverMS": 110.5,
+            "largestDisplayCallbackGapMS": 65.6
+          }
+        ]
+      },
+      "repeat196.log": {
+        "20": [
+          {
+            "round": 1,
+            "tapMS": 154.8,
+            "firstCardMS": 734.2,
+            "firstCoverMS": 789.0,
+            "largestDisplayCallbackGapMS": 461.4
+          },
+          {
+            "round": 2,
+            "tapMS": 4.8,
+            "firstCardMS": 98.7,
+            "firstCoverMS": 175.4,
+            "largestDisplayCallbackGapMS": 104.7
+          },
+          {
+            "round": 3,
+            "tapMS": 4.9,
+            "firstCardMS": 82.9,
+            "firstCoverMS": 155.2,
+            "largestDisplayCallbackGapMS": 87.4
+          }
+        ]
+      },
+      "repeat197.log": {
+        "20": [
+          {
+            "round": 1,
+            "tapMS": 25.5,
+            "firstCardMS": 360.4,
+            "firstCoverMS": 406.4,
+            "largestDisplayCallbackGapMS": 241.2
+          },
+          {
+            "round": 2,
+            "tapMS": 4.1,
+            "firstCardMS": 79.3,
+            "firstCoverMS": 137.0,
+            "largestDisplayCallbackGapMS": 78.4
+          },
+          {
+            "round": 3,
+            "tapMS": 4.0,
+            "firstCardMS": 75.5,
+            "firstCoverMS": 133.2,
+            "largestDisplayCallbackGapMS": 74.6
+          }
+        ]
+      },
+      "next.log": {
+        "300": [
+          {
+            "round": 1,
+            "tapMS": 37.5,
+            "firstCardMS": 330.9,
+            "firstCoverMS": 432.4,
+            "largestDisplayCallbackGapMS": 307.7
+          },
+          {
+            "round": 2,
+            "tapMS": 4.9,
+            "firstCardMS": 77.7,
+            "firstCoverMS": 123.9,
+            "largestDisplayCallbackGapMS": 75.2
+          },
+          {
+            "round": 3,
+            "tapMS": 3.6,
+            "firstCardMS": 116.6,
+            "firstCoverMS": 123.3,
+            "largestDisplayCallbackGapMS": 63.2
+          }
+        ],
+        "20": [
+          {
+            "round": 1,
+            "tapMS": 26.0,
+            "firstCardMS": 297.1,
+            "firstCoverMS": 420.4,
+            "largestDisplayCallbackGapMS": 295.3
+          },
+          {
+            "round": 2,
+            "tapMS": 11.9,
+            "firstCardMS": 88.4,
+            "firstCoverMS": 134.7,
+            "largestDisplayCallbackGapMS": 79.1
+          },
+          {
+            "round": 3,
+            "tapMS": 4.1,
+            "firstCardMS": 79.6,
+            "firstCoverMS": 141.8,
+            "largestDisplayCallbackGapMS": 83.5
+          }
+        ]
+      }
+    },
+    "testConditions": "Optimized iOS simulator; silent, local media; same timeline image to author. First visit after launch followed by two repeat visits. 20/300 is first page item count. Callback gap is not physical FPS. Host load varies between launches. base/repeat196 are 196; cand/repeat197 are accepted 197; next.log is discarded experiment.",
+    "timeProfiler196": {
+      "intervalMs": 199.2,
+      "mainThreadSamples": 199,
+      "typeMetadataOrConformanceSamples": 97,
+      "scope": "one 300-item fixture trace, main thread only, top 12 frames classification"
+    },
+    "testCorrections": [
+      "Original business page geometry assertion compared the top panel against the transparent full-width bottom accessibility container. The same 16 vs 0 mismatch reproduced on 196. The final test checks panel edges derived from four hittable buttons and runs both normal and nested exit."
+    ],
+    "discardedExperiment": "Conditional removal of ScrollViewReader. 20-item first cover was slower. Its timeline queue/position test also failed at the initial fixture counter assertion. It is absent from the signed sources.",
+    "repeatConditions": "The second 196 simulator measurement overlapped preparation of the signed Release. Both repeat measurements used the same simulator and fixture; overlap reduces comparability for timing."
+  },
+  "deviceUpgrade": {
+    "candidateBuild": "197",
+    "installed": true,
+    "launched": true,
+    "stage": "installed_data_verified_launched",
+    "previousBuild": "196",
+    "installedBuild": "197",
+    "dataContinuity": {
+      "support": {
+        "unchanged": true,
+        "entries": 213
+      },
+      "offlineIndexes": {
+        "unchanged": true,
+        "entries": 1
+      },
+      "preferences": {
+        "unchanged": true,
+        "entries": 1
+      },
+      "caches": {
+        "unchanged": true,
+        "entries": 1194
+      }
+    },
+    "launchArguments": {
+      "muted": true
+    }
+  },
+  "sideloadPackage": {
+    "bundle_identifier": "com.xueyj.civitviewer",
+    "version": "1.1.0",
+    "build": "197",
+    "minimum_ios": "17.0",
+    "platforms": [
+      "iPhoneOS"
+    ],
+    "ipa_filename": "CivitViewer-1.1.0-build197-sideload.ipa",
+    "ipa_bytes": 8879350,
+    "ipa_sha256": "f4e49728046cd41f4121227a88bdc9e0354cd805ba85fe9ced5883fec0c1e90d",
+    "packaged_regular_files": 11,
+    "macho_binaries_checked": 2,
+    "personal_provisioning_profiles": 0,
+    "personal_certificate_signatures": 0,
+    "personal_signing_entitlements": 0,
+    "local_checksum_signatures": "ad-hoc, must be replaced by recipient signing",
+    "deep_strict_codesign_passed": true,
+    "ipa_crc_and_file_hashes_passed": true,
+    "main_executable_has_no_coverage_sections": true,
+    "original_input_app_unchanged": true,
+    "recipient_resigning_required": true,
+    "device_install_after_recipient_resigning": "NOT_TESTED"
+  }
+}

@@ -1,5 +1,8 @@
 import Foundation
 import Combine
+#if canImport(AppKit)
+import AppKit
+#endif
 
 @main struct MediaPrefetchChecks {
     @MainActor static func main() async throws {
@@ -8,7 +11,9 @@ import Combine
         let legacy = CommandLine.arguments[2] == "--baseline51"
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("media-prefetch-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
-        let cache = MediaCache(directoryURL: root, monitorNetwork: false, diagnostics: nil, availableBytesProvider: { 2_000_000_000 })
+        // Independent cache owners must be siblings. A child cache directory
+        // inside this inventory correctly makes its regular-file scan UNKNOWN.
+        let cache = MediaCache(directoryURL: root.appendingPathComponent("primary-cache"), monitorNetwork: false, diagnostics: nil, availableBytesProvider: { 2_000_000_000 })
         let defaults = UserDefaults.standard
         let prior = defaults.object(forKey: "wifiVideoPrefetch")
         defaults.set(false, forKey: "wifiVideoPrefetch")
@@ -41,6 +46,16 @@ import Combine
         func resetStats() async throws {
             _ = try await URLSession.shared.data(from: base.appendingPathComponent("reset"))
         }
+        #if canImport(AppKit)
+        func tinyJPEG() -> Data {
+            let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 4, pixelsHigh: 4,
+                bitsPerSample: 8, samplesPerPixel: 3, hasAlpha: false, isPlanar: false,
+                colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+            let color = NSColor(calibratedRed: 0.1, green: 0.4, blue: 0.8, alpha: 1)
+            for y in 0..<4 { for x in 0..<4 { bitmap.setColor(color, atX: x, y: y) } }
+            return bitmap.representation(using: .jpeg, properties: [:])!
+        }
+        #endif
         func waitForRequest(_ path: String, timeout: Double = 7) async -> Bool {
             let end = Date().addingTimeInterval(timeout)
             while Date() < end {
@@ -57,10 +72,10 @@ import Combine
             }
             return false
         }
-        func waitUntil(_ timeout: Double = 7, _ predicate: @MainActor () -> Bool) async -> Bool {
+        func waitUntil(_ timeout: Double = 7, _ predicate: @MainActor () async -> Bool) async -> Bool {
             let end = Date().addingTimeInterval(timeout)
-            while Date() < end { if predicate() { return true }; try? await Task.sleep(for: .milliseconds(20)) }
-            return predicate()
+            while Date() < end { if await predicate() { return true }; try? await Task.sleep(for: .milliseconds(20)) }
+            return await predicate()
         }
         func runWindow(_ round: Int) async throws -> [String: Any] {
             let roundItems = [item(round * 10, "r\(round)-current"),
@@ -74,11 +89,24 @@ import Combine
                 await task.value
             #else
                 let controller = MediaPreloader(cache: cache)
+                var preparedCoverIDs = Set<String>()
+                controller.onCoverReady = { context, generation, preview in
+                    precondition(context == "round-\(round)" && generation == cache.repairGeneration)
+                    preparedCoverIDs.insert(preview.request.identity)
+                }
                 controller.update(roundItems, after: 0, count: 3, context: "round-\(round)", wifiOnly: false)
-                let ready = await waitUntil { controller.snapshot.ready >= 5 }
+                let ready = await waitUntil {
+                    controller.snapshot.ready >= 5 && cache.preloadStatus?.ready == 3 &&
+                        cache.preloadStatus?.total == 3 && cache.preloadStatus?.target == 3
+                }
                 precondition(ready, "All five window targets must complete")
                 precondition(cache.preloadStatus?.ready == 3 && cache.preloadStatus?.total == 3 && cache.preloadStatus?.target == 3,
                              "Visible preload status counts primary works rather than extra poster files")
+                if round == 1 {
+                    let expected = MediaPosterPolicy.coverRequest(source: roundItems[1].mediaURL!, declared: roundItems[1].posterURL, isVideo: true)
+                    precondition(preparedCoverIDs.contains(expected.identity),
+                                 "A completed cover decode is published to the bounded preview consumer")
+                }
                 controller.stop()
             #endif
             let elapsed = Int(Date().timeIntervalSince(started) * 1000)
@@ -86,17 +114,149 @@ import Combine
             let req = serverStats["requests"] as? [String: Any] ?? [:]
             let timing = serverStats["firstRequestMs"] as? [String: Int] ?? [:]
             let paths = ["r\(round)-video1", "r\(round)-video2", "r\(round)-poster1", "r\(round)-poster2", "r\(round)-image3"]
-            let completed = paths.filter { path in
-                let isVideo = path.contains("video")
-                return cache.cached(base.appendingPathComponent(path), video: isVideo) != nil
-            }.count
+            var completed = 0
+            for path in paths {
+                if await cache.cached(base.appendingPathComponent(path), video: path.contains("video")) != nil { completed += 1 }
+            }
             precondition(completed == 5, "Every comparison round must cache all five expected files; observed \(completed)")
+            #if !LEGACY_PREFETCH51
+            if round == 1 {
+                let request = MediaPosterPolicy.coverRequest(source: roundItems[1].mediaURL!, declared: roundItems[1].posterURL, isVideo: true)
+                let decodedAtCoverTier = await cache.decodedCoverPreview(request)
+                let schedulerMemoryHit = cache.preparedCoverMemory(request)
+                let largerTier = MediaPosterPolicy.CoverRequest(source: request.source, declared: request.declared,
+                    isVideo: request.isVideo, candidates: request.candidates, decodePixels: 2048)
+                let incorrectlyReusedLargeTier = await cache.decodedCoverPreview(largerTier)
+                let afterLookup = try await stats()["requests"] as? [String: Int] ?? [:]
+                precondition((req["/r1-poster1"] as? Int) == 1 && decodedAtCoverTier != nil && schedulerMemoryHit != nil &&
+                             incorrectlyReusedLargeTier == nil && afterLookup["/r1-poster1"] == 1 && afterLookup.count == req.count,
+                             "Preload must fetch the formal primary cover once and publish only its decoded 512px tier")
+            }
+            #endif
             let videoTimes = [timing["/r\(round)-video1"], timing["/r\(round)-video2"]].compactMap { $0 }
             return ["round": round, "firstVideoRequestMs": videoTimes.min() as Any? ?? NSNull(), "allFiveCompleteMs": completed == 5 ? elapsed : NSNull(), "completedFiles": completed, "expectedFiles": 5]
         }
 
         var rounds: [[String: Any]] = []
         for index in 1...3 { rounds.append(try await runWindow(index)) }
+
+        var generatedCoverMeasurements: [[String: Int]] = []
+        #if !LEGACY_PREFETCH51
+        try await resetStats()
+        let styleItem = item(390, "style-original-image", poster: "style-cover-image")
+        let statusBeforeCoverOnly = cache.preloadStatus
+        let coverOnly = MediaPreloader(cache: cache, network: Just(true).eraseToAnyPublisher())
+        coverOnly.update([item(389, "style-current"), styleItem], after: 0, count: 3,
+                         context: "style-cover-only", wifiOnly: false, coverOnly: true)
+        let styleCoverReady = await waitUntil { coverOnly.snapshot.ready == 1 }
+        let styleCoverRequests = try await stats()["requests"] as? [String: Int] ?? [:]
+        precondition(styleCoverReady && styleCoverRequests["/style-cover-image"] == 1 && styleCoverRequests["/style-original-image"] == nil,
+                     "Timeline cover-only mode uses the declared cover URL and never downloads the original image")
+        precondition(cache.preloadStatus == statusBeforeCoverOnly,
+                     "Silent cover-only warm does not replace the visible preload-status owner")
+        coverOnly.stop()
+        precondition(cache.preloadStatus == statusBeforeCoverOnly,
+                     "Stopping a cover-only warm leaves visible preload status unchanged")
+
+        try await resetStats()
+        let ordinary = MediaPreloader(cache: cache, network: Just(true).eraseToAnyPublisher())
+        ordinary.update([item(391, "ordinary-current"), styleItem], after: 0, count: 3,
+                        context: "style-ordinary-original", wifiOnly: false)
+        let ordinaryReady = await waitUntil { ordinary.snapshot.ready == 1 }
+        let ordinaryRequests = try await stats()["requests"] as? [String: Int] ?? [:]
+        precondition(ordinaryReady && ordinaryRequests["/style-original-image"] == 1 && ordinaryRequests["/style-cover-image"] == nil,
+                     "Ordinary deck preloading retains the raw image URL used by imageResource")
+        ordinary.stop()
+
+        try await resetStats()
+        let generatedSource = base.appendingPathComponent("generated-opaque-video")
+        let generatedRequest = MediaPosterPolicy.coverRequest(source: generatedSource, declared: nil, isVideo: true)
+        precondition(generatedRequest.candidates.isEmpty, "The opaque video fixture has no safe remote cover candidate")
+        // Permit a controlled comparison with an expensive disk budget read.
+        let probeDelayMs = Int(ProcessInfo.processInfo.environment["CIVIT_COVER_BUDGET_PROBE_DELAY_MS"] ?? "") ?? 0
+        for sample in 0..<5 {
+            var budgetReads = 0
+            let generatedCache = MediaCache(directoryURL: root.appendingPathComponent("cover-budget-probe-\(sample)"),
+                monitorNetwork: false, diagnostics: nil, availableBytesProvider: {
+                    budgetReads += 1
+                    if probeDelayMs > 0 { Thread.sleep(forTimeInterval: Double(probeDelayMs) / 1000) }
+                    return 2_000_000_000
+                })
+            try await generatedCache.storeGeneratedPoster(tinyJPEG(), source: generatedSource, expectedGeneration: generatedCache.repairGeneration)
+            await generatedCache.trim()
+            let generatedController = MediaPreloader(cache: generatedCache, network: Just(true).eraseToAnyPublisher())
+            let generatedItem = item(392, "generated-opaque-video", video: true)
+            var readyMeasurement: [String: Int]?
+            budgetReads = 0
+            let started = ContinuousClock.now
+            generatedController.onCoverReady = { _, _, _ in
+                let elapsed = started.duration(to: .now).components
+                readyMeasurement = ["budgetReadsBeforeReady": budgetReads,
+                                    "readyMicroseconds": Int(elapsed.seconds) * 1_000_000 + Int(elapsed.attoseconds / 1_000_000_000_000),
+                                    "injectedLatencyMsPerBudgetRead": probeDelayMs]
+            }
+            generatedController.update([item(393, "generated-current"), generatedItem], after: 0, count: 3,
+                                       context: "generated-cover-hit", wifiOnly: false, coverOnly: true)
+            let generatedReady = await waitUntil { generatedController.snapshot.ready == 1 }
+            let generatedMemoryHit = generatedCache.preparedCoverMemory(generatedRequest)
+            guard generatedReady, generatedMemoryHit != nil, let readyMeasurement else {
+                preconditionFailure("An empty-candidate cover request reuses its generated poster")
+            }
+            precondition(readyMeasurement["budgetReadsBeforeReady"] == 0,
+                         "An already cached cover is published without probing download budgets")
+            generatedCoverMeasurements.append(readyMeasurement)
+            generatedController.stop()
+        }
+        let generatedRequests = try await stats()["requests"] as? [String: Int] ?? [:]
+        precondition(generatedRequests.isEmpty, "Preparing generated covers does not access the network")
+
+        try await resetStats()
+        let limitedCoverCache = MediaCache(directoryURL: root.appendingPathComponent("cover-budget-retry"),
+            monitorNetwork: false, diagnostics: nil, availableBytesProvider: { 1_020_000_000 })
+        let limitedCoverController = MediaPreloader(cache: limitedCoverCache, network: Just(true).eraseToAnyPublisher())
+        let limitedCoverItems = [
+            item(410, "cover-budget-current"),
+            item(411, "cover-budget-original-a", poster: "cover-budget-poster-a"),
+            item(412, "cover-budget-original-b", poster: "cover-budget-poster-b")
+        ]
+        limitedCoverController.update(limitedCoverItems, after: 0, count: 3,
+                                      context: "cover-budget-retry", wifiOnly: false, concurrency: 2, coverOnly: true)
+        let secondCoverDeferred = await waitUntil {
+            limitedCoverController.snapshot.active == 1 && limitedCoverController.snapshot.failed == 1
+        }
+        precondition(secondCoverDeferred, "Only one cold cover can reserve the constrained shared budget")
+        let bothCoversReady = await waitUntil { limitedCoverController.snapshot.ready == 2 }
+        let limitedCoverRequests = try await stats()["requests"] as? [String: Int] ?? [:]
+        precondition(bothCoversReady && limitedCoverController.snapshot.failed == 0 && limitedCoverCache.pendingDownloadBudget == 0 &&
+                     limitedCoverRequests == ["/cover-budget-poster-a": 1, "/cover-budget-poster-b": 1],
+                     "After the reservation is released, the deferred cover retries once without fetching either original")
+        limitedCoverController.stop()
+
+        try await resetStats()
+        let noCoverController = MediaPreloader(cache: cache, network: Just(true).eraseToAnyPublisher())
+        noCoverController.update([item(394, "no-generated-current"), item(395, "opaque-video-miss", video: true)], after: 0, count: 3,
+                                 context: "generated-cover-miss", wifiOnly: false, coverOnly: true)
+        let noCoverFailed = await waitUntil { noCoverController.snapshot.failed == 1 }
+        let noCoverRequests = try await stats()["requests"] as? [String: Int] ?? [:]
+        precondition(noCoverFailed && noCoverRequests.isEmpty,
+                     "An empty-candidate miss stays neutral and never fetches the original video")
+        noCoverController.stop()
+
+        try await resetStats()
+        let focusImage = item(396, "writer-focus-image")
+        let writer = MediaPreloader(cache: cache, network: Just(true).eraseToAnyPublisher())
+        writer.update([item(397, "writer-before"), focusImage], after: 0, count: 3,
+                      context: "writer-current-raw", wifiOnly: false, concurrency: 1)
+        let writerStarted = await waitForRequest("/writer-focus-image")
+        writer.update([item(397, "writer-before"), focusImage], after: 1, count: 3,
+                      context: "writer-current-raw", wifiOnly: false, concurrency: 1)
+        let retainedCurrentWriter = writer.snapshot.active == 1
+        let focusImageReady = await waitUntil { (await cache.cached(focusImage.mediaURL!, video: false)) != nil }
+        let writerRequests = try await stats()["requests"] as? [String: Int] ?? [:]
+        precondition(writerStarted && retainedCurrentWriter && focusImageReady && writerRequests["/writer-focus-image"] == 1,
+                     "A raw image writer remains attached when its item becomes current focus")
+        writer.stop()
+        #endif
 
         var focusVideo2Requests = 0
         #if !LEGACY_PREFETCH51
@@ -107,7 +267,7 @@ import Combine
             let imageFailed = await waitUntil { recovery.snapshot.failed == 1 }
             precondition(imageFailed, "Recovery begins with an actual failed image request")
             recoveryPath.send(false) // Offline -> cellular can remain non-unmetered.
-            let recoveredImage = await waitUntil { cache.cached(recoveryItems[1].mediaURL!, video: false) != nil }
+            let recoveredImage = await waitUntil { (await cache.cached(recoveryItems[1].mediaURL!, video: false)) != nil }
             precondition(recoveredImage, "A new path snapshot retries failed images without another page update")
             let recoveredRequests = try await stats()["requests"] as? [String: Int] ?? [:]
             precondition(recoveredRequests["/recover-failure-image"] == 2 && recoveredRequests["/recover-paused-video"] == nil,
@@ -121,7 +281,7 @@ import Combine
             let lateStarted = await waitForRequest("/recover-inflight-image")
             precondition(lateStarted, "The old-path request is running before the network changes")
             latePath.send(false)
-            let lateReady = await waitUntil { cache.cached(lateItems[1].mediaURL!, video: false) != nil }
+            let lateReady = await waitUntil { (await cache.cached(lateItems[1].mediaURL!, video: false)) != nil }
             precondition(lateReady, "A late failure from the prior path receives one attempt on the latest path")
             lateRecovery.stop()
 
@@ -159,9 +319,9 @@ import Combine
             let smallOwner = MediaPreloader(cache: smallBudget, network: Just(true).eraseToAnyPublisher())
             let smallItems = [item(330, "space-current"), item(331, "space-small-video1", video: true), item(332, "space-small-video2", video: true)]
             smallOwner.update(smallItems, after: 0, count: 3, context: "small-space", wifiOnly: false)
-            let smallFirstReady = await waitUntil { smallBudget.cached(smallItems[1].mediaURL!, video: true) != nil }
+            let smallFirstReady = await waitUntil { (await smallBudget.cached(smallItems[1].mediaURL!, video: true)) != nil }
             precondition(smallFirstReady, "A constrained owner completes its first admitted target")
-            let smallSecondReady = await waitUntil { smallBudget.cached(smallItems[2].mediaURL!, video: true) != nil }
+            let smallSecondReady = await waitUntil { (await smallBudget.cached(smallItems[2].mediaURL!, video: true)) != nil }
             precondition(smallSecondReady, "After a small file completes, deferred work automatically reuses the released budget without another page gesture")
             smallOwner.stop()
             // Network recovery, stop, context changes, clear, low-space, and duplicate
@@ -172,17 +332,18 @@ import Combine
             let controller = MediaPreloader(cache: contractCache, network: subject.eraseToAnyPublisher())
             let contractItems = [item(80, "c-current"), item(81, "c-video", video: true, poster: "c-poster"), item(82, "c-image")]
             controller.update(contractItems, after: 0, count: 3, context: "wifi", wifiOnly: true)
-            let imageReady = await waitUntil { contractCache.cached(contractItems[2].mediaURL!, video: false) != nil }
+            let imageReady = await waitUntil { (await contractCache.cached(contractItems[2].mediaURL!, video: false)) != nil }
             precondition(imageReady, "Wi-Fi pause must still allow image prefetch")
             let pausedStats = try await stats()["requests"] as? [String: Int] ?? [:]
             precondition(pausedStats["/c-video"] == nil, "Wi-Fi pause must not request video")
             subject.send(true)
-            let videoReady = await waitUntil { contractCache.cached(contractItems[1].mediaURL!, video: true) != nil }
+            let videoReady = await waitUntil { (await contractCache.cached(contractItems[1].mediaURL!, video: true)) != nil }
             precondition(videoReady, "Network recovery must resume video without another update")
             controller.stop()
             subject.send(false)
             controller.update(contractItems, after: 0, count: 3, context: "wifi", wifiOnly: true)
-            precondition(controller.snapshot.ready == 3, "Wi-Fi restrictions must still reuse all media already cached locally")
+            let reusedLocals = await waitUntil { controller.snapshot.ready == 3 }
+            precondition(reusedLocals, "Wi-Fi restrictions must still reuse all media already cached locally")
             controller.stop()
 
             let stopped = MediaPreloader(cache: contractCache, network: Just(true).eraseToAnyPublisher())
@@ -192,9 +353,9 @@ import Combine
             precondition(stopStarted, "Stop case must cancel an already-started download")
             stopped.stop()
             try? await Task.sleep(for: .milliseconds(1_500))
-            precondition(contractCache.cached(stopItems[1].mediaURL!, video: true) == nil, "Stopped late result must not persist")
+            let cacheObserved5_0 = await contractCache.cached(stopItems[1].mediaURL!, video: true); precondition(cacheObserved5_0 == nil, "Stopped late result must not persist")
             stopped.update(stopItems, after: 0, count: 3, context: "stop", wifiOnly: false)
-            let resumedAfterStop = await waitUntil { contractCache.cached(stopItems[1].mediaURL!, video: true) != nil }
+            let resumedAfterStop = await waitUntil { (await contractCache.cached(stopItems[1].mediaURL!, video: true)) != nil }
             precondition(resumedAfterStop, "The same retained owner must resume after an explicit update following stop")
             stopped.stop()
 
@@ -206,7 +367,7 @@ import Combine
             precondition(oldStarted, "Context case must start the old-context download")
             contextController.update(newContextItems, after: 0, count: 3, context: "new-context", wifiOnly: false)
             try? await Task.sleep(for: .milliseconds(1_500))
-            precondition(contractCache.cached(oldContextItems[1].mediaURL!, video: true) == nil, "Old-context late result must not persist")
+            let cacheObserved4_0 = await contractCache.cached(oldContextItems[1].mediaURL!, video: true); precondition(cacheObserved4_0 == nil, "Old-context late result must not persist")
             contextController.stop()
 
             let clearItems = [item(83, "clear-current"), item(84, "clear-video", video: true, poster: "clear-poster"), item(85, "clear-image")]
@@ -214,15 +375,15 @@ import Combine
             beforeClear.update(clearItems, after: 0, count: 3, context: "clear", wifiOnly: false)
             let clearStarted = await waitForRequest("/clear-video")
             precondition(clearStarted, "Clear case must begin an unfinished HTTP download")
-            contractCache.clear()
+            (await contractCache.clear())
             try? await Task.sleep(for: .milliseconds(1_500))
             let afterClearStats = try await stats()["requests"] as? [String: Int] ?? [:]
             let clearCount = afterClearStats["/clear-video", default: 0]
-            precondition(contractCache.cached(clearItems[1].mediaURL!, video: true) == nil, "Clear must discard the late in-flight result")
+            let cacheObserved3_0 = await contractCache.cached(clearItems[1].mediaURL!, video: true); precondition(cacheObserved3_0 == nil, "Clear must discard the late in-flight result")
             precondition(clearCount == 1, "Clear must not restart the canceled request")
             beforeClear.update(clearItems, after: 0, count: 3, context: "clear", wifiOnly: false)
             let resumedRequest = await waitForRequestCount("/clear-video", 2)
-            let resumedCache = await waitUntil { contractCache.cached(clearItems[1].mediaURL!, video: true) != nil }
+            let resumedCache = await waitUntil { (await contractCache.cached(clearItems[1].mediaURL!, video: true)) != nil }
             let resumed = resumedRequest && resumedCache
             precondition(resumed, "A new update must resume prefetch after clear")
             beforeClear.stop()
@@ -243,7 +404,7 @@ import Combine
             duplicate.update(duplicateItems, after: 0, count: 3, context: "duplicate", wifiOnly: false)
             let duplicateRequest = await waitForRequest("/dup-video")
             precondition(duplicateRequest, "Duplicate-update case must perform the expected video request")
-            let duplicateReady = await waitUntil { contractCache.cached(duplicateItems[1].mediaURL!, video: true) != nil }
+            let duplicateReady = await waitUntil { (await contractCache.cached(duplicateItems[1].mediaURL!, video: true)) != nil }
             precondition(duplicateReady, "Duplicate-update target must complete")
             duplicate.update(duplicateItems, after: 0, count: 3, context: "duplicate", wifiOnly: false)
             try? await Task.sleep(for: .milliseconds(250))
@@ -258,16 +419,35 @@ import Combine
             let addressA = base.appendingPathComponent("owner-a-image"), addressB = base.appendingPathComponent("owner-b-image")
             let savedA = await owners.image(addressA), savedB = await owners.image(addressB)
             precondition(savedA != nil && savedB != nil, "Owner protection starts with two actual decoded fixture files")
-            owners.setPrefetchTargets([(addressA, false)], owner: ownerA)
-            owners.setPrefetchTargets([(addressB, false)], owner: ownerB)
-            freeBytes = 0; owners.trim()
-            precondition(owners.cached(addressA, video: false) != nil && owners.cached(addressB, video: false) != nil,
+            (await owners.setPrefetchTargets([(addressA, false)], owner: ownerA))
+            (await owners.setPrefetchTargets([(addressB, false)], owner: ownerB))
+            freeBytes = 0; (await owners.trim())
+            let cacheObserved2_0 = await owners.cached(addressA, video: false); let cacheObserved2_1 = await owners.cached(addressB, video: false); precondition(cacheObserved2_0 != nil && cacheObserved2_1 != nil,
                          "Both independent windows remain protected under eviction pressure")
-            owners.removePrefetchTargets(owner: ownerA)
-            precondition(owners.cached(addressA, video: false) == nil && owners.cached(addressB, video: false) != nil,
+            (await owners.removePrefetchTargets(owner: ownerA))
+            let cacheObserved1_0 = await owners.cached(addressA, video: false); let cacheObserved1_1 = await owners.cached(addressB, video: false); precondition(cacheObserved1_0 == nil && cacheObserved1_1 != nil,
                          "An old owner cannot release another timeline's cache protection")
-            owners.removePrefetchTargets(owner: ownerB)
-            precondition(owners.cached(addressB, video: false) == nil, "The final owner releases its own files for normal eviction")
+            (await owners.removePrefetchTargets(owner: ownerB))
+            let cacheObserved0_0 = await owners.cached(addressB, video: false); precondition(cacheObserved0_0 == nil, "The final owner releases its own files for normal eviction")
+
+            let healthyDirectory = root.appendingPathComponent("healthy-inventory")
+            try FileManager.default.createDirectory(at: healthyDirectory, withIntermediateDirectories: true)
+            for index in 0..<70 {
+                try Data([1]).write(to: healthyDirectory.appendingPathComponent("fixture-\(index).img"))
+            }
+            let healthy = MediaCache(directoryURL: healthyDirectory, monitorNetwork: false,
+                diagnostics: nil, availableBytesProvider: { 2_000_000_000 })
+            let healthyOwner = UUID()
+            let healthyAddress = base.appendingPathComponent("healthy-first-image")
+            let healthyFirst = await healthy.image(healthyAddress)
+            precondition(healthyFirst != nil, "Healthy inventory fixture admits its first actual cover")
+            let initialYields = await healthy.maintenanceYieldCount()
+            let healthyNext = await healthy.image(base.appendingPathComponent("healthy-new-image"))
+            await healthy.setPrefetchTargets([(healthyAddress, false)], owner: healthyOwner)
+            await healthy.removePrefetchTargets(owner: healthyOwner)
+            let afterYields = await healthy.maintenanceYieldCount()
+            precondition(healthyNext != nil && initialYields > 0 && afterYields == initialYields,
+                         "Installing and releasing under a verified healthy budget must not walk the full inventory")
 
             let boundedItems = [item(200, "bounded-current")] + (1...12).map { item(200 + $0, "bounded-image-\($0)") }
             let bounded = MediaPreloader(cache: contractCache, network: Just(true).eraseToAnyPublisher())
@@ -295,7 +475,7 @@ import Combine
         try? await Task.sleep(for: .milliseconds(80))
         firstFocusTask.cancel()
         let restartedFocusTask = Task { await cache.prefetch(focusItems, after: 1) }
-        _ = await waitUntil { cache.cached(focusItems[2].mediaURL!, video: true) != nil }
+        _ = await waitUntil { (await cache.cached(focusItems[2].mediaURL!, video: true)) != nil }
         await restartedFocusTask.value
         #else
         let focusController = MediaPreloader(cache: cache, network: Just(true).eraseToAnyPublisher())
@@ -304,7 +484,7 @@ import Combine
         precondition(focusStarted, "Current focus case must start video2 before moving focus")
         try? await Task.sleep(for: .milliseconds(80))
         focusController.update(focusItems, after: 1, count: 3, context: "focus", wifiOnly: false)
-        let focusReady = await waitUntil { cache.cached(focusItems[2].mediaURL!, video: true) != nil }
+        let focusReady = await waitUntil { (await cache.cached(focusItems[2].mediaURL!, video: true)) != nil }
         precondition(focusReady, "Unchanged future video must complete after moving focus")
         focusController.stop()
         #endif
@@ -323,6 +503,28 @@ import Combine
             else { defaults.removeObject(forKey: "cacheLimitGB") }
         }
         defaults.set(cacheLimitArgument, forKey: "cacheLimitGB")
+        if cacheLimitArgument >= 5 {
+            try await resetStats()
+            let coverCache = MediaCache(directoryURL: root.appendingPathComponent("near-cover-order"),
+                monitorNetwork: false, diagnostics: nil, availableBytesProvider: { 10_000_000_000 })
+            let preloader = MediaPreloader(cache: coverCache, network: Just(true).eraseToAnyPublisher())
+            let works = (0..<6).map { item(5900 + $0, "concurrency61-near-cover-\($0)", video: true,
+                                          poster: "near-cover-poster-\($0)") }
+            let next = works[2]
+            var nextCoverReady = false
+            preloader.onCoverReady = { _, _, preview in
+                if preview.request.source == next.mediaURL { nextCoverReady = true }
+            }
+            preloader.update(works, after: 1, count: 6, context: "near-cover-order", wifiOnly: false, concurrency: 4)
+            let readyBeforeVideoBytes = await waitUntil(3) { nextCoverReady }
+            let nextVideoStarted = await waitForRequest("/concurrency61-near-cover-2", timeout: 2)
+            _ = try await URLSession.shared.data(from: base.appendingPathComponent("release-concurrency"))
+            precondition(readyBeforeVideoBytes && nextVideoStarted,
+                         "The immediate forward video and its cover should start even with a previous video in the window")
+            let completed = await waitUntil { preloader.snapshot.ready == preloader.snapshot.desired && preloader.snapshot.active == 0 }
+            precondition(completed)
+            preloader.stop()
+        }
         let videoReservation = Int64(512 * 1024 * 1024)
         try await resetStats()
         let bufferingCache = MediaCache(directoryURL: root.appendingPathComponent("buffering-window"), monitorNetwork: false,
@@ -629,10 +831,10 @@ import Combine
             _ = try await URLSession.shared.data(from: base.appendingPathComponent("release-concurrency"))
             let largeReady = await waitUntil(20) { largeController.snapshot.ready == 8 }
             precondition(largeReady, "All eight file-backed videos complete through bounded disk downloads")
-            let cachedBytes = largeItems.dropFirst().compactMap { $0.mediaURL }
-                .compactMap { largeCache.cached($0, video: true) }
-                .compactMap { try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize }
-                .reduce(0, +)
+            var cachedBytes = 0
+            for url in largeItems.dropFirst().compactMap({ $0.mediaURL }) {
+                if let file = await largeCache.cached(url, video: true), let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize { cachedBytes += size }
+            }
             largeController.stop()
             _ = await waitUntil(3) { largeCache.pendingDownloadBudget == 0 }
             precondition(cachedBytes == 64 * 1024 * 1024 && largeCache.pendingDownloadBudget == 0,
@@ -683,6 +885,7 @@ import Combine
             "concurrencyMeasurements": concurrencyMeasurements,
             "cacheLimitGB": cacheLimitArgument,
             "adjacentWindow170": "previous-video-budget-and-dedup-checked",
+            "generatedCoverMeasurements": generatedCoverMeasurements,
             "observedRangesMs": ["firstVideoRequest": firstVideoTimes.isEmpty ? NSNull() : [firstVideoTimes.min()!, firstVideoTimes.max()!] as Any,
                                  "allFiveComplete": completionTimes.isEmpty ? NSNull() : [completionTimes.min()!, completionTimes.max()!] as Any],
             "coverage": ["expectedPerRound": 5, "observedCompletePerRound": rounds.map { $0["completedFiles"] ?? 0 }],

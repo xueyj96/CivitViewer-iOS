@@ -6,7 +6,7 @@ output_dir="$task_root/build"
 mkdir -p "$output_dir"
 log_file="$output_dir/172-playback-pool-final-checks.log"
 
-source_file="$task_root/CivitViewer/VideoPlaybackSessions.swift"
+source_file="$task_root/CivitViewer/Media/VideoPlaybackSessions.swift"
 source_sha_before="$(shasum -a 256 "$source_file" | awk '{print $1}')"
 if [[ -n "${EXPECTED_PLAYBACK_POOL_SHA:-}" && "$source_sha_before" != "$EXPECTED_PLAYBACK_POOL_SHA" ]]; then
   printf 'Expected pool SHA %s; found %s\n' "$EXPECTED_PLAYBACK_POOL_SHA" "$source_sha_before" >&2

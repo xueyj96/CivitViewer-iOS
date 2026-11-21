@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 root = Path(__file__).resolve().parents[1]
-site_path = root / "CivitViewer/SiteSession.swift"
+site_path = root / "CivitViewer/Site/SiteSession.swift"
 test_path = root / "Tests/SessionBoundaryChecks.swift"
 site = site_path.read_text()
 test = test_path.read_text()
@@ -58,7 +58,7 @@ def extract_braced(marker: str) -> str:
 
 
 identity_line = next(line.strip() for line in site.splitlines() if line.strip().startswith("var feedIdentity: String {"))
-request = extract_braced("private func request<T: Decodable>(")
+request = extract_braced("private func request<T: Decodable & Sendable>(")
 request = request.replace("private func request<T:", "func request<T:", 1)
 hydrate_media = extract_braced("private func hydrateMedia(").replace("private func ", "func ", 1)
 
@@ -94,8 +94,8 @@ def run_logged(command, timeout=None):
 
 
 log_path.write_text("")
-sources = ["LocalDiagnostics.swift", "PlaybackDiagnostics.swift", "VideoDuration.swift", "Models.swift",
-           "BrowsingPreferences.swift", "MediaSearch.swift", "LocalTagTypes.swift", "SiteRequestClient.swift"]
+sources = ["Diagnostics/LocalDiagnostics.swift", "Diagnostics/PlaybackDiagnostics.swift", "Media/VideoDuration.swift", "Feed/Models.swift",
+           "Features/Settings/BrowsingPreferences.swift", "Features/Search/MediaSearch.swift", "Features/Search/LocalTagTypes.swift", "Site/SiteRequestClient.swift"]
 run_logged(["xcrun", "swiftc", *(str(root / "CivitViewer" / source) for source in sources), str(generated), "-o", str(binary)])
 run_logged([str(binary)], timeout=45)
 print("Source SiteSession.swift SHA-256:", sha256(site_path.read_bytes()).hexdigest())

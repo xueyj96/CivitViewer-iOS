@@ -3,7 +3,7 @@
 from pathlib import Path
 import http.server, json, os, struct, subprocess, threading, time, zlib, sys
 root = Path(__file__).resolve().parents[1]
-source = (root/'CivitViewer/MediaCache.swift').read_text()
+source = (root/'CivitViewer/Media/Loading/MediaCache.swift').read_text()
 shim = '''import AppKit
 typealias UIImage = NSImage
 extension NSImage {
@@ -13,10 +13,10 @@ extension NSImage {
 }'''
 extracted = root/'build/ImageCacheUnderTest.swift'
 extracted.parent.mkdir(exist_ok=True)
-extracted.write_text(source.replace('import UIKit', shim, 1))
+extracted.write_text(source.replace('import UIKit', shim, 1) + '\n' + (root/'Tests/PreviewQuotaChecks.swift').read_text())
 env = {**os.environ, 'DEVELOPER_DIR':'/Applications/Xcode.app/Contents/Developer'}
 binary = root/'build/image-cache-checks'
-subprocess.run(['xcrun','swiftc',str(root/'CivitViewer/VideoDuration.swift'),str(root/'CivitViewer/Models.swift'),str(root/'CivitViewer/MediaLoadQueue.swift'),str(root/'CivitViewer/MediaFormat.swift'),str(root/'CivitViewer/MediaRepairStore.swift'),str(root/'CivitViewer/PlaybackDiagnostics.swift'),str(root/'CivitViewer/LocalDiagnostics.swift'),str(extracted),str(root/'Tests/ImageCacheChecks.swift'),'-o',str(binary)],check=True,env=env)
+subprocess.run(['xcrun','swiftc',str(root/'CivitViewer/Media/VideoDuration.swift'),str(root/'CivitViewer/Feed/Models.swift'),str(root/'CivitViewer/Media/Loading/MediaLoadQueue.swift'),str(root/'CivitViewer/Media/MediaFormat.swift'),str(root/'CivitViewer/Media/MediaRepairStore.swift'),str(root/'CivitViewer/Diagnostics/PlaybackDiagnostics.swift'),str(root/'CivitViewer/Diagnostics/LocalDiagnostics.swift'),str(extracted),str(root/'Tests/ImageCacheChecks.swift'),str(root/'Tests/MediaCacheConcurrencyChecks.swift'),'-o',str(binary)],check=True,env=env)
 def chunk(t, data):
     return struct.pack('!I',len(data))+t+data+struct.pack('!I',zlib.crc32(t+data)&0xffffffff)
 png = b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('!2I5B',16,16,8,2,0,0,0))+chunk(b'IDAT',zlib.compress((b'\0'+bytes((30,120,210))*16)*16))+chunk(b'IEND',b'')
@@ -34,7 +34,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             active_by_path[self.path]=active_by_path.get(self.path,0)+1
             if self.path == '/shared-quota-image': same_url_max=max(same_url_max,active_by_path[self.path])
         try:
-            time.sleep(0.7 if self.path.startswith('/block-') or (self.path == '/shared-quota-image' and nth == 1) else 0.25)
+            time.sleep(0.7 if self.path.startswith('/block-') or self.path == '/candidate-cancel' or (self.path == '/shared-quota-image' and nth == 1) else 0.25)
             if self.path == '/oversized-image':
                 # Stream a synthetic body beyond the image ceiling without a large allocation.
                 size = 65 * 1024 * 1024
@@ -57,9 +57,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             if self.path in ('/redirect-image','/redirect-403'):
                 self.send_response(302);self.send_header('Location','/video-header-image' if self.path=='/redirect-image' else '/http403');self.end_headers();return
-            code=404 if self.path=='/http404' else 429 if self.path=='/http429' else 403 if self.path=='/http403' else 200
+            code=503 if self.path=='/transient-preview176' and nth==1 else 503 if self.path in ('/persistent-preview176','/candidate-503') else 404 if self.path in ('/http404','/candidate-404') else 429 if self.path in ('/http429','/candidate-429') else 403 if self.path in ('/http403','/candidate-403') else 200
             fixtures = {'/video-poster':'short.mp4','/short-video':'short.mp4','/animated-gif':'animated.gif','/animated-webp':'animated.webp'}
-            body=(root/'Tests/Fixtures'/fixtures[self.path]).read_bytes() if self.path in fixtures else b'<html>login needed</html>' if self.path=='/html-body' else b'{"error":"authentication"}' if self.path=='/json-body' else b'bad image' if self.path=='/recover' and nth==1 else png
+            body=(root/'Tests/Fixtures'/fixtures[self.path]).read_bytes() if self.path in fixtures else b'<html>login needed</html>' if self.path=='/html-body' else b'{"error":"authentication"}' if self.path=='/json-body' else b'bad image' if self.path=='/candidate-bad-image' or (self.path=='/recover' and nth==1) else png
             mime='video/mp4' if self.path in ('/video-poster','/video-header-image','/short-video') else 'text/plain' if self.path=='/mislabel-image' else None if self.path=='/no-type-image' else 'application/octet-stream' if self.path=='/octet-image' else 'image/png'
             self.send_response(code);
             if mime:self.send_header('Content-Type',mime)

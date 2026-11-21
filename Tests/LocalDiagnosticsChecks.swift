@@ -44,6 +44,40 @@ import Foundation
         let lifecycleCodes = lifecycleEntries.filter { $0.area == DiagnosticArea.lifecycle }.map { $0.code }
         check(lifecycleCodes == [.background,.foreground,.appStarted], "Lifecycle events persist newest-first without extra payload fields")
 
+        let trace = NavigationTrace(samples: [
+            .init(ms: 100, event: .leaseAcquired, tab: nil, owner: .edgeReturn, locks: 1, zone: nil),
+            .init(ms: 190, event: .shieldTouch, tab: nil, owner: .edgeReturn, locks: 1, zone: .bottom),
+        ], delayMS: 490, probeMS: 190)
+        await restarted.record(area: .navigation, code: .navigationMainDelayed, navigation: trace)
+        await restarted.record(area: .navigation, code: .navigationTrace, navigation: trace)
+        await restarted.record(area: .navigation, code: .navigationMainResumed,
+                               navigation: .init(samples: Array(repeating: trace.samples[0], count: 41), delayMS: 490, probeMS: 190))
+        let reopened = LocalDiagnosticsStore(fileURL: file, build: 124, now: { clock.date })
+        let traces = try await reopened.entries().filter { $0.area == .navigation }
+        check(traces.count == 1 && traces.first?.navigation == trace, "Bounded offline navigation records persist only with matching event types")
+        let offlineExport = try await reopened.exportData()
+        let logs = try exportDecoder.decode(ExportFixture.self, from: offlineExport).entries
+        check(logs.contains { $0.navigation == trace }, "The existing JSON export includes typed navigation events and timing")
+        try await reopened.clear(minimumNavigationGeneration: 1)
+        await reopened.record(area: .navigation, code: .navigationMainDelayed, navigation: trace, navigationGeneration: 0)
+        await reopened.record(area: .navigation, code: .navigationShieldBlocked,
+                             navigation: .init(samples: trace.samples), navigationGeneration: 1)
+        let postClear = try await reopened.entries()
+        check(postClear.count == 1 && postClear.first?.code == .navigationShieldBlocked,
+              "Queued old diagnostics cannot reappear after clearing history")
+        let pending = NavigationTrace(samples: trace.samples)
+        let withPending = try await reopened.exportData(latestNavigation: pending, navigationGeneration: 1)
+        let exportedPending = try exportDecoder.decode(ExportFixture.self, from: withPending)
+        check(exportedPending.entries.first?.navigation == pending,
+              "Immediate export includes events still in the in-memory window")
+        await reopened.record(area: .navigation, code: .navigationShieldBlocked, navigation: pending, navigationGeneration: 1)
+        await reopened.record(area: .navigation, code: .navigationMainDelayed,
+                              navigation: .init(samples: [], delayMS: 580, probeMS: 510), navigationGeneration: 1)
+        let closeIncidents = try await reopened.entries()
+        check(closeIncidents.filter { $0.code == .navigationShieldBlocked }.count == 2
+              && closeIncidents.contains { $0.code == .navigationMainDelayed && $0.navigation?.samples.isEmpty == true },
+              "Separate shield hits and main stalls are retained even with no elapsed batch interval")
+
         // Global limit: 31 different status keys in one minute accepts 30, then carries suppression.
         let rateFile = root.appendingPathComponent("rate/diagnostics-0.jsonl")
         let rateStore = LocalDiagnosticsStore(fileURL: rateFile, build: 1, now: { clock.date })
@@ -54,6 +88,25 @@ import Foundation
         await rateStore.record(area: .cache, code: .http, httpStatus: 131)
         rateEntries = try await rateStore.entries()
         check(rateEntries.count == 31 && rateEntries[0].suppressed == 1, "Global dropped-event count is carried into the next writable record")
+        for status in 100...128 { await rateStore.record(area: .cache, code: .http, httpStatus: status) }
+        await rateStore.record(area: .navigation, code: .navigationMainDelayed, navigation: trace)
+        let saturated = try await rateStore.entries()
+        check(saturated.contains { $0.navigation == trace }, "The first UI stall still gets stored after other diagnostics exhaust their budget")
+
+        let navigationFile = root.appendingPathComponent("navigation-volume/diagnostics-0.jsonl")
+        let navigationStore = LocalDiagnosticsStore(fileURL: navigationFile, build: 123, now: { clock.date })
+        let fullTrace = NavigationTrace(samples: (0..<40).map {
+            .init(ms: $0 * 150, event: .shieldTouch, tab: 2, owner: .edgeReturn, locks: 1, zone: .bottom)
+        })
+        for _ in 0..<420 {
+            clock.date.addTimeInterval(3)
+            await navigationStore.record(area: .navigation, code: .navigationTrace, navigation: fullTrace)
+        }
+        let boundedReport = try await navigationStore.exportData()
+        let report = try exportDecoder.decode(ExportFixture.self, from: boundedReport)
+        let current = try await navigationStore.entries()
+        check(boundedReport.count <= 1_100_000 && report.entries.first == current.first && report.entries.count < 420,
+              "Full-volume navigation traces export a bounded newest subset after disk rotation")
 
         // Rotation remains bounded by four 256 KiB / 250-event segments and 1,000 entries.
         let boundedFile = root.appendingPathComponent("bounded/diagnostics-0.jsonl")

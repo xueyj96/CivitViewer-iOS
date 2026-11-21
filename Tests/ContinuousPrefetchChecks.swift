@@ -35,13 +35,13 @@ import AVFoundation
         func releaseImageGate() async throws {
             _ = try await URLSession.shared.data(from: base.appendingPathComponent("release-image-gate"))
         }
-        func waitUntil(_ timeout: Double = 8, _ predicate: @MainActor () -> Bool) async -> Bool {
+        func waitUntil(_ timeout: Double = 8, _ predicate: @MainActor () async -> Bool) async -> Bool {
             let end = Date().addingTimeInterval(timeout)
             while Date() < end {
-                if predicate() { return true }
+                if await predicate() { return true }
                 try? await Task.sleep(for: .milliseconds(10))
             }
-            return predicate()
+            return await predicate()
         }
         func waitServer(_ timeout: Double = 8, _ predicate: ([String: Any]) -> Bool) async -> [String: Any]? {
             let end = Date().addingTimeInterval(timeout)
@@ -87,7 +87,9 @@ import AVFoundation
             let reverseSnapshot = controller.snapshot
             let pendingBudgetAfterReverseUpdate = cache.pendingDownloadBudget
             let nearReady = await waitUntil(8) {
-                cache.cached(items[2].mediaURL!, video: true) != nil && cache.cached(items[3].mediaURL!, video: true) != nil
+                let first = await cache.cached(items[2].mediaURL!, video: true)
+                let second = await cache.cached(items[3].mediaURL!, video: true)
+                return first != nil && second != nil
             }
             let nearSnapshot = controller.snapshot
             let pendingBudgetAfterNearReady = cache.pendingDownloadBudget
@@ -157,7 +159,7 @@ import AVFoundation
         let consumersAtGate = inFlightConsumerCounts(imageCache)
         try await releaseImageGate()
         let foregroundImageValue = await foregroundImage.value
-        let cachedImage = await waitUntil(3) { imageCache.cached(imageURL, video: false) != nil }
+        let cachedImage = await waitUntil(3) { (await imageCache.cached(imageURL, video: false)) != nil }
         imageController.stop()
         _ = await waitUntil(3) { imageCache.pendingDownloadBudget == 0 }
         let imageBudgetAfter = imageCache.pendingDownloadBudget
